@@ -37,6 +37,8 @@ def main(argv=None):
     s.add_argument("--port", type=int, default=8484)
     s.add_argument("--api-key", help="require this key in x-api-key")
     s.add_argument("--concurrency", type=int, default=4, help="sequences decoded at once")
+    s.add_argument("--prompt-cache-gb", type=float, help="memory for saved prompt caches (default: fit to the GPU)")
+    s.add_argument("--reserve-gb", type=float, default=6.0, help="GPU memory kept free for active sequences")
     s.add_argument("--log-level", default="INFO")
     sub.add_parser("models", help="list configured models")
     a = ap.parse_args(argv)
@@ -63,7 +65,8 @@ def main(argv=None):
     from .http import Server
 
     _wired_limit()
-    engine = Engine(resolve(name, models), decode_concurrency=a.concurrency)
+    engine = Engine(resolve(name, models), decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
+                    prompt_cache_bytes=int(a.prompt_cache_gb * (1 << 30)) if a.prompt_cache_gb else None)
     server = Server((a.host, a.port), engine, models, a.api_key)
     logging.info("Aris Server %s serving %s on http://%s:%d", __version__, name, a.host, a.port)
     try:

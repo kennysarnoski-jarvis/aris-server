@@ -192,5 +192,6 @@ def _log(name, p, run, n, builder, reason, t0):
     dt = time.time() - t0
     budget = run.budget[0] if run.budget else None
     think = f" think={budget.n}/{p.think_budget}{' FORCED' if budget.forced else ''}" if budget else ""
-    logging.info("%s effort=%s prompt=%d cached=%d out=%d%s tools=%d stop=%s %.1fs (%.1f tok/s)", name, p.effort,
-                 run.prompt_tokens, run.cached_tokens, n, think, builder.tool_calls, reason, dt, n / dt if dt else 0)
+    logging.info("%s effort=%s prompt=%d cached=%d out=%d%s tools=%d stop=%s %.1fs (%.1f tok/s) %s", name, p.effort,
+                 run.prompt_tokens, run.cached_tokens, n, think, builder.tool_calls, reason, dt, n / dt if dt else 0,
+                 Engine.memory())
