@@ -147,11 +147,13 @@ class MessageBuilder:
                 out.append({"name": p["name"], "arguments": args if isinstance(args, dict) else {"value": args}})
         return out
 
-    def finish(self, finish_reason: str | None) -> tuple[list[dict], str]:
+    def finish(self, finish_reason: str | None, context_capped: bool = False) -> tuple[list[dict], str]:
         events = self._flush_tool() if (self._tool_text or self._xml) else []
         events += self._close()
         if self.tool_calls and finish_reason != "length":
             reason = "tool_use"
+        elif finish_reason == "length" and context_capped:
+            reason = "model_context_window_exceeded"
         else:
             reason = STOP_REASONS.get(finish_reason or "stop", "end_turn")
         return events, reason

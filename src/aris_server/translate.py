@@ -23,6 +23,29 @@ class Plan:
     thinking: bool
     effort: str
     hidden_tools: list[str] = field(default_factory=list)
+    context: int | None = None
+    context_capped: bool = False  # max_tokens was cut to fit the context window
+
+
+class PromptTooLong(RequestError):
+    """Worded exactly as the Anthropic API words it: Claude Code matches the text to start compacting."""
+
+    def __init__(self, tokens: int, maximum: int):
+        super().__init__(f"prompt is too long: {tokens} tokens > {maximum} maximum")
+
+
+MIN_OUTPUT_TOKENS = 1024  # a prompt that leaves less room than this is too long to answer usefully
+
+
+def fit_context(p: "Plan", prompt_tokens: int) -> None:
+    """Shrink max_tokens so prompt + output fits the context window, as the Anthropic API does."""
+    if not p.context:
+        return
+    room = p.context - prompt_tokens
+    if room < MIN_OUTPUT_TOKENS:
+        raise PromptTooLong(prompt_tokens, p.context - MIN_OUTPUT_TOKENS)
+    if p.max_tokens > room:
+        p.max_tokens, p.context_capped = room, True
 
 
 def _text(content) -> str:
@@ -153,11 +176,11 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
         budget = int(thinking_cfg["budget_tokens"])
 
     max_tokens = int(body.get("max_tokens") or default_max)
-    if spec.context:
-        max_tokens = min(max_tokens, spec.context)
     tools, hidden = convert_tools(body.get("tools"), body["messages"])
+    messages = convert_messages(body.get("system"), body["messages"])
+    tools, messages = _apply_tool_choice(body.get("tool_choice"), tools, messages)
     return Plan(
-        messages=convert_messages(body.get("system"), body["messages"]),
+        messages=messages,
         tools=tools,
         template_kwargs=kwargs,
         max_tokens=max_tokens,
@@ -169,4 +192,25 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
         thinking=thinking,
         effort=effort,
         hidden_tools=hidden,
+        context=spec.context,
     )
+
+
+def _apply_tool_choice(choice, tools, messages):
+    """Open models can't be forced to call a tool, so "any" and a named tool become an instruction (and a named
+    tool narrows the list); "none" removes the tools."""
+    kind = (choice or {}).get("type", "auto")
+    if kind == "auto" or not tools:
+        return tools, messages
+    if kind == "none":
+        return None, messages
+    if kind == "tool":
+        named = [t for t in tools if t["function"]["name"] == choice.get("name")]
+        if not named:
+            raise RequestError(f"tool_choice names unknown tool {choice.get('name')!r}")
+        tools, note = named, f"Respond by calling the {choice['name']} tool."
+    elif kind == "any":
+        note = "Respond by calling one of the available tools."
+    else:
+        raise RequestError(f"unknown tool_choice type {kind!r}")
+    return tools, messages + [{"role": "user", "content": f"<system-reminder>\n{note}\n</system-reminder>"}]

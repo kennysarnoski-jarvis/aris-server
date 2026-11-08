@@ -56,7 +56,13 @@ Claude Code ──/v1/messages──▶ Anthropic layer ──▶ mlx-lm engine 
 - `tools` → OpenAI-style function schemas for the template. **Deferred tools**
   (`defer_loading: true`) are hidden from the model until a `tool_reference` to them appears in a
   tool result, which is how Claude Code's tool search loads them.
-- `temperature`, `top_p`, `top_k`, `stop_sequences`, `max_tokens` → sampling and stop settings.
+- `temperature`, `top_p`, `top_k`, `stop_sequences` → sampling and stop settings.
+- `max_tokens` is cut so prompt plus output fits the model's `context` (stop reason
+  `model_context_window_exceeded` if that cut is what ends the answer). A prompt that leaves under
+  1024 tokens of room gets the API's `prompt is too long: N tokens > M maximum`, worded exactly:
+  Claude Code matches that text to compact the conversation.
+- `tool_choice`: `none` drops the tools; `any` and a named tool (which narrows the list) become an
+  instruction, since an open model can't be forced to call one.
 - Ignored: `cache_control`, `metadata`, `context_management`, `betas` (the prompt cache is
   automatic).
 

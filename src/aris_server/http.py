@@ -15,7 +15,7 @@ from . import __version__
 from .config import ModelSpec, resolve
 from .engine import Engine
 from .stream import MessageBuilder, new_id, sse
-from .translate import RequestError, plan
+from .translate import RequestError, fit_context, plan
 
 
 # Claude Code drops a stream that sends nothing for a few minutes, and a tool call is only sent once it closes, so a
@@ -44,6 +44,7 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, status: int, body: dict):
         data = json.dumps(body, ensure_ascii=False).encode()
         self.send_response(status)
+        self.send_header("request-id", new_id("req"))
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(data)))
         self.end_headers()
@@ -125,6 +126,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "invalid_request_error", str(e))
         if self.route.endswith("count_tokens"):
             return self._json(200, {"input_tokens": engine.count_tokens(p)})
+        try:
+            fit_context(p, engine.count_tokens(p))
+        except RequestError as e:
+            return self._error(400, "invalid_request_error", str(e))
         if body.get("stream"):
             self._stream(name, p)
         else:
@@ -146,7 +151,7 @@ class Handler(BaseHTTPRequestHandler):
                     run.stop()
                     logging.info("client disconnected after %d tokens; generation stopped", n)
                     return
-        _, reason = builder.finish(finish)
+        _, reason = builder.finish(finish, p.context_capped)
         msg = _message(name, builder.blocks, reason, run, n)
         self._json(200, msg)
         _log(name, p, run, n, builder, reason, t0)
@@ -154,6 +159,7 @@ class Handler(BaseHTTPRequestHandler):
     def _stream(self, name, p):
         t0 = time.time()
         self.send_response(200)
+        self.send_header("request-id", new_id("req"))
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
         self.send_header("connection", "close")
@@ -188,7 +194,7 @@ class Handler(BaseHTTPRequestHandler):
                     events = [{"type": "ping"}]
                 if events:
                     write(events)
-            events, reason = builder.finish(finish)
+            events, reason = builder.finish(finish, p.context_capped)
             events.append({"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": None},
                            "usage": _usage(run, n)})
             events.append({"type": "message_stop"})

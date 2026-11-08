@@ -20,6 +20,11 @@ class FakeEngine:
         self.script, self.delay = script, delay
         self.stopped = threading.Event()
 
+    def count_tokens(self, plan):
+        return self.prompt_tokens
+
+    prompt_tokens = 10
+
     def run(self, plan, on_progress=None):
         def pieces():
             n = 0
@@ -107,3 +112,17 @@ def test_dropped_stream_client_stops_generation_during_a_silent_tool_call(serve,
     assert not engine.stopped.is_set()
     sock.close()
     assert engine.stopped.wait(5)
+
+
+def test_overlong_prompt_gets_the_error_claude_code_compacts_on(serve):
+    engine = FakeEngine([("normal", "hi")])
+    engine.spec = ModelSpec(name="fake", path="fake", context=8192)
+    engine.prompt_tokens = 9000
+    port = serve(engine)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("POST", "/v1/messages", json.dumps(BODY), {"content-type": "application/json"})
+    resp = conn.getresponse()
+    body = json.loads(resp.read())
+    assert resp.status == 400 and resp.getheader("request-id")
+    assert body["error"] == {"type": "invalid_request_error", "message": "prompt is too long: 9000 tokens > 7168 maximum"}
+    assert not engine.stopped.is_set()

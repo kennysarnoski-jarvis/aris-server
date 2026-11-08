@@ -79,9 +79,9 @@ def test_model_without_effort_control_gets_budgets_only():
     assert p.think_budget == 1024
 
 
-def test_sampling_defaults_and_overrides_and_context_cap():
-    p = plan(body(max_tokens=500000), ARETE)
-    assert (p.temperature, p.top_p, p.top_k, p.max_tokens) == (0.6, 0.95, 20, 131072)
+def test_sampling_defaults_and_overrides():
+    p = plan(body(), ARETE)
+    assert (p.temperature, p.top_p, p.top_k) == (0.6, 0.95, 20)
     p = plan(body(temperature=0.2, top_p=0.5, stop_sequences=["END"]), ARETE)
     assert (p.temperature, p.top_p, p.stop) == (0.2, 0.5, ["END"])
 
@@ -105,3 +105,37 @@ def test_system_messages_inside_the_conversation():
 def test_bad_requests(bad):
     with pytest.raises(RequestError):
         plan(body(**bad), ARETE)
+
+
+TOOLS = [{"name": n, "description": "", "input_schema": {"type": "object"}} for n in ("Bash", "Write")]
+
+
+@pytest.mark.parametrize("choice,names,note", [
+    (None, ["Bash", "Write"], None),
+    ({"type": "auto"}, ["Bash", "Write"], None),
+    ({"type": "none"}, None, None),
+    ({"type": "any"}, ["Bash", "Write"], "calling one of the available tools"),
+    ({"type": "tool", "name": "Write"}, ["Write"], "calling the Write tool"),
+])
+def test_tool_choice(choice, names, note):
+    p = plan(body(tools=TOOLS, tool_choice=choice), ARETE)
+    assert ([t["function"]["name"] for t in p.tools] if p.tools else None) == names
+    assert (note in p.messages[-1]["content"]) if note else p.messages[-1] == {"role": "user", "content": "hi"}
+
+
+def test_tool_choice_naming_an_unknown_tool_is_rejected():
+    with pytest.raises(RequestError):
+        plan(body(tools=TOOLS, tool_choice={"type": "tool", "name": "Nope"}), ARETE)
+
+
+def test_output_is_cut_to_fit_the_context_and_overlong_prompts_get_the_api_s_wording():
+    from aris_server.translate import PromptTooLong, fit_context
+
+    p = plan(body(max_tokens=32000), ARETE)
+    fit_context(p, 120000)
+    assert (p.max_tokens, p.context_capped) == (131072 - 120000, True)
+    p = plan(body(max_tokens=32000), ARETE)
+    fit_context(p, 1000)
+    assert (p.max_tokens, p.context_capped) == (32000, False)
+    with pytest.raises(PromptTooLong, match=r"^prompt is too long: 130600 tokens > 130048 maximum$"):
+        fit_context(plan(body(), ARETE), 130600)
