@@ -3,6 +3,8 @@
 import json
 import uuid
 
+from .tool_stream import FUNCTION, XmlToolCall
+
 STOP_REASONS = {"stop": "end_turn", "length": "max_tokens"}
 
 
@@ -19,6 +21,8 @@ class MessageBuilder:
         self._open: str | None = None       # "thinking" | "text" while a block is open
         self._ws = ""                        # whitespace held back until real text arrives
         self._tool_text = ""
+        self._xml: XmlToolCall | None = None  # set while an XML-style call streams
+        self._buffer_tool = False             # this call's format can't stream: parse it whole when it ends
         self.tool_calls = 0
 
     @property
@@ -52,13 +56,12 @@ class MessageBuilder:
 
     def feed(self, state: str, text: str) -> list[dict]:
         events = []
-        if state != "tool" and self._tool_text:
+        if state != "tool" and (self._tool_text or self._xml):
             events += self._flush_tool()
         if not text:
             return events
         if state == "tool":
-            self._tool_text += text
-            return events
+            return events + self._feed_tool(text)
         kind = "thinking" if state == "reasoning" else "text"
         text = self._ws + text
         if self._open != kind:
@@ -76,8 +79,41 @@ class MessageBuilder:
                        "delta": {"type": "thinking_delta" if kind == "thinking" else "text_delta", kind: text}})
         return events
 
+    def _feed_tool(self, text: str) -> list[dict]:
+        if self._xml is not None:
+            return self._apply(self._xml.feed(text))
+        self._tool_text += text
+        if self._buffer_tool:
+            return []
+        head = self._tool_text.lstrip()
+        if head.startswith(FUNCTION):
+            self._xml = XmlToolCall(self.tools)
+            raw, self._tool_text = self._tool_text, ""
+            return self._apply(self._xml.feed(raw))
+        if len(head) >= len(FUNCTION) or (head and not FUNCTION.startswith(head)):
+            self._buffer_tool = True
+        return []
+
+    def _apply(self, ops) -> list[dict]:
+        events = []
+        for op, value in ops:
+            if op == "start":
+                events += self._start({"type": "tool_use", "id": new_id("toolu"), "name": value, "input": {}})
+            elif op == "json":
+                events.append({"type": "content_block_delta", "index": self.index,
+                               "delta": {"type": "input_json_delta", "partial_json": value}})
+            else:
+                self.blocks[-1]["input"] = value
+                events += self._close()
+                self.tool_calls += 1
+        return events
+
     def _flush_tool(self) -> list[dict]:
-        raw, self._tool_text = self._tool_text, ""
+        if self._xml is not None:
+            events = self._apply(self._xml.finish())
+            self._xml = None
+            return events
+        raw, self._tool_text, self._buffer_tool = self._tool_text, "", False
         calls = self._parse(raw)
         events = []
         for call in calls:
@@ -112,7 +148,7 @@ class MessageBuilder:
         return out
 
     def finish(self, finish_reason: str | None) -> tuple[list[dict], str]:
-        events = self._flush_tool() if self._tool_text else []
+        events = self._flush_tool() if (self._tool_text or self._xml) else []
         events += self._close()
         if self.tool_calls and finish_reason != "length":
             reason = "tool_use"

@@ -30,8 +30,9 @@ def test_thinking_then_text_then_tool_call():
     assert b.blocks[2]["name"] == "Bash" and b.blocks[2]["input"] == {"command": "ls -la", "timeout": 30}
     kinds = [e["type"] for e in events]
     assert kinds.count("content_block_start") == kinds.count("content_block_stop") == 3
-    json_delta = next(e for e in events if e["type"] == "content_block_delta" and e["delta"]["type"] == "input_json_delta")
-    assert json.loads(json_delta["delta"]["partial_json"]) == {"command": "ls -la", "timeout": 30}
+    streamed = "".join(e["delta"]["partial_json"] for e in events
+                       if e["type"] == "content_block_delta" and e["delta"]["type"] == "input_json_delta")
+    assert json.loads(streamed) == {"command": "ls -la", "timeout": 30}
     sig = [e for e in events if e["type"] == "content_block_delta" and e["delta"]["type"] == "signature_delta"]
     assert len(sig) == 1 and sig[0]["index"] == 0
 
@@ -52,7 +53,7 @@ def test_length_stop_and_truncated_tool_call():
     b, _, reason = run([("reasoning", "thinking forever")], finish="length")
     assert reason == "max_tokens"
     b, _, reason = run([("tool", "<function=Bash>\n<parameter=command>\nls")], finish="length")
-    assert reason == "max_tokens" and b.tool_calls == 0
+    assert reason == "max_tokens" and b.blocks[0]["input"] == {"command": "ls"}
 
 
 def test_two_tool_calls_in_one_turn():

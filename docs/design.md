@@ -78,8 +78,11 @@ Headers and `message_start` go out at once. A `ping` goes out while a long promp
 whenever nothing else has been sent for five seconds (a tool call is only sent once it closes, so
 writing a long file would otherwise be minutes of silence, and Claude Code abandons a silent
 stream and retries). Thinking streams as `thinking_delta`,
-text as `text_delta`. A tool call streams as one `input_json_delta` when its closing tag arrives
-(parsers need the whole call). `message_delta` carries `stop_reason` (`end_turn`, `tool_use`,
+text as `text_delta`. Tool calls in the XML style most open models use
+(`<function=...><parameter=...>`) stream like the Anthropic API's: the `tool_use` block opens when
+the name is known and string arguments stream as `input_json_delta` while they are written (Claude
+Code abandons a response that produces no content for minutes, and pings don't count). Other tool
+formats are parsed whole when the call ends. `message_delta` carries `stop_reason` (`end_turn`, `tool_use`,
 `max_tokens`, `stop_sequence`) and usage, including cached input tokens. A client that disconnects
 stops its generation, also when nothing is being written to it (non-streaming requests, or a tool
 call in progress): the socket is checked every two seconds. Abandoned generations otherwise keep
