@@ -4,6 +4,8 @@ import hmac
 import json
 import logging
 import os
+import select
+import socket
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +16,12 @@ from .config import ModelSpec, resolve
 from .engine import Engine
 from .stream import MessageBuilder, new_id, sse
 from .translate import RequestError, plan
+
+
+# Claude Code drops a stream that sends nothing for a few minutes, and a tool call is only sent once it closes, so a
+# long Write could go silent; a ping goes out whenever nothing else has for this long.
+HEARTBEAT_SECONDS = 5.0
+DISCONNECT_CHECK_SECONDS = 2.0
 
 
 class Server(ThreadingHTTPServer):
@@ -62,6 +70,15 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, "invalid_request_error", "body must be a JSON object")
             return None
         return body
+
+    def _client_gone(self) -> bool:
+        """True once the client has closed its end. A request that is still generating writes nothing (non-streaming,
+        or a tool call in progress), so a dropped client would otherwise keep its generation running."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
 
     @property
     def route(self) -> str:
@@ -119,10 +136,16 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         run = self.server.engine.run(p)
         builder = MessageBuilder(run.tool_parser, p.tools)
-        finish, n = None, 0
+        finish, n, checked = None, 0, time.time()
         for pieces, finish, n in run.pieces:
             for piece in pieces:
                 builder.feed(piece.state, piece.text)
+            if time.time() - checked > DISCONNECT_CHECK_SECONDS:
+                checked = time.time()
+                if self._client_gone():
+                    run.stop()
+                    logging.info("client disconnected after %d tokens; generation stopped", n)
+                    return
         _, reason = builder.finish(finish)
         msg = _message(name, builder.blocks, reason, run, n)
         self._json(200, msg)
@@ -137,10 +160,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.flush()
 
+        last_write = [time.time()]
+
         def write(events):
             for e in events:
                 self.wfile.write(sse(e))
             self.wfile.flush()
+            last_write[0] = time.time()
 
         def progress(done, total):
             write([{"type": "ping"}])
@@ -158,6 +184,8 @@ class Handler(BaseHTTPRequestHandler):
                 events = []
                 for piece in pieces:
                     events += builder.feed(piece.state, piece.text)
+                if not events and time.time() - last_write[0] > HEARTBEAT_SECONDS:
+                    events = [{"type": "ping"}]
                 if events:
                     write(events)
             events, reason = builder.finish(finish)
@@ -170,6 +198,7 @@ class Handler(BaseHTTPRequestHandler):
             if run is not None:
                 run.stop()
             logging.info("client disconnected; generation stopped")
+            return
         except Exception as e:  # report engine failures in-stream; the status line is already sent
             logging.exception("generation failed")
             try:

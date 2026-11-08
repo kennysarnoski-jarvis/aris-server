@@ -19,7 +19,8 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude
 Aris Server does one job: serve a local model to coding agents properly.
 
 - **Native `/v1/messages`.** Thinking, tool calls and text stream as real Anthropic events from
-  the first byte, with pings while a long prompt is read, so clients never time out on silence.
+  the first byte, with pings while a long prompt is read or a long tool call is written, so clients
+  never time out on silence, and a client that hangs up stops its generation.
 - **Effort that works.** Claude Code's effort setting reaches models that have trained effort
   levels.
 - **A think budget.** Reasoning models that overthink get their thinking closed at the next

@@ -74,12 +74,16 @@ reasoning on a complete thought and answers. Budgets per effort are set per mode
 
 ### Streaming
 
-Headers and `message_start` go out at once. While a long prompt is read, `ping` events go out
-with progress, so clients never see a silent connection. Thinking streams as `thinking_delta`,
+Headers and `message_start` go out at once. A `ping` goes out while a long prompt is read and
+whenever nothing else has been sent for five seconds (a tool call is only sent once it closes, so
+writing a long file would otherwise be minutes of silence, and Claude Code abandons a silent
+stream and retries). Thinking streams as `thinking_delta`,
 text as `text_delta`. A tool call streams as one `input_json_delta` when its closing tag arrives
 (parsers need the whole call). `message_delta` carries `stop_reason` (`end_turn`, `tool_use`,
 `max_tokens`, `stop_sequence`) and usage, including cached input tokens. A client that disconnects
-stops its generation.
+stops its generation, also when nothing is being written to it (non-streaming requests, or a tool
+call in progress): the socket is checked every two seconds. Abandoned generations otherwise keep
+running, pile up, and exhaust GPU memory.
 
 ## Model settings
 
