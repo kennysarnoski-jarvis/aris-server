@@ -20,6 +20,9 @@ class FakeEngine:
         self.script, self.delay = script, delay
         self.stopped = threading.Event()
 
+    def adapt_memory(self):
+        pass
+
     def count_tokens(self, plan):
         return self.prompt_tokens
 

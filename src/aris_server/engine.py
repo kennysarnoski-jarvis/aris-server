@@ -74,6 +74,11 @@ class MovingPromptCache(LRUPromptCache):
         return entry.prompt_cache, tokens[len(key):]
 
 
+def shrink_cap(cap: int, peak: int, limit: int, headroom: int, floor: int = 1 << 30) -> int:
+    over = peak - (limit - headroom)
+    return max(floor, cap - over) if over > 0 else cap
+
+
 def merge_prompt_tail(tokenized):
     """mlx-lm splits a chat prompt into system / conversation / thinking-tail segments and saves a copy of the cache
     at the end of each but the last. The conversation snapshot is a second full copy of a long context, held through
@@ -127,6 +132,7 @@ class Engine:
             time.sleep(0.2)
         self.tokenizer = self.provider.tokenizer
         self.budget_tokens = BudgetTokens(self.tokenizer)
+        self.cache = cache
         self._fit_memory(cache, ns, prompt_cache_bytes, reserve_gb)
         if disk_cache_gb > 0:
             disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)))
@@ -166,6 +172,19 @@ class Engine:
             time.sleep(1)
         logging.critical("the generation engine stopped (see the error above); exiting")
         os._exit(70)
+
+    def adapt_memory(self, headroom_gb: float = 2.5):
+        """After a request: if memory came within `headroom_gb` of the GPU limit, shrink the prompt cache by the
+        overshoot. A fixed reserve can't be right for every Mac, model and context length; this settles on what the
+        machine actually needs after its first long session."""
+        gb = 1 << 30
+        peak, limit = mx.get_peak_memory(), mx.device_info()["max_recommended_working_set_size"]
+        mx.reset_peak_memory()
+        cap = shrink_cap(self.cache.max_bytes, peak, limit, int(headroom_gb * gb))
+        if cap < self.cache.max_bytes:
+            self.cache.max_bytes = self.provider.cli_args.prompt_cache_bytes = cap
+            logging.warning("memory peaked at %.1f of %.1f GB; prompt cache lowered to %.1f GB", peak / gb, limit / gb,
+                            cap / gb)
 
     @staticmethod
     def memory() -> str:

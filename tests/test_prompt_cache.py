@@ -47,3 +47,12 @@ def test_only_the_system_prompt_segment_is_snapshotted_mid_turn():
     assert merge_prompt_tail(plain) == plain
     no_tail = (prompt, [prompt[:3], prompt[3:]], ["system", "user"], "normal", None)
     assert merge_prompt_tail(no_tail) == no_tail  # the last segment is never snapshotted mid-turn
+
+
+def test_the_prompt_cache_shrinks_by_how_far_memory_got_into_the_headroom():
+    from aris_server.engine import shrink_cap
+
+    gb = 1 << 30
+    assert shrink_cap(5 * gb, peak=30 * gb, limit=37 * gb, headroom=2 * gb) == 5 * gb       # plenty of room
+    assert shrink_cap(5 * gb, peak=36 * gb, limit=37 * gb, headroom=2 * gb) == 4 * gb       # 1 GB too close
+    assert shrink_cap(2 * gb, peak=40 * gb, limit=37 * gb, headroom=2 * gb) == 1 * gb       # never below the floor

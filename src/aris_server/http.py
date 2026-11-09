@@ -157,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
         _, reason = builder.finish(finish, p.context_capped)
         msg = _message(name, builder.blocks, reason, run, n)
         self._json(200, msg)
-        _log(name, p, run, n, builder, reason, t0)
+        _log(name, p, run, n, builder, reason, t0, self.server.engine)
 
     def _stream(self, name, p):
         t0 = time.time()
@@ -210,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
                            "usage": _usage(run, n)})
             events.append({"type": "message_stop"})
             write(events)
-            _log(name, p, run, n, builder, reason, t0)
+            _log(name, p, run, n, builder, reason, t0, self.server.engine)
         except (BrokenPipeError, ConnectionResetError):
             if run is not None:
                 run.stop()
@@ -234,10 +234,12 @@ def _message(name, blocks, reason, run, n):
             "stop_reason": reason, "stop_sequence": None, "usage": _usage(run, n)}
 
 
-def _log(name, p, run, n, builder, reason, t0):
+def _log(name, p, run, n, builder, reason, t0, engine=None):
     dt = time.time() - t0
     budget = run.budget[0] if run.budget else None
     think = f" think={budget.n}/{p.think_budget}{' FORCED' if budget.forced else ''}" if budget else ""
     logging.info("%s effort=%s prompt=%d cached=%d out=%d%s tools=%d stop=%s %.1fs (%.1f tok/s) %s", name, p.effort,
                  run.prompt_tokens, run.cached_tokens, n, think, builder.tool_calls, reason, dt, n / dt if dt else 0,
                  Engine.memory())
+    if engine is not None:
+        engine.adapt_memory()
