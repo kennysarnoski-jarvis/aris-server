@@ -1,6 +1,7 @@
 """mlx-lm's server engine (batching, prompt cache, thinking and tool parsing), driven by Aris Server."""
 
 import argparse
+import gc
 import logging
 import os
 import threading
@@ -98,13 +99,20 @@ class MovingPromptCache(LRUPromptCache):
             return cache, rest
         data, n = found
         t0 = time.time()
+        del cache
+        # An evicted turn's arrays can outlive their last reference until the next collection; with a long context
+        # that is a second conversation's worth of memory under the one being loaded.
+        gc.collect()
+        mx.clear_cache()
+        before = mx.get_active_memory()
         try:
             loaded = self.disk.load(data)
         except Exception as e:
             logging.warning("could not load a prompt cache from disk: %s", e)
-            return cache, rest
-        logging.info("loaded a %d-token cache from disk in place of %d cached tokens (%.1fs)", n,
-                     len(tokens) - len(rest), time.time() - t0)
+            return None, tokens
+        gb = 1 << 30
+        logging.info("loaded a %d-token cache from disk in place of %d cached tokens (%.1fs, active %.1f -> %.1f GB)",
+                     n, len(tokens) - len(rest), time.time() - t0, before / gb, mx.get_active_memory() / gb)
         return loaded, list(tokens[n:])
 
     def _fetch_from_memory(self, model, tokens):
