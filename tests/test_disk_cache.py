@@ -183,3 +183,17 @@ def test_an_adapter_gets_its_own_caches(tmp_path):
     before = model_id(str(base), str(adapter))
     (adapter / "adapters.safetensors").write_bytes(b"y" * 11)  # retrained: new weights, new caches
     assert model_id(str(base), str(adapter)) != before
+
+
+def test_a_finished_turn_that_diverged_from_its_history_is_dropped_before_the_disk_copy_loads(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    cache.snapshot_min_tokens = 1024
+    cache.reading.append(TURN2)
+    cache.insert_cache("m", TURN2[:-1], layers(2699, 1), cache_type="assistant")       # prompt snapshot, on disk
+    cache.reading.remove(TURN2)
+    generated = TURN2 + [5, 6, 7]                                                      # tokens as generated
+    cache.insert_cache("m", generated, layers(2703, 2), cache_type="assistant")
+    rendered = TURN2 + [5, 67] + [8]                                                   # the same text, re-tokenized
+    got, rest = cache.fetch_nearest_cache("m", rendered)
+    assert got[0].offset == 2699 and rest == rendered[2699:]                           # resumed from the snapshot
+    assert len(cache) == 0 and not cache.disk.has(generated)                           # the dead turn is gone

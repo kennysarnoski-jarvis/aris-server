@@ -162,6 +162,7 @@ class MovingPromptCache(LRUPromptCache):
         data, n = found
         t0 = time.time()
         del cache
+        self._drop_diverged(model, tokens, n)
         # An evicted turn's arrays can outlive their last reference until the next collection; with a long context
         # that is a second conversation's worth of memory under the one being loaded.
         gc.collect()
@@ -176,6 +177,30 @@ class MovingPromptCache(LRUPromptCache):
         logging.info("loaded a %d-token cache from disk in place of %d cached tokens (%.1fs, active %.1f -> %.1f GB)",
                      n, len(tokens) - len(rest), time.time() - t0, before / gb, mx.get_active_memory() / gb)
         return loaded, list(tokens[n:])
+
+    def _drop_diverged(self, model, tokens, shared: int):
+        """Entries of this conversation that run past `shared` tokens and then differ from the request: a finished
+        turn whose re-rendered history tokenized differently from what was generated, say. Nothing will continue
+        them, and kept beside the copy loaded from disk they double the conversation in memory."""
+        key = list(tokens)
+        for kind, lru in self._lru._lrus.items():
+            if kind == "system":
+                continue
+            for m, entry_key in list(lru):
+                if m != model or len(entry_key) <= shared or entry_key[:shared] != key[:shared]:
+                    continue
+                if entry_key == key[:len(entry_key)]:
+                    continue  # still a prefix: not diverged
+                self._trie.taking = True  # dropped, not evicted: never written
+                try:
+                    entry = self._trie.pop(m, entry_key)
+                finally:
+                    self._trie.taking = False
+                self._lru.remove(m, entry_key)
+                self._n_bytes -= entry.nbytes
+                self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+                logging.info("memory cache: dropped a %d-token %s that diverged from its conversation at or after "
+                             "token %d", len(entry_key), entry.cache_type, shared)
 
     def _fetch_from_memory(self, model, tokens):
         result = self._trie.search(model, tokens)
