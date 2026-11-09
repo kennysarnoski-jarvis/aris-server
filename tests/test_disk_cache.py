@@ -76,6 +76,36 @@ def test_partial_writes_are_cleaned_up_at_startup(tmp_path):
     assert list(tmp_path.rglob("*.safetensors")) == []
 
 
+def test_a_conversation_evicted_from_memory_comes_back_from_disk(tmp_path):
+    from mlx_lm.models.cache import LRUPromptCache
+
+    cache = cache_with_disk(tmp_path)
+    cache.insert_cache("m", SYSTEM, layers(1200, 1), cache_type="system")
+    cache.insert_cache("m", TURN2, layers(2700, 3), cache_type="assistant")
+    cache.trim_to(n_bytes=cache._n_bytes_by_type["system"])          # memory keeps only the system prompt
+    got, rest = cache.fetch_nearest_cache("m", TURN2 + [1, 2])
+    assert rest == [1, 2] and got[0].offset == 2700 and mx.all(got[1][1] == 3).item()
+
+    short = cache_with_disk(tmp_path)                                  # a gain under DISK_MIN_GAIN stays in memory
+    LRUPromptCache.insert_cache(short, "m", TURN2[:-100], layers(2600, 4), cache_type="assistant")
+    got, rest = short.fetch_nearest_cache("m", TURN2 + [1])
+    assert len(rest) == 101 and mx.all(got[1][1] == 4).item()
+
+
+def test_a_snapshot_of_a_prompt_still_being_answered_goes_to_disk_only(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    prompt = TURN2
+    cache.reading.append(prompt)
+    cache.insert_cache("m", SYSTEM, layers(1200, 1), cache_type="system")           # shared: stays in memory
+    cache.insert_cache("m", prompt[:-1], layers(2699, 2), cache_type="assistant")    # the request holds a copy
+    assert len(cache) == 1 and sorted(len(t) for t, _ in cache.disk.index.values()) == [1200, 2699]
+    cache.reading.remove(prompt)
+    cache.insert_cache("m", prompt + [9, 9], layers(2702, 3), cache_type="assistant")  # the finished turn
+    assert len(cache) == 2
+    got, rest = cache_with_disk(tmp_path).fetch_nearest_cache("m", prompt)          # a retry finds it on disk
+    assert rest == prompt[-1:] and got[0].offset == 2699
+
+
 def test_a_retry_and_a_continuation_both_find_a_snapshot(tmp_path):
     prompt = TURN1
     answered = TURN1 + [42, 43]

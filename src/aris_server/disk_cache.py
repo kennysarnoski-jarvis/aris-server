@@ -1,5 +1,6 @@
 """Prompt caches on disk, so a restart, a crash or a reopened thread resumes in seconds instead of re-reading a long
-conversation (minutes for a 27B model at 40k tokens). Each finished turn's cache and the shared system-prompt snapshot
+conversation (minutes for a 27B model at 40k tokens). A conversation evicted from memory is also loaded back from
+here. Each finished turn's cache and the shared system-prompt snapshot
 are written as they enter the in-memory cache; a conversation's older snapshot is deleted when its next turn is saved.
 """
 
@@ -79,6 +80,22 @@ class DiskCache:
             total -= oldest.stat().st_size if oldest.exists() else 0
             self._delete(oldest)
 
+    def nearest(self, tokens, longer_than: int = 0) -> tuple[Path, int] | None:
+        """The saved cache covering the longest proper prefix of `tokens`, if it covers more than `longer_than`."""
+        key = tuple(tokens)
+        best = None
+        for data, (t, _) in self.index.items():
+            if longer_than < len(t) < len(key) and key[:len(t)] == t and (best is None or len(t) > best[1]):
+                best = (data, len(t))
+        return best
+
+    @staticmethod
+    def load(data: Path):
+        cache = load_prompt_cache(str(data))
+        # Loading is lazy and bound to the loading thread's stream; generation may run on another thread.
+        mx.eval([c.state for c in cache])
+        return cache
+
     def restore(self, insert, budget: int) -> int:
         """Load the most recent caches that fit in `budget` bytes through insert(tokens, cache, type)."""
         loaded = 0
@@ -89,9 +106,7 @@ class DiskCache:
             if loaded + size > budget:
                 continue
             try:
-                cache = load_prompt_cache(str(data))
-                # Loading is lazy and bound to this thread's stream; generation runs on another thread.
-                mx.eval([c.state for c in cache])
+                cache = self.load(data)
             except Exception:  # a damaged file: drop it and carry on
                 logging.warning("dropping unreadable prompt cache %s", data.name)
                 self._delete(data)

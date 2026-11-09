@@ -37,6 +37,9 @@ def _processors(args):
 mls._make_logits_processors = _processors
 
 
+DISK_MIN_GAIN = 1024  # fewer extra tokens than this are as quick to read as the cache file
+
+
 class MovingPromptCache(LRUPromptCache):
     """mlx-lm copies a saved cache for the request that continues it, so a long conversation sits in memory twice
     for the whole turn (2.4 GB extra at 37k tokens on a 27B model, enough to run a 48 GB Mac out of memory). A
@@ -45,8 +48,18 @@ class MovingPromptCache(LRUPromptCache):
 
     disk = None  # DiskCache: entries are also written to disk as they come in
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reading: list[list[int]] = []  # prompts of the requests in flight
+
     def insert_cache(self, model, tokens, prompt_cache, *, cache_type="assistant"):
-        super().insert_cache(model, tokens, prompt_cache, cache_type=cache_type)
+        # A snapshot of part of a prompt still being answered: the request holds its own copy, so keeping this one
+        # in memory too doubles the conversation (3.5 GB more at 51k tokens) and ran a 48 GB Mac out of memory.
+        # Disk is enough for the retry it exists for. The shared system prompt stays in memory.
+        mid_request = cache_type != "system" and any(
+            len(tokens) < len(p) and p[:len(tokens)] == list(tokens) for p in self.reading)
+        if not mid_request:
+            super().insert_cache(model, tokens, prompt_cache, cache_type=cache_type)
         if self.disk is not None:
             try:
                 self.disk.save(tokens, prompt_cache, cache_type)
@@ -54,6 +67,27 @@ class MovingPromptCache(LRUPromptCache):
                 logging.warning("could not save a prompt cache to disk: %s", e)
 
     def fetch_nearest_cache(self, model, tokens):
+        cache, rest = self._fetch_from_memory(model, tokens)
+        if self.disk is None:
+            return cache, rest
+        # Memory holds what fits beside the weights; on a small Mac that can be less than one long conversation plus
+        # the system prompt, so a turn finds only the system prompt. Reading the turn's cache back from disk takes a
+        # second or two; re-reading the conversation takes minutes.
+        found = self.disk.nearest(tokens, longer_than=len(tokens) - len(rest) + DISK_MIN_GAIN)
+        if found is None:
+            return cache, rest
+        data, n = found
+        t0 = time.time()
+        try:
+            loaded = self.disk.load(data)
+        except Exception as e:
+            logging.warning("could not load a prompt cache from disk: %s", e)
+            return cache, rest
+        logging.info("loaded a %d-token cache from disk in place of %d cached tokens (%.1fs)", n,
+                     len(tokens) - len(rest), time.time() - t0)
+        return loaded, list(tokens[n:])
+
+    def _fetch_from_memory(self, model, tokens):
         result = self._trie.search(model, tokens)
         short = len(result.shorter) if result.shorter is not None else 0
         if result.exact is None:
@@ -125,7 +159,14 @@ class Engine:
         # The generator thread loads the model, so all MLX work stays on one thread and stream.
         self.generator = mls.ResponseGenerator(self.provider, cache)
         tokenize = self.generator._tokenize
-        self.generator._tokenize = lambda *a, **k: merge_prompt_tail(tokenize(*a, **k))
+
+        def tokenize_and_track(*a, **k):
+            # Runs on the generation thread before the prompt is read, so a mid-request snapshot can't beat it.
+            tokenized = merge_prompt_tail(tokenize(*a, **k))
+            cache.reading = cache.reading[-15:] + [tokenized[0]]
+            return tokenized
+
+        self.generator._tokenize = tokenize_and_track
         while self.provider.tokenizer is None:
             if not self.generator.generation_available():
                 raise RuntimeError(f"could not load {spec.path}")
@@ -221,8 +262,15 @@ class Engine:
         request = mls.CompletionRequest(request_type="chat", prompt="", messages=plan.messages, tools=plan.tools,
                                         role_mapping=None)
         ctx, responses = self.generator.generate(request, args, progress_callback=on_progress)
+
+        def pieces():
+            try:
+                yield from _classify(ctx, responses)
+            finally:
+                self.cache.reading = [p for p in self.cache.reading if p != ctx.prompt]
+
         return Run(prompt_tokens=len(ctx.prompt), cached_tokens=max(ctx.prompt_cache_count, 0),
-                   tool_parser=ctx.tool_parser, pieces=_classify(ctx, responses), stop=ctx.stop, budget=budget)
+                   tool_parser=ctx.tool_parser, pieces=pieces(), stop=ctx.stop, budget=budget)
 
 
 def _classify(ctx, responses):

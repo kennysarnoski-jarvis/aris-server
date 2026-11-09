@@ -23,8 +23,8 @@ Aris Server does one job: serve a local model to coding agents properly.
   never time out on silence, and a client that hangs up stops its generation.
 - **Effort that works.** Claude Code's effort setting reaches models that have trained effort
   levels.
-- **A think budget.** Reasoning models that overthink get their thinking closed at the next
-  paragraph break once they pass the budget for the requested effort, so they answer instead of
+- **A think budget.** Reasoning models that overthink get their thinking closed at the end of
+  the current line once they pass the budget for the requested effort, so they answer instead of
   burning every token deliberating.
 - **Claude Code's tool search.** Deferred tools stay out of the prompt until the agent loads them.
 - **Fast on Apple Silicon.** Built on [MLX](https://github.com/ml-explore/mlx) and mlx-lm:

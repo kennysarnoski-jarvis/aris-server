@@ -74,9 +74,12 @@ Claude Code ──/v1/messages──▶ Anthropic layer ──▶ mlx-lm engine 
 | `output_config.effort` low / medium / high / xhigh / max | The model's own effort control if it has one (for example Arete's `reasoning_effort`), else nothing, plus that effort's think budget. |
 | `thinking.budget_tokens` | Overrides the think budget. |
 
-**Think budget:** a logits processor counts thinking tokens. Past the budget it waits for the next
-paragraph break outside a code fence and forces the end-of-thinking token, so the model closes its
-reasoning on a complete thought and answers. Budgets per effort are set per model, with defaults.
+**Think budget:** a logits processor counts thinking tokens. Past the budget, outside a code fence,
+it blocks paragraph breaks and forces the end-of-thinking token after the next newline, so the
+model closes its reasoning on a complete line and answers. It closes on one newline, not a
+paragraph break, because chat templates re-render past reasoning as `text\n</think>`: a turn closed
+as `text\n\n</think>` stops matching its own prompt cache, and the next turn re-reads from there.
+Budgets per effort are set per model, with defaults.
 
 ### Streaming
 
@@ -100,13 +103,17 @@ running, pile up, and exhaust GPU memory.
 ## Prompt cache
 
 mlx-lm's LRU cache, with three changes. A conversation's cache moves to the turn that continues
-it instead of being copied (only the shared system-prompt snapshot is copied), and the mid-turn
-snapshot of the whole conversation is skipped, so a long context is in memory once. The cache's
+it instead of being copied (only the shared system-prompt snapshot is copied), and a snapshot of
+part of a prompt still being answered goes to disk only (the request holds its own copy; two copies
+of a 51k-token conversation ran a 48 GB Mac out of memory), so a long context is in memory once. The cache's
 budget is what the GPU holds beside the weights less a reserve for prefill scratch. And entries are
 also written to `~/.aris-server/cache/<model>/` as they come in (the read prompt, which a retry
 needs, and the finished turn, which the next turn continues; a conversation keeps only its longest
 earlier snapshot), then loaded at startup, so a restart or crash resumes a 40k-token conversation
-in seconds instead of re-reading it for minutes. A cache file without its metadata file is a write
+in seconds instead of re-reading it for minutes. A turn that finds memory holding less of its
+prompt than disk does (at least 1024 tokens less) loads the disk copy: on a Mac where one long
+conversation plus the system prompt doesn't fit the memory budget, the conversation is evicted
+every turn, and re-reading 40k tokens costs minutes where the file costs a second. A cache file without its metadata file is a write
 that was cut off and is deleted. Loaded caches are evaluated before generation uses them: MLX binds
 a lazy load to the loading thread's stream.
 
