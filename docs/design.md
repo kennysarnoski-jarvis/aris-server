@@ -80,8 +80,11 @@ reasoning on a complete thought and answers. Budgets per effort are set per mode
 
 ### Streaming
 
-Headers and `message_start` go out at once. A `ping` goes out while a long prompt is read and
-whenever nothing else has been sent for five seconds (a tool call is only sent once it closes, so
+Headers and `message_start` go out at once. Claude Code doesn't count pings as activity, so when
+reading the prompt takes more than 30 seconds its progress goes out as thinking (a
+`⟨reading prompt N/M⟩` line every 30 seconds, stripped when the conversation comes back, so the
+model never sees it); re-reading a long conversation on a small Mac can take longer than Claude
+Code waits. A `ping` also goes out whenever nothing else has been sent for five seconds (a tool call is only sent once it closes, so
 writing a long file would otherwise be minutes of silence, and Claude Code abandons a silent
 stream and retries). Thinking streams as `thinking_delta`,
 text as `text_delta`. Tool calls in the XML style most open models use

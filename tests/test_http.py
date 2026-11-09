@@ -25,8 +25,14 @@ class FakeEngine:
 
     prompt_tokens = 10
 
+    progress_steps = 0
+    endless = True
+
     def run(self, plan, on_progress=None):
         def pieces():
+            for i in range(self.progress_steps):  # a long prompt being read
+                time.sleep(self.delay)
+                on_progress(512 * (i + 1), 512 * self.progress_steps)
             n = 0
             for state, text in self.script:
                 if self.stopped.is_set():
@@ -34,7 +40,7 @@ class FakeEngine:
                 time.sleep(self.delay)
                 n += 1
                 yield [Piece(state, text)], None, n
-            while not self.stopped.is_set():  # a generation that would go on forever unless stopped
+            while self.endless and not self.stopped.is_set():  # a generation that goes on until stopped
                 time.sleep(self.delay)
                 n += 1
                 yield [Piece("tool", "x")], None, n
@@ -126,3 +132,18 @@ def test_overlong_prompt_gets_the_error_claude_code_compacts_on(serve):
     assert resp.status == 400 and resp.getheader("request-id")
     assert body["error"] == {"type": "invalid_request_error", "message": "prompt is too long: 9000 tokens > 7168 maximum"}
     assert not engine.stopped.is_set()
+
+
+def test_slow_prompt_reading_shows_up_as_thinking_so_claude_code_keeps_waiting(serve, monkeypatch):
+    monkeypatch.setattr(ah, "PROGRESS_SECONDS", 0.0)
+    engine = FakeEngine([("reasoning", "plan"), ("normal", "done"), ("normal", "")], delay=0.01)
+    engine.script.append(("normal", ""))
+    engine.progress_steps, engine.endless = 3, False
+    port = serve(engine)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("POST", "/v1/messages", json.dumps({**BODY, "stream": True}), {"content-type": "application/json"})
+    raw = conn.getresponse().read().split(b"\n\n")
+    events = [json.loads(c.split(b"data: ", 1)[1]) for c in raw if b"data: " in c]
+    thinking = "".join(e["delta"]["thinking"] for e in events if e.get("delta", {}).get("type") == "thinking_delta")
+    assert thinking.startswith("⟨reading prompt 512/1536⟩\n⟨reading prompt 1024/1536⟩\n")
+    assert thinking.endswith("plan")

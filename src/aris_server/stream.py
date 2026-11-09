@@ -1,11 +1,17 @@
 """Turn the engine's classified text (reasoning / normal / tool) into Anthropic content blocks and SSE events."""
 
 import json
+import re
 import uuid
 
 from .tool_stream import FUNCTION, XmlToolCall
 
 STOP_REASONS = {"stop": "end_turn", "length": "max_tokens"}
+PROGRESS_NOTE = re.compile(r"⟨reading prompt \d+/\d+⟩\n?")
+
+
+def progress_note(done: int, total: int) -> str:
+    return f"⟨reading prompt {done}/{total}⟩\n"
 
 
 def new_id(prefix: str) -> str:
@@ -77,6 +83,14 @@ class MessageBuilder:
         self.blocks[-1][kind] += text
         events.append({"type": "content_block_delta", "index": self.index,
                        "delta": {"type": "thinking_delta" if kind == "thinking" else "text_delta", kind: text}})
+        return events
+
+    def note(self, text: str) -> list[dict]:
+        """A line of thinking from the server itself (prefill progress): content the client counts as activity."""
+        events = [] if self._open == "thinking" else self._start({"type": "thinking", "thinking": ""})
+        self.blocks[-1]["thinking"] += text
+        events.append({"type": "content_block_delta", "index": self.index,
+                       "delta": {"type": "thinking_delta", "thinking": text}})
         return events
 
     def _feed_tool(self, text: str) -> list[dict]:

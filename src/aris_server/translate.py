@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 
 from .config import EFFORTS, ModelSpec
+from .stream import PROGRESS_NOTE
 
 
 class RequestError(ValueError):
@@ -126,7 +127,9 @@ def convert_messages(system, messages) -> list[dict]:
             for block in content:
                 kind = block.get("type")
                 if kind == "thinking":
-                    reasoning.append(block.get("thinking", ""))
+                    thought = PROGRESS_NOTE.sub("", block.get("thinking", ""))
+                    if thought.strip():
+                        reasoning.append(thought)
                 elif kind == "text":
                     texts.append(block.get("text", ""))
                 elif kind == "tool_use":

@@ -139,3 +139,16 @@ def test_output_is_cut_to_fit_the_context_and_overlong_prompts_get_the_api_s_wor
     assert (p.max_tokens, p.context_capped) == (32000, False)
     with pytest.raises(PromptTooLong, match=r"^prompt is too long: 130600 tokens > 130048 maximum$"):
         fit_context(plan(body(), ARETE), 130600)
+
+
+def test_prefill_progress_lines_never_reach_the_model():
+    p = plan(body(messages=[
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "⟨reading prompt 512/9000⟩\n⟨reading prompt 1024/9000⟩\nreal plan", "signature": "s"},
+            {"type": "tool_use", "id": "t", "name": "Bash", "input": {}}]},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "⟨reading prompt 512/9000⟩\n", "signature": "s"}, {"type": "text", "text": "ok"}]},
+    ]), ARETE)
+    assert p.messages[1]["reasoning_content"] == "real plan"
+    assert "reasoning_content" not in p.messages[2]

@@ -14,13 +14,16 @@ from urllib.parse import urlsplit
 from . import __version__
 from .config import ModelSpec, resolve
 from .engine import Engine
-from .stream import MessageBuilder, new_id, sse
+from .stream import MessageBuilder, new_id, progress_note, sse
 from .translate import RequestError, fit_context, plan
 
 
 # Claude Code drops a stream that sends nothing for a few minutes, and a tool call is only sent once it closes, so a
 # long Write could go silent; a ping goes out whenever nothing else has for this long.
 HEARTBEAT_SECONDS = 5.0
+# Claude Code doesn't count pings as activity either, and reading a long prompt can take longer than it waits, so a
+# slow prefill reports its progress as a line of thinking (stripped again when the conversation comes back).
+PROGRESS_SECONDS = 30.0
 DISCONNECT_CHECK_SECONDS = 2.0
 
 
@@ -174,15 +177,23 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             last_write[0] = time.time()
 
+        holder: list[MessageBuilder] = []
+        last_note = [time.time()]
+
         def progress(done, total):
-            write([{"type": "ping"}])
             logging.debug("prompt %d/%d", done, total)
+            if holder and time.time() - last_note[0] > PROGRESS_SECONDS:
+                last_note[0] = time.time()
+                write(holder[0].note(progress_note(done, total)))
+            else:
+                write([{"type": "ping"}])
 
         run = None
         try:
             write([{"type": "ping"}])
             run = self.server.engine.run(p, on_progress=progress)
             builder = MessageBuilder(run.tool_parser, p.tools)
+            holder.append(builder)
             start = _message(name, [], None, run, 0)
             write([{"type": "message_start", "message": start}])
             finish, n = None, 0
