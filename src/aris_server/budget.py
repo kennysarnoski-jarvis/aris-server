@@ -4,20 +4,27 @@ import mlx.core as mx
 
 
 class ThinkBudget:
-    """Logits processor. Counts generated tokens while thinking; past `budget` and outside a code fence, it blocks
-    paragraph breaks and forces the end-of-thinking token after the next newline. Inert once thinking has ended.
+    """Logits processor. Counts generated tokens while thinking. Past `budget`, outside a code fence, a paragraph
+    break becomes a single newline and the end-of-thinking token is forced after the next newline; `overrun` tokens
+    later it closes regardless (an open fence, or a line that never ends: models can loop in place). Inert once
+    thinking has ended.
 
     Ending on a single newline matters: chat templates re-render past reasoning as `text\\n</think>`, so a turn that
     closed after a paragraph break (`text\\n\\n</think>`) no longer matches its own prompt cache, and the next turn
     re-reads everything from that point."""
 
     def __init__(self, budget: int, end_id: int, newline_id: int, paragraph_ids: frozenset[int],
-                 fence_counts: dict[int, int]):
-        self.budget, self.end_id, self.newline_id = budget, end_id, newline_id
+                 fence_counts: dict[int, int], overrun: int = 1024):
+        self.budget, self.end_id, self.newline_id, self.overrun = budget, end_id, newline_id, overrun
         self.paragraph_ids, self.fence_counts = paragraph_ids, fence_counts
         self.n = self.fences = 0
         self.done = self.forced = False
-        self._no_paragraphs = None
+        self._paragraphs = None
+
+    def _only(self, token_id, logits):
+        mask = mx.arange(logits.shape[-1]) == token_id
+        return mx.broadcast_to(mx.where(mask, mx.array(0.0, logits.dtype), mx.array(-mx.inf, logits.dtype)),
+                               logits.shape)
 
     def __call__(self, tokens, logits):
         if self.done or tokens is None or len(tokens) == 0:
@@ -28,19 +35,27 @@ class ThinkBudget:
             return logits
         self.n += 1
         self.fences += self.fence_counts.get(last, 0)
-        if self.n < self.budget or self.fences % 2:
+        if self.n < self.budget:
+            return logits
+        hard = self.n >= self.budget + self.overrun
+        if self.fences % 2 and not hard:
             return logits
         if last == self.newline_id:
             self.done = self.forced = True
-            mask = mx.arange(logits.shape[-1]) == self.end_id
-            forced = mx.where(mask, mx.array(0.0, logits.dtype), mx.array(-mx.inf, logits.dtype))
-            return mx.broadcast_to(forced, logits.shape)
-        if self._no_paragraphs is None:
-            blocked = mx.zeros((logits.shape[-1],), mx.bool_)
-            if self.paragraph_ids:
-                blocked[mx.array(sorted(self.paragraph_ids))] = True
-            self._no_paragraphs = blocked
-        return mx.where(self._no_paragraphs, mx.array(-mx.inf, logits.dtype), logits)
+            return self._only(self.end_id, logits)
+        if hard:
+            return self._only(self.newline_id, logits)
+        # A paragraph break the model would take becomes a single newline, which then closes thinking.
+        if self._paragraphs is None:
+            ids = sorted(self.paragraph_ids)
+            self._paragraphs = mx.array(ids) if ids else None
+        if self._paragraphs is None:
+            return logits
+        flat = logits.reshape(-1, logits.shape[-1])
+        merged = mx.logaddexp(flat[:, self.newline_id], mx.logsumexp(flat[:, self._paragraphs], axis=-1))
+        flat[:, self._paragraphs] = -mx.inf
+        flat[:, self.newline_id] = merged
+        return flat.reshape(logits.shape)
 
 
 class BudgetTokens:

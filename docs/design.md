@@ -75,8 +75,10 @@ Claude Code ──/v1/messages──▶ Anthropic layer ──▶ mlx-lm engine 
 | `thinking.budget_tokens` | Overrides the think budget. |
 
 **Think budget:** a logits processor counts thinking tokens. Past the budget, outside a code fence,
-it blocks paragraph breaks and forces the end-of-thinking token after the next newline, so the
-model closes its reasoning on a complete line and answers. It closes on one newline, not a
+a paragraph break the model would take becomes a single newline, and the end-of-thinking token is
+forced after the next newline, so the model closes its reasoning on a complete line and answers.
+1024 tokens past the budget it closes regardless: inside a code fence the model can write code for
+thousands of tokens, and a model can loop on one line that never ends. It closes on one newline, not a
 paragraph break, because chat templates re-render past reasoning as `text\n</think>`: a turn closed
 as `text\n\n</think>` stops matching its own prompt cache, and the next turn re-reads from there.
 Budgets per effort are set per model, with defaults.
