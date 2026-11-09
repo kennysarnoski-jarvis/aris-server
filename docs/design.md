@@ -129,9 +129,11 @@ turn to disk while mlx-lm still held the evicted copy. Evictions are logged. The
 budget is what the GPU holds beside the weights less a reserve for prefill scratch. And entries go to
 `~/.aris-server/cache/<model>/` when memory lets them go: a finished turn when the LRU evicts it or
 at a graceful stop (usually its next turn takes it from memory first and it is never written), the
-shared system prompt at once, and a snapshot of a long prompt being answered (16k+ tokens), which a
-retry, or a next turn whose re-rendered history tokenizes differently from what was generated,
-resumes from. Writing every turn put 445 GB on an SSD in one day. A conversation keeps only its
+shared system prompt at once. Writing every turn put 445 GB on an SSD in one day. A model sometimes
+generates a non-canonical tokenization, so its finished turn no longer matches the history the
+client sends back; instead of a multi-gigabyte snapshot of each prompt, the recurrent layers' state
+at the prompt's end (fixed-size, megabytes) is kept, and such a turn is rebuilt to its prompt's end
+in memory: its attention caches trimmed and that state put back. A conversation keeps only its
 longest earlier snapshot. Caches are loaded at startup, so a restart or crash resumes a 40k-token conversation
 in seconds instead of re-reading it for minutes. A turn that finds memory holding less of its
 prompt than disk does (at least 1024 tokens less) loads the disk copy: on a Mac where one long

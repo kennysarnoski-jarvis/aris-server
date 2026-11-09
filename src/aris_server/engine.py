@@ -13,7 +13,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 from mlx_lm import server as mls
 from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START, PromptProcessingBatch, TextStateMachine
-from mlx_lm.models.cache import LRUPromptCache, can_trim_prompt_cache
+from mlx_lm.models.cache import ArraysCache, LRUPromptCache, can_trim_prompt_cache
 
 from .budget import BudgetTokens, ThinkBudget
 from .config import ModelSpec, home
@@ -86,13 +86,21 @@ class MovingPromptCache(LRUPromptCache):
     system-prompt segment is still copied for every conversation that starts from it."""
 
     disk = None  # DiskCache: entries go to disk when memory lets them go (see insert_cache)
-    # Snapshots of a prompt being answered are kept only past this length, where re-reading would cost minutes.
-    snapshot_min_tokens = 16384
+    # Full snapshots of a prompt being answered go to disk only from this length (off by default: the in-memory
+    # rebuild below covers what they were for, and at 2-4 GB each they wrote ~45 GB an hour).
+    snapshot_min_tokens = 1 << 62
+    light_min_tokens = 1024  # shorter prompts are quick to re-read
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.reading: list[list[int]] = []  # prompts of the requests in flight
         self._trie = _EvictionTrie(self._trie, self._evicted)
+        # Prompt-end recurrent state of requests in flight, then of the turns they finished as. A finished turn
+        # whose history comes back tokenized differently is rebuilt to its prompt's end from these: its attention
+        # caches trimmed (they hold the prompt's tokens first) and its recurrent layers' state put back. The
+        # recurrent state is small and fixed-size, so this costs megabytes where a full snapshot costs gigabytes.
+        self._prompt_state: dict[tuple, list] = {}
+        self._turn_state: dict[tuple, tuple[int, list]] = {}
 
     def _save(self, tokens, prompt_cache, cache_type):
         if self.disk is None or self.disk.has(tokens):
@@ -117,6 +125,18 @@ class MovingPromptCache(LRUPromptCache):
         # Disk is enough for the retry it exists for. The shared system prompt stays in memory.
         mid_request = cache_type != "system" and any(
             len(tokens) < len(p) and p[:len(tokens)] == list(tokens) for p in self.reading)
+        if mid_request and len(tokens) >= self.light_min_tokens:
+            self._prompt_state[tuple(tokens)] = [list(c.cache) if isinstance(c, ArraysCache) else None
+                                                 for c in prompt_cache]
+            while len(self._prompt_state) > 8:
+                self._prompt_state.pop(next(iter(self._prompt_state)))
+        elif cache_type != "system":
+            key = tuple(tokens)
+            at = max((k for k in self._prompt_state if len(k) < len(key) and key[:len(k)] == k), key=len, default=None)
+            if at is not None:
+                self._turn_state[key] = (len(at), self._prompt_state.pop(at))
+                while len(self._turn_state) > 8:
+                    self._turn_state.pop(next(iter(self._turn_state)))
         if not mid_request:
             before = {k for k in self._entry_keys()}
             # The turn that just finished is the cache its conversation's next turn continues, often within seconds:
@@ -149,8 +169,45 @@ class MovingPromptCache(LRUPromptCache):
         return [(kind, len(key)) for kind, lru in self._lru._lrus.items() for _, key in lru] \
             if hasattr(self._lru, "_lrus") else []
 
+    def _rebuild_diverged(self, model, tokens, have: int):
+        """The finished turn of this conversation, rebuilt to its prompt's end, when the request diverges from it
+        after that point and the rebuild covers more than `have` tokens."""
+        key = list(tokens)
+        for entry_key, (n, states) in list(self._turn_state.items()):
+            if not (have < n < len(key)) or list(entry_key[:n]) != key[:n] or list(entry_key) == key[:len(entry_key)]:
+                continue
+            try:
+                entry = self._trie.get(model, list(entry_key))
+            except Exception:  # noqa: BLE001  no longer cached: taken, evicted or dropped
+                self._turn_state.pop(entry_key, None)
+                continue
+            if not all(state is not None or hasattr(layer, "trim")
+                       for layer, state in zip(entry.prompt_cache, states)):
+                continue  # a cache type that can't be cut back: the disk path covers it
+            self._trie.taking = True
+            try:
+                self._trie.pop(model, list(entry_key))
+            finally:
+                self._trie.taking = False
+            self._lru.remove(model, list(entry_key))
+            self._n_bytes -= entry.nbytes
+            self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+            self._turn_state.pop(entry_key, None)
+            for layer, state in zip(entry.prompt_cache, states):
+                if state is not None:
+                    layer.cache = list(state)
+                else:
+                    layer.trim(layer.offset - n)
+            logging.info("rebuilt a %d-token cache in memory from a %d-token turn whose history came back "
+                         "tokenized differently", n, len(entry_key))
+            return entry.prompt_cache, key[n:]
+        return None
+
     def fetch_nearest_cache(self, model, tokens):
         cache, rest = self._fetch_from_memory(model, tokens)
+        rebuilt = self._rebuild_diverged(model, tokens, len(tokens) - len(rest))
+        if rebuilt is not None:
+            return rebuilt
         if self.disk is None:
             return cache, rest
         # Memory holds what fits beside the weights; on a small Mac that can be less than one long conversation plus

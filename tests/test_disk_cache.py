@@ -197,3 +197,19 @@ def test_a_finished_turn_that_diverged_from_its_history_is_dropped_before_the_di
     got, rest = cache.fetch_nearest_cache("m", rendered)
     assert got[0].offset == 2699 and rest == rendered[2699:]                           # resumed from the snapshot
     assert len(cache) == 0 and not cache.disk.has(generated)                           # the dead turn is gone
+
+
+def test_a_diverged_turn_is_rebuilt_to_its_prompt_end_in_memory_without_a_disk_snapshot(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    prompt = TURN2
+    cache.reading.append(prompt)
+    cache.insert_cache("m", prompt[:-1], layers(2699, 1), cache_type="assistant")  # prompt end: recurrent state 1
+    assert cache.disk.index == {}                                                    # no snapshot written
+    cache.reading.remove(prompt)
+    generated = prompt + [5, 6, 7]
+    cache.insert_cache("m", generated, layers(2703, 2), cache_type="assistant")      # finished: state moved on
+    rendered = prompt + [5, 67, 8]                                                   # same text, re-tokenized
+    got, rest = cache.fetch_nearest_cache("m", rendered)
+    assert got[0].offset == 2699 and rest == rendered[2699:]                         # attention trimmed
+    assert mx.all(got[1][1] == 1).item()                                              # recurrent state put back
+    assert len(cache) == 0 and cache.disk.index == {}
