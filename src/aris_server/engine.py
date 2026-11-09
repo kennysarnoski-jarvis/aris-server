@@ -54,7 +54,7 @@ class Run:
 
 class Engine:
     def __init__(self, spec: ModelSpec, decode_concurrency: int = 4, prompt_concurrency: int = 2,
-                 prompt_cache_size: int = 8, prompt_cache_bytes: int | None = None, reserve_gb: float = 6.0):
+                 prompt_cache_size: int = 8, prompt_cache_bytes: int | None = None, reserve_gb: float = 3.0):
         self.spec = spec
         ns = argparse.Namespace(
             model=spec.path, adapter_path=None, draft_model=None, num_draft_tokens=3, trust_remote_code=False,
@@ -86,10 +86,12 @@ class Engine:
         weights = sum(v.nbytes for _, v in tree_flatten(self.provider.model.parameters()))
         limit = mx.device_info()["max_recommended_working_set_size"]
         spare = limit - weights - int(reserve_gb * gb)
+        # The cap covers saved caches plus the copies active sequences work on (mlx-lm trims the LRU to the cap minus
+        # the active bytes). Too small, and a long conversation is evicted after every turn and re-read from scratch.
         if prompt_cache_bytes is None:
-            prompt_cache_bytes = max(spare // 2, gb // 2)
+            prompt_cache_bytes = max(spare, gb // 2)
         cache.max_bytes = ns.prompt_cache_bytes = prompt_cache_bytes
-        mx.set_cache_limit(max(min(spare // 4, 2 * gb), gb // 4))
+        mx.set_cache_limit(max(min(spare // 8, gb), gb // 4))
         logging.info("memory: GPU limit %.1f GB, weights %.1f GB, prompt cache up to %.1f GB, %.1f GB reserved for "
                      "active sequences", limit / gb, weights / gb, prompt_cache_bytes / gb, reserve_gb)
         if spare < gb:
