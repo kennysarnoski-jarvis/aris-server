@@ -15,7 +15,7 @@ from . import __version__
 from .config import ModelSpec, resolve
 from .engine import Engine
 from .stream import MessageBuilder, new_id, progress_note, sse
-from .translate import RequestError, fit_context, plan
+from .translate import RequestError, fit_context, parse_tools, plan
 
 
 # Claude Code drops a stream that sends nothing for a few minutes, and a tool call is only sent once it closes, so a
@@ -143,7 +143,7 @@ class Handler(BaseHTTPRequestHandler):
     def _complete(self, name, p):
         t0 = time.time()
         run = self.server.engine.run(p)
-        builder = MessageBuilder(run.tool_parser, p.tools)
+        builder = MessageBuilder(run.tool_parser, parse_tools(p))
         finish, n, checked = None, 0, time.time()
         for pieces, finish, n in run.pieces:
             for piece in pieces:
@@ -192,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             write([{"type": "ping"}])
             run = self.server.engine.run(p, on_progress=progress)
-            builder = MessageBuilder(run.tool_parser, p.tools)
+            builder = MessageBuilder(run.tool_parser, parse_tools(p))
             holder.append(builder)
             start = _message(name, [], None, run, 0)
             write([{"type": "message_start", "message": start}])

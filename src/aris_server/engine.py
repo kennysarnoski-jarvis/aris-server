@@ -80,12 +80,34 @@ class MovingPromptCache(LRUPromptCache):
         mid_request = cache_type != "system" and any(
             len(tokens) < len(p) and p[:len(tokens)] == list(tokens) for p in self.reading)
         if not mid_request:
-            super().insert_cache(model, tokens, prompt_cache, cache_type=cache_type)
+            before = {k for k in self._entry_keys()}
+            # The turn that just finished is the cache its conversation's next turn continues, often within seconds:
+            # when it's larger than the budget, other entries go and it stays. Evicting it sent that next turn to
+            # disk while mlx-lm still briefly held the evicted copy, putting two copies of the conversation in memory.
+            cap, size = self.max_bytes, sum(c.nbytes for c in prompt_cache)
+            keep = size + self._n_bytes_by_type.get("system", 0)
+            if cache_type != "system" and keep > cap:
+                self.max_bytes = keep
+            try:
+                super().insert_cache(model, tokens, prompt_cache, cache_type=cache_type)
+            finally:
+                self.max_bytes = cap
+            gone = before - {k for k in self._entry_keys()}
+            if gone:
+                gb = 1 << 30
+                logging.info("memory cache: inserting %d tokens evicted %s; %d left, %.1f of %.1f GB", len(tokens),
+                             ", ".join(f"{n}-token {kind}" for kind, n in sorted(gone)), len(self),
+                             self.nbytes / gb, self.max_bytes / gb)
         if self.disk is not None:
             try:
                 self.disk.save(tokens, prompt_cache, cache_type)
             except OSError as e:  # a full disk must not stop generation
                 logging.warning("could not save a prompt cache to disk: %s", e)
+
+    def _entry_keys(self):
+        """(type, length) of each entry, for logging what an insert evicted."""
+        return [(kind, len(key)) for kind, lru in self._lru._lrus.items() for _, key in lru] \
+            if hasattr(self._lru, "_lrus") else []
 
     def fetch_nearest_cache(self, model, tokens):
         cache, rest = self._fetch_from_memory(model, tokens)

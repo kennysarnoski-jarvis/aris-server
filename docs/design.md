@@ -83,6 +83,14 @@ paragraph break, because chat templates re-render past reasoning as `text\n</thi
 as `text\n\n</think>` stops matching its own prompt cache, and the next turn re-reads from there.
 Budgets per effort are set per model, with defaults.
 
+### Deferred tools
+
+Claude Code sends tools marked `defer_loading` and loads them with tool search mid-conversation.
+They stay out of the template's tool list, which heads the prompt: a tool joining it changes the
+prompt's first tokens and the whole conversation is re-read (30k tokens took 6.5 minutes on a 27B
+model). A loaded tool's definition goes into the tool result that loaded it instead, and the
+stream parser still gets every loaded tool's parameter types.
+
 ### Streaming
 
 Headers and `message_start` go out at once. Claude Code doesn't count pings as activity, so when
@@ -109,7 +117,9 @@ it instead of being copied (only the shared system-prompt snapshot is copied), a
 part of a prompt still being answered goes to disk only (the request holds its own copy; two copies
 of a 51k-token conversation ran a 48 GB Mac out of memory), and when a conversation moves from
 reading its prompt to generating, its batch cache is handed over rather than deep-copied (mlx-lm
-copies the whole batch there), so a long context is in memory once. The cache's
+copies the whole batch there), so a long context is in memory once. A turn that just finished is never the entry evicted to
+make room: its conversation's next turn continues it within seconds, and evicting it sent that
+turn to disk while mlx-lm still held the evicted copy. Evictions are logged. The cache's
 budget is what the GPU holds beside the weights less a reserve for prefill scratch. And entries are
 also written to `~/.aris-server/cache/<model>/` as they come in (the read prompt, which a retry
 needs, and the finished turn, which the next turn continues; a conversation keeps only its longest

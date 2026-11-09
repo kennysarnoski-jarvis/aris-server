@@ -74,3 +74,13 @@ def test_a_batch_that_moves_whole_to_generation_hands_its_cache_over():
     moved = whole.split([0])
     assert moved.prompt_cache is layers and moved.uids == [7]      # handed over, not deep-copied
     assert whole.uids == [] and whole.prompt_cache == []
+
+
+def test_a_finished_turn_larger_than_the_budget_stays_and_older_entries_go():
+    cache = MovingPromptCache(max_size=10, max_bytes=50)
+    cache.insert_cache("m", SYSTEM, [Layer(10)], cache_type="system")
+    cache.insert_cache("m", [7] * 50, [Layer(20)], cache_type="assistant")     # an older conversation
+    turn = [Layer(60)]
+    cache.insert_cache("m", TURN1, turn, cache_type="assistant")              # bigger than the whole budget
+    assert cache.fetch_nearest_cache("m", TURN1 + [1])[0] is turn               # still there for the next turn
+    assert cache.fetch_nearest_cache("m", [7] * 50 + [1])[0] is None            # the older one went instead

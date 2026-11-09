@@ -1,5 +1,6 @@
 """Anthropic Messages request -> chat-template input and generation settings."""
 
+import json
 from dataclasses import dataclass, field
 
 from .config import EFFORTS, ModelSpec
@@ -24,8 +25,15 @@ class Plan:
     thinking: bool
     effort: str
     hidden_tools: list[str] = field(default_factory=list)
+    # Deferred tools loaded mid-conversation: described where they were loaded, not in `tools` (see convert_tools).
+    loaded_tools: list[dict] = field(default_factory=list)
     context: int | None = None
     context_capped: bool = False  # max_tokens was cut to fit the context window
+
+
+def parse_tools(p: "Plan") -> list[dict] | None:
+    """Every tool the model may call: the listed ones plus deferred ones loaded so far."""
+    return (p.tools or []) + p.loaded_tools or None
 
 
 class PromptTooLong(RequestError):
@@ -49,7 +57,7 @@ def fit_context(p: "Plan", prompt_tokens: int) -> None:
         p.max_tokens, p.context_capped = room, True
 
 
-def _text(content) -> str:
+def _text(content, defs: dict | None = None) -> str:
     """Flatten a string or a list of content blocks to text."""
     if content is None:
         return ""
@@ -63,9 +71,11 @@ def _text(content) -> str:
         elif kind == "image":
             parts.append("[image omitted: this model cannot see images]")
         elif kind == "tool_reference":
-            parts.append(f"Tool {block.get('tool_name', '')} is now available.")
+            name = block.get("tool_name", "")
+            spec = (defs or {}).get(name)
+            parts.append(f"Tool {name} is now available." + (f" Its definition:\n{json.dumps(spec)}" if spec else ""))
         elif kind == "document":
-            parts.append(_text(block.get("source", {}).get("content")) or "[document omitted]")
+            parts.append(_text(block.get("source", {}).get("content"), defs) or "[document omitted]")
     return "\n".join(p for p in parts if p)
 
 
@@ -80,7 +90,7 @@ def _loaded_tools(messages) -> set[str]:
     return names
 
 
-def convert_messages(system, messages) -> list[dict]:
+def convert_messages(system, messages, defs: dict | None = None) -> list[dict]:
     out = []
     sys_text = _text(system)
     if sys_text:
@@ -111,7 +121,7 @@ def convert_messages(system, messages) -> list[dict]:
                 if block.get("type") == "tool_result":
                     if pending:
                         out.append({"role": "user", "content": "\n".join(pending)}); pending = []
-                    text = _text(block.get("content"))
+                    text = _text(block.get("content"), defs)
                     if block.get("is_error") and "error" not in text[:40].lower():
                         text = f"Error: {text}"
                     out.append({"role": "tool", "tool_call_id": block.get("tool_use_id"), "content": text})
@@ -144,20 +154,28 @@ def convert_messages(system, messages) -> list[dict]:
     return out
 
 
-def convert_tools(tools, messages) -> tuple[list[dict] | None, list[str]]:
+def convert_tools(tools, messages) -> tuple[list[dict] | None, list[str], list[dict]]:
+    """(listed tools, names of deferred tools not loaded, deferred tools loaded). Loaded deferred tools stay out of
+    the listed ones: chat templates render the list at the top of the prompt, so a tool joining it mid-conversation
+    changes the prompt's first tokens and the whole conversation is re-read (20k tokens, minutes, on a local model).
+    Their definitions go where tool search loaded them instead."""
     if not tools:
-        return None, []
+        return None, [], []
     loaded = _loaded_tools(messages)
-    out, hidden = [], []
+    out, hidden, late = [], [], []
     for t in tools:
         if "input_schema" not in t:  # server-side tools (web search etc.) can't run locally
             continue
-        if t.get("defer_loading") and t["name"] not in loaded:
-            hidden.append(t["name"])
+        fn = {"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
+                                               "parameters": t["input_schema"]}}
+        if t.get("defer_loading"):
+            if t["name"] in loaded:
+                late.append(fn)
+            else:
+                hidden.append(t["name"])
             continue
-        out.append({"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
-                                                     "parameters": t["input_schema"]}})
-    return out or None, hidden
+        out.append(fn)
+    return out or None, hidden, late
 
 
 def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
@@ -181,9 +199,9 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
         budget = max(int(budget * spec.followup_budget), MIN_FOLLOWUP_BUDGET)
 
     max_tokens = int(body.get("max_tokens") or default_max)
-    tools, hidden = convert_tools(body.get("tools"), body["messages"])
-    messages = convert_messages(body.get("system"), body["messages"])
-    tools, messages = _apply_tool_choice(body.get("tool_choice"), tools, messages)
+    tools, hidden, late = convert_tools(body.get("tools"), body["messages"])
+    messages = convert_messages(body.get("system"), body["messages"], {f["function"]["name"]: f for f in late})
+    tools, messages = _apply_tool_choice(body.get("tool_choice"), tools, messages, late)
     return Plan(
         messages=messages,
         tools=tools,
@@ -197,6 +215,7 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
         thinking=thinking,
         effort=effort,
         hidden_tools=hidden,
+        loaded_tools=late,
         context=spec.context,
     )
 
@@ -218,7 +237,7 @@ def _continues_tool_loop(messages) -> bool:
     return not typed
 
 
-def _apply_tool_choice(choice, tools, messages):
+def _apply_tool_choice(choice, tools, messages, late=()):
     """Open models can't be forced to call a tool, so "any" and a named tool become an instruction (and a named
     tool narrows the list); "none" removes the tools."""
     kind = (choice or {}).get("type", "auto")
@@ -227,7 +246,7 @@ def _apply_tool_choice(choice, tools, messages):
     if kind == "none":
         return None, messages
     if kind == "tool":
-        named = [t for t in tools if t["function"]["name"] == choice.get("name")]
+        named = [t for t in [*tools, *late] if t["function"]["name"] == choice.get("name")]
         if not named:
             raise RequestError(f"tool_choice names unknown tool {choice.get('name')!r}")
         tools, note = named, f"Respond by calling the {choice['name']} tool."

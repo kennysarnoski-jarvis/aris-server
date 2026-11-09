@@ -1,7 +1,7 @@
 import pytest
 
 from aris_server.config import ModelSpec
-from aris_server.translate import RequestError, plan
+from aris_server.translate import RequestError, parse_tools, plan
 
 ARETE = ModelSpec(name="arete:27b", path="x", context=131072, effort_kwarg="reasoning_effort",
                   effort_map={"high": "medium", "xhigh": "xhigh"})
@@ -55,8 +55,12 @@ def test_deferred_tools_stay_hidden_until_tool_search_loads_them():
         {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "ToolSearch", "input": {"query": "monitor"}}]},
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
                                       "content": [{"type": "tool_reference", "tool_name": "Monitor"}]}]}]), ARETE)
-    assert [t["function"]["name"] for t in after.tools] == ["Bash", "Monitor"]
-    assert after.messages[-1]["content"] == "Tool Monitor is now available."
+    # The listed tools never change mid-conversation (they head the prompt, so a change re-reads all of it); a
+    # loaded tool's definition goes where it was loaded, and the parser still knows it.
+    assert [t["function"]["name"] for t in after.tools] == ["Bash"]
+    assert after.messages[-1]["content"].startswith("Tool Monitor is now available. Its definition:\n")
+    assert '"name": "Monitor"' in after.messages[-1]["content"]
+    assert [t["function"]["name"] for t in parse_tools(after)] == ["Bash", "Monitor"]
 
 
 @pytest.mark.parametrize("req,kwargs,budget", [
