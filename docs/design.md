@@ -105,7 +105,9 @@ running, pile up, and exhaust GPU memory.
 mlx-lm's LRU cache, with three changes. A conversation's cache moves to the turn that continues
 it instead of being copied (only the shared system-prompt snapshot is copied), and a snapshot of
 part of a prompt still being answered goes to disk only (the request holds its own copy; two copies
-of a 51k-token conversation ran a 48 GB Mac out of memory), so a long context is in memory once. The cache's
+of a 51k-token conversation ran a 48 GB Mac out of memory), and when a conversation moves from
+reading its prompt to generating, its batch cache is handed over rather than deep-copied (mlx-lm
+copies the whole batch there), so a long context is in memory once. The cache's
 budget is what the GPU holds beside the weights less a reserve for prefill scratch. And entries are
 also written to `~/.aris-server/cache/<model>/` as they come in (the read prompt, which a retry
 needs, and the finished turn, which the next turn continues; a conversation keeps only its longest

@@ -11,7 +11,7 @@ from typing import Callable, Optional
 import mlx.core as mx
 from mlx.utils import tree_flatten
 from mlx_lm import server as mls
-from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START, TextStateMachine
+from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START, PromptProcessingBatch, TextStateMachine
 from mlx_lm.models.cache import LRUPromptCache, can_trim_prompt_cache
 
 from .budget import BudgetTokens, ThinkBudget
@@ -35,6 +35,26 @@ def _processors(args):
 
 
 mls._make_logits_processors = _processors
+
+
+_orig_split = PromptProcessingBatch.split
+
+
+def _split(self, indices):
+    """mlx-lm deep-copies the whole batch's cache when sequences move from prompt reading to generation, then
+    discards the rest. With one conversation in flight, that's a second copy of a long context (4.5 GB at 66k tokens
+    for a 27B model) at the moment generation starts: it ran a 48 GB Mac out of memory. When every sequence moves,
+    hand the cache over instead."""
+    if sorted(indices) != list(range(len(self.uids))):
+        return _orig_split(self, indices)
+    moved = self.__class__.__new__(self.__class__)
+    moved.__dict__.update(self.__dict__)
+    self.prompt_cache = []
+    self.filter([])
+    return moved
+
+
+PromptProcessingBatch.split = _split
 
 
 DISK_MIN_GAIN = 1024  # fewer extra tokens than this are as quick to read as the cache file

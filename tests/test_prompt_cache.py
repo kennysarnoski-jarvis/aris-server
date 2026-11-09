@@ -56,3 +56,21 @@ def test_the_prompt_cache_shrinks_by_how_far_memory_got_into_the_headroom():
     assert shrink_cap(5 * gb, peak=30 * gb, limit=37 * gb, headroom=2 * gb) == 5 * gb       # plenty of room
     assert shrink_cap(5 * gb, peak=36 * gb, limit=37 * gb, headroom=2 * gb) == 4 * gb       # 1 GB too close
     assert shrink_cap(2 * gb, peak=40 * gb, limit=37 * gb, headroom=2 * gb) == 1 * gb       # never below the floor
+
+
+def test_a_batch_that_moves_whole_to_generation_hands_its_cache_over():
+    from mlx_lm.generate import PromptProcessingBatch
+
+    import aris_server.engine  # noqa: F401  (installs the patch)
+
+    def batch(uids):
+        b = PromptProcessingBatch.__new__(PromptProcessingBatch)
+        b.uids, b.prompt_cache, b.tokens = list(uids), [Layer(5)], [[1]] * len(uids)
+        b.samplers = b.logits_processors = b.max_tokens = b.stop_sequences = [None] * len(uids)
+        return b
+
+    whole = batch([7])
+    layers = whole.prompt_cache
+    moved = whole.split([0])
+    assert moved.prompt_cache is layers and moved.uids == [7]      # handed over, not deep-copied
+    assert whole.uids == [] and whole.prompt_cache == []
