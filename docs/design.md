@@ -97,6 +97,19 @@ stops its generation, also when nothing is being written to it (non-streaming re
 call in progress): the socket is checked every two seconds. Abandoned generations otherwise keep
 running, pile up, and exhaust GPU memory.
 
+## Prompt cache
+
+mlx-lm's LRU cache, with three changes. A conversation's cache moves to the turn that continues
+it instead of being copied (only the shared system-prompt snapshot is copied), and the mid-turn
+snapshot of the whole conversation is skipped, so a long context is in memory once. The cache's
+budget is what the GPU holds beside the weights less a reserve for prefill scratch. And entries are
+also written to `~/.aris-server/cache/<model>/` as they come in (the read prompt, which a retry
+needs, and the finished turn, which the next turn continues; a conversation keeps only its longest
+earlier snapshot), then loaded at startup, so a restart or crash resumes a 40k-token conversation
+in seconds instead of re-reading it for minutes. A cache file without its metadata file is a write
+that was cut off and is deleted. Loaded caches are evaluated before generation uses them: MLX binds
+a lazy load to the loading thread's stream.
+
 ## Model settings
 
 `~/.aris-server/models.toml`:

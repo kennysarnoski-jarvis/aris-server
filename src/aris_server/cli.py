@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import signal
 import sys
 
 from . import __version__
@@ -38,6 +39,7 @@ def main(argv=None):
     s.add_argument("--api-key", help="require this key in x-api-key")
     s.add_argument("--concurrency", type=int, default=4, help="sequences decoded at once")
     s.add_argument("--prompt-cache-gb", type=float, help="memory for saved prompt caches (default: fit to the GPU)")
+    s.add_argument("--disk-cache-gb", type=float, default=20.0, help="disk for saved prompt caches (0 turns it off)")
     s.add_argument("--reserve-gb", type=float, default=6.0, help="GPU memory kept free for active sequences")
     s.add_argument("--log-level", default="INFO")
     sub.add_parser("models", help="list configured models")
@@ -66,9 +68,15 @@ def main(argv=None):
 
     _wired_limit()
     engine = Engine(resolve(name, models), decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
+                    disk_cache_gb=a.disk_cache_gb,
                     prompt_cache_bytes=int(a.prompt_cache_gb * (1 << 30)) if a.prompt_cache_gb else None)
     server = Server((a.host, a.port), engine, models, a.api_key)
     logging.info("Aris Server %s serving %s on http://%s:%d", __version__, name, a.host, a.port)
+
+    def stop(*_):  # a service manager stops with SIGTERM: finish the current step (and any cache write) first
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

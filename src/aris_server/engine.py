@@ -15,7 +15,8 @@ from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START, TextStateMachine
 from mlx_lm.models.cache import LRUPromptCache, can_trim_prompt_cache
 
 from .budget import BudgetTokens, ThinkBudget
-from .config import ModelSpec
+from .config import ModelSpec, home
+from .disk_cache import DiskCache
 from .translate import Plan
 
 
@@ -41,6 +42,16 @@ class MovingPromptCache(LRUPromptCache):
     for the whole turn (2.4 GB extra at 37k tokens on a 27B model, enough to run a 48 GB Mac out of memory). A
     conversation's cache is only ever continued by its next turn, so it moves to that request instead; the shared
     system-prompt segment is still copied for every conversation that starts from it."""
+
+    disk = None  # DiskCache: entries are also written to disk as they come in
+
+    def insert_cache(self, model, tokens, prompt_cache, *, cache_type="assistant"):
+        super().insert_cache(model, tokens, prompt_cache, cache_type=cache_type)
+        if self.disk is not None:
+            try:
+                self.disk.save(tokens, prompt_cache, cache_type)
+            except OSError as e:  # a full disk must not stop generation
+                logging.warning("could not save a prompt cache to disk: %s", e)
 
     def fetch_nearest_cache(self, model, tokens):
         result = self._trie.search(model, tokens)
@@ -93,7 +104,8 @@ class Run:
 
 class Engine:
     def __init__(self, spec: ModelSpec, decode_concurrency: int = 4, prompt_concurrency: int = 2,
-                 prompt_cache_size: int = 8, prompt_cache_bytes: int | None = None, reserve_gb: float = 6.0):
+                 prompt_cache_size: int = 8, prompt_cache_bytes: int | None = None, reserve_gb: float = 6.0,
+                 disk_cache_gb: float = 20.0):
         self.spec = spec
         ns = argparse.Namespace(
             model=spec.path, adapter_path=None, draft_model=None, num_draft_tokens=3, trust_remote_code=False,
@@ -116,6 +128,14 @@ class Engine:
         self.tokenizer = self.provider.tokenizer
         self.budget_tokens = BudgetTokens(self.tokenizer)
         self._fit_memory(cache, ns, prompt_cache_bytes, reserve_gb)
+        if disk_cache_gb > 0:
+            disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)))
+            key = self.provider.model_key
+            restored = disk.restore(lambda t, c, kind: LRUPromptCache.insert_cache(cache, key, t, c, cache_type=kind),
+                                    cache.max_bytes)
+            cache.disk = disk
+            if restored:
+                logging.info("restored %.1f GB of prompt caches from disk", restored / (1 << 30))
         threading.Thread(target=self._watch, daemon=True).start()
         logging.info("loaded %s (thinking=%s, tools=%s, think-end id=%s)", spec.path, self.tokenizer.has_thinking,
                      self.tokenizer.has_tool_calling, self.budget_tokens.end_id)
