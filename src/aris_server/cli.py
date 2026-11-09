@@ -38,7 +38,7 @@ def main(argv=None):
     s.add_argument("--api-key", help="require this key in x-api-key")
     s.add_argument("--concurrency", type=int, default=4, help="sequences decoded at once")
     s.add_argument("--prompt-cache-gb", type=float, help="memory for saved prompt caches (default: fit to the GPU)")
-    s.add_argument("--reserve-gb", type=float, default=3.0, help="GPU memory kept free for active sequences")
+    s.add_argument("--reserve-gb", type=float, default=6.0, help="GPU memory kept free for active sequences")
     s.add_argument("--log-level", default="INFO")
     sub.add_parser("models", help="list configured models")
     a = ap.parse_args(argv)
