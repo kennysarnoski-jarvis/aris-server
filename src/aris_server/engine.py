@@ -61,17 +61,55 @@ PromptProcessingBatch.split = _split
 DISK_MIN_GAIN = 1024  # fewer extra tokens than this are as quick to read as the cache file
 
 
+class _EvictionTrie:
+    """mlx-lm's prompt trie, reporting entries the LRU evicts (and not ones a request takes) so they can go to disk
+    on the way out."""
+
+    def __init__(self, trie, on_evict):
+        self._trie, self._on_evict = trie, on_evict
+        self.taking = False
+
+    def __getattr__(self, name):
+        return getattr(self._trie, name)
+
+    def pop(self, model, tokens):
+        entry = self._trie.pop(model, tokens)
+        if not self.taking:
+            self._on_evict(tokens, entry)
+        return entry
+
+
 class MovingPromptCache(LRUPromptCache):
     """mlx-lm copies a saved cache for the request that continues it, so a long conversation sits in memory twice
     for the whole turn (2.4 GB extra at 37k tokens on a 27B model, enough to run a 48 GB Mac out of memory). A
     conversation's cache is only ever continued by its next turn, so it moves to that request instead; the shared
     system-prompt segment is still copied for every conversation that starts from it."""
 
-    disk = None  # DiskCache: entries are also written to disk as they come in
+    disk = None  # DiskCache: entries go to disk when memory lets them go (see insert_cache)
+    # Snapshots of a prompt being answered are kept only past this length, where re-reading would cost minutes.
+    snapshot_min_tokens = 16384
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.reading: list[list[int]] = []  # prompts of the requests in flight
+        self._trie = _EvictionTrie(self._trie, self._evicted)
+
+    def _save(self, tokens, prompt_cache, cache_type):
+        if self.disk is None or self.disk.has(tokens):
+            return
+        try:
+            self.disk.save(tokens, prompt_cache, cache_type)
+        except OSError as e:  # a full disk must not stop generation
+            logging.warning("could not save a prompt cache to disk: %s", e)
+
+    def _evicted(self, tokens, entry):
+        self._save(tokens, entry.prompt_cache, entry.cache_type)
+
+    def flush(self):
+        """Write what is only in memory, for a restart to resume from (a graceful stop calls this)."""
+        for kind, lru in self._lru._lrus.items():
+            for model, key in list(lru):
+                self._save(key, self._trie.get(model, key).prompt_cache, kind)
 
     def insert_cache(self, model, tokens, prompt_cache, *, cache_type="assistant"):
         # A snapshot of part of a prompt still being answered: the request holds its own copy, so keeping this one
@@ -98,11 +136,13 @@ class MovingPromptCache(LRUPromptCache):
                 logging.info("memory cache: inserting %d tokens evicted %s; %d left, %.1f of %.1f GB", len(tokens),
                              ", ".join(f"{n}-token {kind}" for kind, n in sorted(gone)), len(self),
                              self.nbytes / gb, self.max_bytes / gb)
-        if self.disk is not None:
-            try:
-                self.disk.save(tokens, prompt_cache, cache_type)
-            except OSError as e:  # a full disk must not stop generation
-                logging.warning("could not save a prompt cache to disk: %s", e)
+        # Disk writes are kept to what is needed: a cache of 40k tokens is 3 GB, and writing every turn put 445 GB on
+        # an SSD in one day. A finished turn is written only when memory evicts it (or at shutdown): usually its next
+        # turn takes it from memory first. The shared system prompt is written at once, and a snapshot of a long
+        # prompt being answered too: it is what a retry, or a next turn whose re-rendered history tokenizes
+        # differently from what was generated, resumes from.
+        if cache_type == "system" or (mid_request and len(tokens) >= self.snapshot_min_tokens):
+            self._save(tokens, prompt_cache, cache_type)
 
     def _entry_keys(self):
         """(type, length) of each entry, for logging what an insert evicted."""
@@ -151,7 +191,11 @@ class MovingPromptCache(LRUPromptCache):
         entry = self._trie.get(result.model, key)
         if entry.cache_type == "system":
             return super().fetch_nearest_cache(model, tokens)
-        self._trie.pop(result.model, key)
+        self._trie.taking = True
+        try:
+            self._trie.pop(result.model, key)
+        finally:
+            self._trie.taking = False
         self._lru.remove(result.model, key)
         self._n_bytes -= entry.nbytes
         self._n_bytes_by_type[entry.cache_type] -= entry.nbytes

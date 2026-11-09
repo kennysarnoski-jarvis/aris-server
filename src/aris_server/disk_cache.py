@@ -46,6 +46,10 @@ class DiskCache:
             meta = json.loads(f.read_text())
             self.index[data] = (tuple(meta["tokens"]), meta["type"])
 
+    def has(self, tokens) -> bool:
+        key = tuple(tokens)
+        return any(t == key for t, _ in self.index.values())
+
     def save(self, tokens, prompt_cache, cache_type: str):
         if len(tokens) < MIN_TOKENS or cache_type not in ("system", "assistant"):
             return

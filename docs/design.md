@@ -126,10 +126,13 @@ reading its prompt to generating, its batch cache is handed over rather than dee
 copies the whole batch there), so a long context is in memory once. A turn that just finished is never the entry evicted to
 make room: its conversation's next turn continues it within seconds, and evicting it sent that
 turn to disk while mlx-lm still held the evicted copy. Evictions are logged. The cache's
-budget is what the GPU holds beside the weights less a reserve for prefill scratch. And entries are
-also written to `~/.aris-server/cache/<model>/` as they come in (the read prompt, which a retry
-needs, and the finished turn, which the next turn continues; a conversation keeps only its longest
-earlier snapshot), then loaded at startup, so a restart or crash resumes a 40k-token conversation
+budget is what the GPU holds beside the weights less a reserve for prefill scratch. And entries go to
+`~/.aris-server/cache/<model>/` when memory lets them go: a finished turn when the LRU evicts it or
+at a graceful stop (usually its next turn takes it from memory first and it is never written), the
+shared system prompt at once, and a snapshot of a long prompt being answered (16k+ tokens), which a
+retry, or a next turn whose re-rendered history tokenizes differently from what was generated,
+resumes from. Writing every turn put 445 GB on an SSD in one day. A conversation keeps only its
+longest earlier snapshot. Caches are loaded at startup, so a restart or crash resumes a 40k-token conversation
 in seconds instead of re-reading it for minutes. A turn that finds memory holding less of its
 prompt than disk does (at least 1024 tokens less) loads the disk copy: on a Mac where one long
 conversation plus the system prompt doesn't fit the memory budget, the conversation is evicted

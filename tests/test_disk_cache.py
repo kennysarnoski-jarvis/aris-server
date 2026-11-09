@@ -29,6 +29,8 @@ def test_a_restarted_server_resumes_the_conversation_from_disk(tmp_path):
     cache.insert_cache("m", SYSTEM, layers(1200, 1), cache_type="system")
     cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")
     cache.insert_cache("m", TURN2, layers(2700, 3), cache_type="assistant")
+    assert len(list(tmp_path.rglob("*.safetensors"))) == 1  # the system prompt; turns wait in memory
+    cache.flush()                                            # a graceful stop
     assert len(list(tmp_path.rglob("*.safetensors"))) == 3  # system, turn 1 (longest earlier snapshot), turn 2
 
     fresh = MovingPromptCache(max_size=10)
@@ -41,6 +43,18 @@ def test_a_restarted_server_resumes_the_conversation_from_disk(tmp_path):
     assert mx.all(lin[1] == 3).item()
     got, rest = fresh.fetch_nearest_cache("m", SYSTEM + [9])
     assert rest == [9] and got[0].offset == 1200
+
+
+def test_a_finished_turn_reaches_disk_only_when_memory_lets_it_go(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")
+    assert cache.disk.index == {}                                       # its next turn usually takes it first
+    cache.trim_to(n_bytes=0)                                            # evicted: written on the way out
+    assert [len(t) for t, _ in cache.disk.index.values()] == [2200]
+    taken = cache_with_disk(tmp_path / "b")
+    taken.insert_cache("m", TURN2, layers(2700, 3), cache_type="assistant")
+    assert taken.fetch_nearest_cache("m", TURN2 + [1])[1] == [1]        # taken by the next turn: never written
+    assert taken.disk.index == {}
 
 
 def test_short_prompts_and_mid_turn_snapshots_stay_off_disk(tmp_path):
@@ -62,6 +76,7 @@ def test_other_weights_never_see_these_caches_and_the_disk_cap_holds(tmp_path):
 def test_an_interrupted_write_is_ignored(tmp_path):
     cache = cache_with_disk(tmp_path)
     cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")
+    cache.flush()
     (meta,) = list(tmp_path.rglob("*.json"))
     meta.unlink()
     assert DiskCache(tmp_path, "model-a", max_bytes=1 << 30).index == {}
@@ -70,6 +85,7 @@ def test_an_interrupted_write_is_ignored(tmp_path):
 def test_partial_writes_are_cleaned_up_at_startup(tmp_path):
     cache = cache_with_disk(tmp_path)
     cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")
+    cache.flush()
     (meta,) = list(tmp_path.rglob("*.json"))
     meta.unlink()
     DiskCache(tmp_path, "model-a", max_bytes=1 << 30)
@@ -94,6 +110,7 @@ def test_a_conversation_evicted_from_memory_comes_back_from_disk(tmp_path):
 
 def test_a_snapshot_of_a_prompt_still_being_answered_goes_to_disk_only(tmp_path):
     cache = cache_with_disk(tmp_path)
+    cache.snapshot_min_tokens = 1024
     prompt = TURN2
     cache.reading.append(prompt)
     cache.insert_cache("m", SYSTEM, layers(1200, 1), cache_type="system")           # shared: stays in memory
@@ -110,8 +127,12 @@ def test_a_retry_and_a_continuation_both_find_a_snapshot(tmp_path):
     prompt = TURN1
     answered = TURN1 + [42, 43]
     cache = cache_with_disk(tmp_path)
+    cache.snapshot_min_tokens = 1024
+    cache.reading.append(prompt)
     cache.insert_cache("m", prompt[:-1], layers(2199, 1), cache_type="assistant")   # prompt read
+    cache.reading.remove(prompt)
     cache.insert_cache("m", answered, layers(2202, 2), cache_type="assistant")      # answer finished
+    cache.flush()
     fresh = MovingPromptCache(max_size=10)
     DiskCache(tmp_path, "model-a", max_bytes=1 << 30).restore(
         lambda t, c, kind: fresh.insert_cache("m", t, c, cache_type=kind), budget=1 << 30)
@@ -123,6 +144,7 @@ def test_a_third_turn_drops_the_first_turns_snapshots(tmp_path):
     cache = cache_with_disk(tmp_path)
     for n, length in enumerate([1500, 1600, 1700, 1800]):
         cache.insert_cache("m", list(range(length)), layers(length, n), cache_type="assistant")
+    cache.flush()
     assert sorted(len(t) for t, _ in cache.disk.index.values()) == [1700, 1800]
 
 
@@ -131,6 +153,7 @@ def test_restored_caches_can_be_used_from_another_thread(tmp_path):
 
     cache = cache_with_disk(tmp_path)
     cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")
+    cache.flush()
     fresh = MovingPromptCache(max_size=10)
     DiskCache(tmp_path, "model-a", max_bytes=1 << 30).restore(
         lambda t, c, kind: fresh.insert_cache("m", t, c, cache_type=kind), budget=1 << 30)
