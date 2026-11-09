@@ -152,3 +152,26 @@ def test_prefill_progress_lines_never_reach_the_model():
     ]), ARETE)
     assert p.messages[1]["reasoning_content"] == "real plan"
     assert "reasoning_content" not in p.messages[2]
+
+
+@pytest.mark.parametrize("last,budget", [
+    ({"role": "user", "content": "build it"}, 8192),
+    ({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}, 4096),
+    ({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"},
+                                  {"type": "text", "text": "<system-reminder>todo</system-reminder>"}]}, 4096),
+    ({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"},
+                                  {"type": "text", "text": "actually use a BTreeMap"}]}, 8192),
+])
+def test_turns_that_continue_a_tool_loop_get_a_smaller_think_budget(last, budget):
+    msgs = [{"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Bash", "input": {}}]}, last]
+    assert plan(body(messages=msgs), ModelSpec(name="m", path="m")).think_budget == budget
+
+
+def test_followup_budget_has_a_floor_and_explicit_budgets_win():
+    msgs = [{"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Bash", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}]
+    assert plan(body(messages=msgs, output_config={"effort": "low"}), ModelSpec(name="m", path="m")).think_budget == 512
+    explicit = plan(body(messages=msgs, thinking={"type": "enabled", "budget_tokens": 3000}), ModelSpec(name="m", path="m"))
+    assert explicit.think_budget == 3000

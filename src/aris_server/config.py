@@ -24,6 +24,9 @@ class ModelSpec:
     # Thinking tokens allowed per effort before thinking is closed at the next paragraph break; 0 = unlimited.
     think_budget: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_THINK_BUDGET))
     template_kwargs: dict = field(default_factory=dict)
+    # Share of the think budget for turns that continue the model's own tool loop: the plan exists by then, and
+    # overthinking models re-plan from scratch on every tool result.
+    followup_budget: float = 0.5
     # Sampling when the request doesn't say (Claude Code sends none with thinking on). Qwen-family thinking defaults.
     temperature: float = 0.6
     top_p: float = 0.95
@@ -52,7 +55,7 @@ def load_models(path: Path | None = None) -> dict[str, ModelSpec]:
             effort_map=dict(raw.get("effort_map") or {}),
             think_budget=budget,
             template_kwargs=dict(raw.get("template_kwargs") or {}),
-            **{k: raw[k] for k in ("temperature", "top_p", "top_k") if k in raw},
+            **{k: raw[k] for k in ("temperature", "top_p", "top_k", "followup_budget") if k in raw},
         )
     return out
 

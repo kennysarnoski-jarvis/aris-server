@@ -177,6 +177,8 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
     budget = spec.budget_for(effort) if thinking else 0
     if thinking and thinking_cfg.get("budget_tokens"):
         budget = int(thinking_cfg["budget_tokens"])
+    elif budget and _continues_tool_loop(body["messages"]):
+        budget = max(int(budget * spec.followup_budget), MIN_FOLLOWUP_BUDGET)
 
     max_tokens = int(body.get("max_tokens") or default_max)
     tools, hidden = convert_tools(body.get("tools"), body["messages"])
@@ -197,6 +199,23 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
         hidden_tools=hidden,
         context=spec.context,
     )
+
+
+MIN_FOLLOWUP_BUDGET = 512
+
+
+def _continues_tool_loop(messages) -> bool:
+    """The request answers the model's own tool calls (the last message holds tool results and nothing the user
+    typed), as opposed to starting work on something the user just asked."""
+    last = messages[-1]
+    if last.get("role") != "user" or not isinstance(last.get("content"), list):
+        return False
+    kinds = {b.get("type") for b in last["content"]}
+    if "tool_result" not in kinds:
+        return False
+    typed = [b for b in last["content"] if b.get("type") == "text"
+             and not b.get("text", "").lstrip().startswith("<system-reminder>")]
+    return not typed
 
 
 def _apply_tool_choice(choice, tools, messages):
