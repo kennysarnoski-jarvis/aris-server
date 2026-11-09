@@ -83,6 +83,12 @@ paragraph break, because chat templates re-render past reasoning as `text\n</thi
 as `text\n\n</think>` stops matching its own prompt cache, and the next turn re-reads from there.
 Budgets per effort are set per model, with defaults.
 
+### Claude Code's billing line
+
+Claude Code's system prompt carries an `x-anthropic-billing-header: cc_version=…` line whose
+suffix changes between requests. It is for Anthropic's usage attribution, not the model, and
+midway through the system prompt it made everything after it miss the cache. It is dropped.
+
 ### Deferred tools
 
 Claude Code sends tools marked `defer_loading` and loads them with tool search mid-conversation.

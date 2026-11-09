@@ -187,3 +187,12 @@ def test_models_toml_reads_an_adapter(tmp_path, monkeypatch):
     (tmp_path / "models.toml").write_text('[models."arete-trained:27b"]\npath = "~/models/arete"\nadapter = "~/adapters/expert1"\n')
     spec = load_models(tmp_path / "models.toml")["arete-trained:27b"]
     assert spec.adapter.endswith("/adapters/expert1") and not spec.adapter.startswith("~")
+
+
+def test_claude_codes_per_request_billing_line_never_reaches_the_prompt():
+    # Its suffix changes between requests mid-system-prompt, which would re-read everything after it.
+    for suffix in ("5de", "eed"):
+        p = plan(body(system=[{"type": "text", "text": f"x-anthropic-billing-header: cc_version=2.1.319.{suffix}; "
+                                                       "cc_entrypoint=t3-code;"},
+                              {"type": "text", "text": "You are Claude Code."}]), ARETE)
+        assert p.messages[0] == {"role": "system", "content": "You are Claude Code."}

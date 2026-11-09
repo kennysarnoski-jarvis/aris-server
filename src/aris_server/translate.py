@@ -1,6 +1,7 @@
 """Anthropic Messages request -> chat-template input and generation settings."""
 
 import json
+import re
 from dataclasses import dataclass, field
 
 from .config import EFFORTS, ModelSpec
@@ -90,9 +91,18 @@ def _loaded_tools(messages) -> set[str]:
     return names
 
 
+BILLING_LINE = re.compile(r"^x-anthropic-billing-header:[^\n]*\n?", re.MULTILINE)
+
+
+def _without_billing_line(text: str) -> str:
+    """Claude Code opens its system prompt with a usage-attribution line whose suffix changes between requests; the
+    model has no use for it, and mid-prompt it would make every later token miss the prompt cache."""
+    return BILLING_LINE.sub("", text).strip("\n")
+
+
 def convert_messages(system, messages, defs: dict | None = None) -> list[dict]:
     out = []
-    sys_text = _text(system)
+    sys_text = _without_billing_line(_text(system))
     if sys_text:
         out.append({"role": "system", "content": sys_text})
     for m in messages:
