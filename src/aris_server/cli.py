@@ -43,7 +43,17 @@ def main(argv=None):
     s.add_argument("--reserve-gb", type=float, default=6.0, help="GPU memory kept free for active sequences")
     s.add_argument("--log-level", default="INFO")
     sub.add_parser("models", help="list configured models")
+    svc = sub.add_parser("service", help="run as a login service that restarts itself (macOS launchd)")
+    svc.add_argument("action", choices=["install", "uninstall", "status"])
+    svc.add_argument("serve_args", nargs=argparse.REMAINDER, help="arguments for serve, after --")
     a = ap.parse_args(argv)
+
+    if a.cmd == "service":
+        from . import service
+
+        if a.action == "install":
+            return service.install([x for x in a.serve_args if x != "--"])
+        return service.uninstall() if a.action == "uninstall" else service.status()
 
     models = load_models()
     if a.cmd == "models":

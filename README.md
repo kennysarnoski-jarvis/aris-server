@@ -48,6 +48,18 @@ think_budget = { low = 1024, medium = 4096, high = 8192, xhigh = 16384, max = 0 
 aris-server serve --model arete:27b
 ```
 
+## Run it as a service
+
+```bash
+aris-server service install -- --model arete:27b
+aris-server service status
+aris-server service uninstall
+```
+
+The service starts at login and restarts the server within seconds of any exit (it exits on purpose
+if the GPU runs out of memory). Saved prompt caches mean the conversation picks up where it left off.
+Logs go to `~/.aris-server/server.log`.
+
 ## Status
 
 Early. macOS on Apple Silicon only. See [docs/design.md](docs/design.md) for what's in and out.
