@@ -1,9 +1,11 @@
 """aris-server command line."""
 
 import argparse
+import dataclasses
 import logging
 import signal
 import sys
+from pathlib import Path
 
 from . import __version__
 from .config import home, load_models, resolve
@@ -34,6 +36,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("serve", help="load a model and serve it")
     s.add_argument("--model", help="configured model name, local MLX folder, or Hugging Face repo id")
+    s.add_argument("--adapter", help="LoRA adapter folder to apply on top of the model")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8484)
     s.add_argument("--api-key", help="require this key in x-api-key")
@@ -77,7 +80,13 @@ def main(argv=None):
     from .http import Server
 
     _wired_limit()
-    engine = Engine(resolve(name, models), decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
+    spec = resolve(name, models)
+    if a.adapter:
+        spec = dataclasses.replace(spec, adapter=str(Path(a.adapter).expanduser().resolve()))
+    if spec.adapter and not (Path(spec.adapter) / "adapter_config.json").is_file():
+        print(f"no adapter_config.json in {spec.adapter}", file=sys.stderr)
+        return 2
+    engine = Engine(spec, decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
                     disk_cache_gb=a.disk_cache_gb,
                     prompt_cache_bytes=int(a.prompt_cache_gb * (1 << 30)) if a.prompt_cache_gb else None)
     server = Server((a.host, a.port), engine, models, a.api_key)

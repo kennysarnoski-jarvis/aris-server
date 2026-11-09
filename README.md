@@ -48,6 +48,10 @@ think_budget = { low = 1024, medium = 4096, high = 8192, xhigh = 16384, max = 0 
 aris-server serve --model arete:27b
 ```
 
+A fine-tuned model can ship as a LoRA adapter on top of its base: add `adapter = "~/adapters/expert1"`
+(a folder with `adapter_config.json` and `adapters.safetensors`, as mlx-lm's trainer writes them) to
+a model entry, or pass `--adapter`. Switching between a base model and its adapter is a restart.
+
 ## Run it as a service
 
 ```bash

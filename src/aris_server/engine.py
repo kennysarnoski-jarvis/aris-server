@@ -113,7 +113,7 @@ class Engine:
                  disk_cache_gb: float = 20.0):
         self.spec = spec
         ns = argparse.Namespace(
-            model=spec.path, adapter_path=None, draft_model=None, num_draft_tokens=3, trust_remote_code=False,
+            model=spec.path, adapter_path=spec.adapter, draft_model=None, num_draft_tokens=3, trust_remote_code=False,
             chat_template="", use_default_chat_template=False, temp=spec.temperature, top_p=spec.top_p,
             top_k=spec.top_k, min_p=0.0, max_tokens=32000, chat_template_args={},
             decode_concurrency=decode_concurrency, prompt_concurrency=prompt_concurrency, prefill_step_size=512,
@@ -135,7 +135,7 @@ class Engine:
         self.cache = cache
         self._fit_memory(cache, ns, prompt_cache_bytes, reserve_gb)
         if disk_cache_gb > 0:
-            disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)))
+            disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)), spec.adapter)
             key = self.provider.model_key
             restored = disk.restore(lambda t, c, kind: LRUPromptCache.insert_cache(cache, key, t, c, cache_type=kind),
                                     cache.max_bytes)
@@ -143,7 +143,8 @@ class Engine:
             if restored:
                 logging.info("restored %.1f GB of prompt caches from disk", restored / (1 << 30))
         threading.Thread(target=self._watch, daemon=True).start()
-        logging.info("loaded %s (thinking=%s, tools=%s, think-end id=%s)", spec.path, self.tokenizer.has_thinking,
+        logging.info("loaded %s%s (thinking=%s, tools=%s, think-end id=%s)", spec.path,
+                     f" + adapter {spec.adapter}" if spec.adapter else "", self.tokenizer.has_thinking,
                      self.tokenizer.has_tool_calling, self.budget_tokens.end_id)
 
     def _fit_memory(self, cache, ns, prompt_cache_bytes, reserve_gb):

@@ -18,6 +18,7 @@ class ModelSpec:
     name: str
     path: str
     context: int | None = None
+    adapter: str | None = None  # a LoRA adapter folder (adapter_config.json + adapters.safetensors) on top of path
     # Template variable that carries effort (e.g. "reasoning_effort"), and how request efforts map to its values.
     effort_kwarg: str | None = None
     effort_map: dict[str, str] = field(default_factory=dict)
@@ -51,6 +52,7 @@ def load_models(path: Path | None = None) -> dict[str, ModelSpec]:
             name=name,
             path=str(Path(raw["path"]).expanduser()) if raw["path"].startswith(("~", "/", ".")) else raw["path"],
             context=raw.get("context"),
+            adapter=str(Path(raw["adapter"]).expanduser()) if raw.get("adapter") else None,
             effort_kwarg=raw.get("effort_kwarg"),
             effort_map=dict(raw.get("effort_map") or {}),
             think_budget=budget,

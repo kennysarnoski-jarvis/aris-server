@@ -115,3 +115,18 @@ def test_restored_caches_can_be_used_from_another_thread(tmp_path):
     t.start()
     t.join()
     assert result == [2 * 2200 * 2 * 4]
+
+
+def test_an_adapter_gets_its_own_caches(tmp_path):
+    from aris_server.disk_cache import model_id
+
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "model.safetensors").write_bytes(b"x" * 10)
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapters.safetensors").write_bytes(b"y" * 10)
+    assert model_id(str(base)) != model_id(str(base), str(adapter))
+    before = model_id(str(base), str(adapter))
+    (adapter / "adapters.safetensors").write_bytes(b"y" * 11)  # retrained: new weights, new caches
+    assert model_id(str(base), str(adapter)) != before

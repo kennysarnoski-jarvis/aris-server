@@ -175,3 +175,11 @@ def test_followup_budget_has_a_floor_and_explicit_budgets_win():
     assert plan(body(messages=msgs, output_config={"effort": "low"}), ModelSpec(name="m", path="m")).think_budget == 512
     explicit = plan(body(messages=msgs, thinking={"type": "enabled", "budget_tokens": 3000}), ModelSpec(name="m", path="m"))
     assert explicit.think_budget == 3000
+
+
+def test_models_toml_reads_an_adapter(tmp_path, monkeypatch):
+    from aris_server.config import load_models
+
+    (tmp_path / "models.toml").write_text('[models."arete-trained:27b"]\npath = "~/models/arete"\nadapter = "~/adapters/expert1"\n')
+    spec = load_models(tmp_path / "models.toml")["arete-trained:27b"]
+    assert spec.adapter.endswith("/adapters/expert1") and not spec.adapter.startswith("~")

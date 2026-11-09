@@ -123,6 +123,10 @@ effort_map = { low = "low", medium = "medium", high = "xhigh", xhigh = "xhigh", 
 think_budget = { low = 1024, medium = 4096, high = 8192, xhigh = 16384, max = 0 }  # 0 = no limit
 ```
 
+`adapter` applies a LoRA adapter folder on top of `path` (mlx-lm's format). One configuration is
+resident at a time; base and adapted weights don't fit side by side on most Macs, so switching is a
+restart. Prompt caches are keyed on the base and adapter files, so they never cross between them.
+
 Models without an entry still load by path or repo id with defaults (no effort kwarg, budgets
 only).
 
