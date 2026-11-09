@@ -102,11 +102,7 @@ def main(argv=None):
         pass
     finally:
         server.server_close()
-        engine.generator.stop_and_join()
-        try:
-            engine.cache.flush()
-        except Exception as e:  # noqa: BLE001  a failed flush costs one re-read after the restart, nothing more
-            logging.warning("could not write prompt caches before stopping: %s", e)
+        engine.generator.stop_and_join()  # the generation thread writes the prompt caches as it exits
     return 0
 
 

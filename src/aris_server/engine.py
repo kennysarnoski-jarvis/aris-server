@@ -58,6 +58,26 @@ def _split(self, indices):
 PromptProcessingBatch.split = _split
 
 
+_orig_generate = mls.ResponseGenerator._generate
+
+
+def _generate_then_stop_hook(self):
+    """MLX arrays can only be evaluated on the thread whose streams made them, so work that touches the prompt
+    cache at shutdown (writing it to disk) runs here, on the generation thread, as it exits."""
+    try:
+        _orig_generate(self)
+    finally:
+        hook = getattr(self, "on_stop", None)
+        if hook is not None:
+            try:
+                hook()
+            except Exception as e:  # noqa: BLE001  a failed flush costs one re-read after the restart
+                logging.warning("could not write prompt caches before stopping: %s", e)
+
+
+mls.ResponseGenerator._generate = _generate_then_stop_hook
+
+
 DISK_MIN_GAIN = 1024  # fewer extra tokens than this are as quick to read as the cache file
 
 
@@ -350,6 +370,7 @@ class Engine:
         self.tokenizer = self.provider.tokenizer
         self.budget_tokens = BudgetTokens(self.tokenizer)
         self.cache = cache
+        self.generator.on_stop = cache.flush
         self._fit_memory(cache, ns, prompt_cache_bytes, reserve_gb)
         if disk_cache_gb > 0:
             disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)), spec.adapter)
