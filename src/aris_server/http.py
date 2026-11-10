@@ -57,6 +57,11 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, kind: str, message: str):
         self._json(status, {"type": "error", "error": {"type": kind, "message": message}})
 
+    def _reject(self, e: RequestError):
+        # Logged: a "prompt is too long" is what makes Claude Code compact, which is otherwise invisible here.
+        logging.info("rejected a request: %s", e)
+        return self._error(400, "invalid_request_error", str(e))
+
     def _authorized(self) -> bool:
         key = self.server.api_key
         if not key:
@@ -130,14 +135,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             p = plan(body, spec)
         except RequestError as e:
-            return self._error(400, "invalid_request_error", str(e))
+            return self._reject(e)
         if self.route.endswith("count_tokens"):
             return self._json(200, {"input_tokens": engine.count_tokens(p)})
         p.context = _fit_window(p.context, getattr(engine, "max_context", None))
         try:
             fit_context(p, engine.count_tokens(p))
         except RequestError as e:
-            return self._error(400, "invalid_request_error", str(e))
+            return self._reject(e)
         if body.get("stream"):
             self._stream(name, p)
         else:
