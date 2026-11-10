@@ -140,6 +140,19 @@ def test_overlong_prompt_gets_the_error_claude_code_compacts_on(serve, model_con
     assert not engine.stopped.is_set()
 
 
+@pytest.mark.parametrize("model_context,fits,window", [
+    (131072, 55296, 55296), (8192, 55296, 8192), (8192, None, 8192), (None, None, None)])
+def test_the_model_list_reports_the_context_window_this_machine_holds(serve, model_context, fits, window):
+    # Clients size their compaction from it: past it the server answers "prompt is too long".
+    engine = FakeEngine([])
+    engine.spec = ModelSpec(name="fake", path="fake", context=model_context)
+    engine.max_context = fits
+    conn = http.client.HTTPConnection("127.0.0.1", serve(engine), timeout=10)
+    conn.request("GET", "/v1/models")
+    model = json.loads(conn.getresponse().read())["data"][0]
+    assert model["id"] == "fake" and model.get("context_window") == window
+
+
 def test_slow_prompt_reading_shows_up_as_thinking_so_claude_code_keeps_waiting(serve, monkeypatch):
     monkeypatch.setattr(ah, "PROGRESS_SECONDS", 0.0)
     engine = FakeEngine([("reasoning", "plan"), ("normal", "done"), ("normal", "")], delay=0.01)

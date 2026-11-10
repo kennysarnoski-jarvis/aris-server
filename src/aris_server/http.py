@@ -99,6 +99,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.route == "/v1/models":
             names = [self.server.engine.spec.name] + [n for n in self.server.models if n != self.server.engine.spec.name]
             data = [{"type": "model", "id": n, "display_name": n, "created_at": "1970-01-01T00:00:00Z"} for n in names]
+            window = _fit_window(self.server.engine.spec.context, getattr(self.server.engine, "max_context", None))
+            if window:
+                data[0]["context_window"] = window  # the loaded model's, on this machine: clients compact before it
             return self._json(200, {"data": data, "has_more": False, "first_id": names[0], "last_id": names[-1]})
         self._error(404, "not_found_error", f"no route {self.route}")
 
@@ -130,9 +133,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "invalid_request_error", str(e))
         if self.route.endswith("count_tokens"):
             return self._json(200, {"input_tokens": engine.count_tokens(p)})
-        fits = getattr(engine, "max_context", None)
-        if fits:
-            p.context = min(p.context or fits, fits)
+        p.context = _fit_window(p.context, getattr(engine, "max_context", None))
         try:
             fit_context(p, engine.count_tokens(p))
         except RequestError as e:
@@ -231,6 +232,11 @@ class Handler(BaseHTTPRequestHandler):
                 write([{"type": "error", "error": {"type": "api_error", "message": str(e)}}])
             except OSError:
                 pass
+
+
+def _fit_window(context: int | None, fits: int | None) -> int | None:
+    """Tokens a request's prompt and reply share: the model's context, or less where this machine's memory ends."""
+    return min(context or fits, fits) if fits else context
 
 
 def _engine_died(engine) -> bool:
