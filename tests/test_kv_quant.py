@@ -5,7 +5,6 @@ import mlx.core as mx
 import pytest
 from mlx_lm.generate import BatchGenerator, _merge_caches
 from mlx_lm.models import base as mlx_base
-from mlx_lm.models import qwen3_5
 from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache
 
 from aris_server.disk_cache import DiskCache, model_id
@@ -16,6 +15,7 @@ from aris_server.kv_quant import (
     quantize_kv,
     scaled_dot_product_attention,
 )
+from tiny_models import tiny_hybrid_model
 
 H, D = 2, 64
 TOLERANCE = 0.03  # 8-bit, groups of 64: a step is under 1/100 of the range of unit-normal values
@@ -126,18 +126,6 @@ def test_attention_on_the_8bit_cache_matches_attention_on_the_full_precision_one
         theirs = mlx_base.quantized_scaled_dot_product_attention(queries, qk, qv, scale=D ** -0.5, mask=mask,
                                                                  group_size=64, bits=8)
         close(theirs, got, 1e-4)
-
-
-def tiny_hybrid_model():
-    """Arete's architecture (Qwen3.5: three linear-attention layers to each full-attention one), tiny and random."""
-    args = qwen3_5.TextModelArgs(model_type="qwen3_5", hidden_size=128, intermediate_size=256, num_hidden_layers=4,
-                                 num_attention_heads=12, num_key_value_heads=2, head_dim=64, vocab_size=64,
-                                 linear_num_value_heads=4, linear_num_key_heads=2, linear_key_head_dim=32,
-                                 linear_value_head_dim=32, full_attention_interval=2)
-    mx.random.seed(0)
-    model = qwen3_5.TextModel(args)
-    mx.eval(model.parameters())
-    return model
 
 
 def test_a_hybrid_model_reads_and_generates_the_same_with_an_8bit_cache():

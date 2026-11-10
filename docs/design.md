@@ -174,6 +174,13 @@ every turn, and re-reading 40k tokens costs minutes where the file costs a secon
 that was cut off and is deleted. Loaded caches are evaluated before generation uses them: MLX binds
 a lazy load to the loading thread's stream.
 
+Decoding evaluates the batch's caches every 64 steps. Each step, every linear-attention layer counts its cache's
+padding down, lazily, and only the first such layer's mask reads the count; mlx-lm evaluates cache state after each
+chunk of a prompt but never while decoding. Unread, the counts grew a graph per layer that kept one Metal buffer alive
+per step until the batch emptied: with four requests always in flight, Arete-27B (48 linear-attention layers) reached
+Metal's 499,000-buffer limit after about 10,600 steps (some 40k tokens) and the engine died. MLX's memory count barely
+moved, a few bytes a buffer, while the process held over a GB more.
+
 ## Model settings
 
 `~/.aris-server/models.toml`:

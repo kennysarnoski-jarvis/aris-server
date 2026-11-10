@@ -88,6 +88,28 @@ def _kept_alone(extract):
 PromptProcessingBatch.extract_cache = _kept_alone(PromptProcessingBatch.extract_cache)
 GenerationBatch.extract_cache = _kept_alone(GenerationBatch.extract_cache)
 
+# Each decode step, every linear-attention layer counts its cache's padding down (ArraysCache.advance), lazily, and
+# only the first such layer's mask reads the count. Unread, the others grow a graph that keeps every step's scalar
+# alive, one Metal buffer a step per layer, until the batch empties. mlx-lm evaluates the caches' state after each
+# chunk of a prompt but never while decoding, so with requests always in flight Arete-27B (48 linear-attention
+# layers) reached Metal's 499,000-buffer limit after about 10,600 steps, some 40k tokens at four in flight, and the
+# engine died. MLX's own memory count barely moves (a few bytes a buffer); the process held over a GB more.
+STATE_EVAL_STEPS = 64
+
+_orig_generation_next = GenerationBatch.next
+
+
+def _next_evaluating_cache_state(self):
+    responses = _orig_generation_next(self)
+    self._steps_unevaluated = getattr(self, "_steps_unevaluated", 0) + 1
+    if self._steps_unevaluated >= STATE_EVAL_STEPS:
+        self._steps_unevaluated = 0
+        mx.async_eval([x for c in self.prompt_cache for _, x in tree_flatten(c.state) if isinstance(x, mx.array)])
+    return responses
+
+
+GenerationBatch.next = _next_evaluating_cache_state
+
 # mlx-lm grows a KV cache by concatenating a new block onto the old one, a full copy of the conversation's keys and
 # values, every 256 tokens. At 60k tokens on a 27B model that is a 4 GB copy each time (both halves alive while it
 # runs): the spikes behind running out of memory, and memory bandwidth taken from generation. Grow in larger blocks.
