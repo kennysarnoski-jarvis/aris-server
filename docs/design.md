@@ -148,7 +148,10 @@ it instead of being copied (only the shared system-prompt snapshot is copied), a
 part of a prompt still being answered goes to disk only (the request holds its own copy; two copies
 of a 51k-token conversation ran a 48 GB Mac out of memory), and when a conversation moves from
 reading its prompt to generating, its batch cache is handed over rather than deep-copied (mlx-lm
-copies the whole batch there), so a long context is in memory once. A turn that just finished is never the entry evicted to
+copies the whole batch there), so a long context is in memory once. A conversation that finishes in a batch with
+others is copied out on its own: mlx-lm cuts it out lazily, and its recurrent state as a view of the batch's rows, so
+every kept conversation held the whole batch's cache alive (13 GB for eight kept from one 4-request batch on a 27B
+model). One alone in its batch is not copied; it is the batch. A turn that just finished is never the entry evicted to
 make room: its conversation's next turn continues it within seconds, and evicting it sent that
 turn to disk while mlx-lm still held the evicted copy. Evictions are logged. The cache's
 budget is what the GPU holds beside the weights less a reserve for prefill scratch. And entries go to

@@ -14,7 +14,7 @@ from typing import Callable, Optional
 import mlx.core as mx
 from mlx.utils import tree_flatten
 from mlx_lm import server as mls
-from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START, PromptProcessingBatch, TextStateMachine
+from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START, GenerationBatch, PromptProcessingBatch, TextStateMachine
 from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
@@ -66,6 +66,27 @@ def _split(self, indices):
 
 
 PromptProcessingBatch.split = _split
+
+
+def _kept_alone(extract):
+    def extract_cache(self, idx):
+        """mlx-lm cuts a finished conversation's cache out of its batch lazily, and its recurrent state as a view of
+        the batch's rows, so a conversation kept from a shared batch held the whole batch's cache alive: every
+        sequence's rows, in 4096-token blocks. Eight kept conversations held 13 GB of one 4-request batch's caches for
+        a 27B model. Copied out on its own, it holds its own. A conversation alone in its batch is the batch, and a
+        copy would only hold its cache twice at the end of every turn."""
+        caches = extract(self, idx)
+        if len(self.uids) > 1:
+            for c in caches:
+                if isinstance(c, ArraysCache):
+                    c.cache = [a if a is None else mx.contiguous(a) for a in c.cache]
+            mx.eval([x for c in caches for _, x in tree_flatten(c.state) if isinstance(x, mx.array)])
+        return caches
+    return extract_cache
+
+
+PromptProcessingBatch.extract_cache = _kept_alone(PromptProcessingBatch.extract_cache)
+GenerationBatch.extract_cache = _kept_alone(GenerationBatch.extract_cache)
 
 # mlx-lm grows a KV cache by concatenating a new block onto the old one, a full copy of the conversation's keys and
 # values, every 256 tokens. At 60k tokens on a 27B model that is a 4 GB copy each time (both halves alive while it

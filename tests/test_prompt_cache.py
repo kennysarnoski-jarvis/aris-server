@@ -98,6 +98,55 @@ def test_the_context_that_fits_leaves_room_for_the_peak_reading_a_prompt_reaches
     assert context_that_fits(int(10 * gb), int(9 * gb), 65536, CONTEXT_OVERHEAD) == 0
 
 
+def _batch(rows):
+    """A prompt batch of `rows` sequences: a KV layer and a recurrent layer, 4 MB of recurrent state per row."""
+    import mlx.core as mx
+    from mlx_lm.generate import PromptProcessingBatch
+    from mlx_lm.models.cache import ArraysCache, BatchKVCache
+
+    kv = BatchKVCache([0] * rows)
+    kv.update_and_fetch(mx.random.normal((rows, 2, 3000, 64)), mx.random.normal((rows, 2, 3000, 64)))
+    state = ArraysCache(2)
+    state.cache = [mx.random.normal((rows, 1024, 1024)), mx.random.normal((rows, 4, 64))]
+    batch = PromptProcessingBatch.__new__(PromptProcessingBatch)
+    batch.uids, batch.prompt_cache = list(range(rows)), [kv, state]
+    mx.eval(kv.state, state.cache)
+    return batch
+
+
+def test_a_conversation_kept_from_a_shared_batch_does_not_keep_the_whole_batch_alive():
+    import gc
+
+    import mlx.core as mx
+
+    import aris_server.engine  # noqa: F401  installs the extract patch
+
+    mb = 1 << 20
+    base = mx.get_active_memory()
+    batch = _batch(4)
+    whole = mx.get_active_memory() - base
+    kept = batch.extract_cache(1)  # a conversation finished; mlx-lm keeps its cache for the next turn
+    del batch
+    gc.collect()
+    held = mx.get_active_memory() - base
+    # Its own quarter of the batch, not the batch: mlx-lm cuts recurrent state as a view of the batch's rows.
+    assert held < whole * 0.4, f"kept {held / mb:.0f} MB of a {whole / mb:.0f} MB batch"
+    assert kept[1].cache[0].shape == (1, 1024, 1024)
+
+
+def test_a_conversation_alone_in_its_batch_is_not_copied_when_kept():
+    import mlx.core as mx
+
+    import aris_server.engine  # noqa: F401
+
+    batch = _batch(1)
+    before = mx.get_active_memory()
+    kept = batch.extract_cache(0)
+    # The batch is the conversation: copying it would hold its cache twice at the end of every turn.
+    assert mx.get_active_memory() - before < 1 << 20
+    assert kept[0].offset == 3000
+
+
 def test_a_model_that_cannot_fit_stops_the_server_with_the_reason_instead_of_running_without_a_limit(caplog):
     from aris_server.engine import NotEnoughMemory, check_memory
 
