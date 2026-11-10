@@ -123,9 +123,12 @@ def test_dropped_stream_client_stops_generation_during_a_silent_tool_call(serve,
     assert engine.stopped.wait(5)
 
 
-def test_overlong_prompt_gets_the_error_claude_code_compacts_on(serve):
+@pytest.mark.parametrize("model_context,fits", [(8192, None), (131072, 8192)])
+def test_overlong_prompt_gets_the_error_claude_code_compacts_on(serve, model_context, fits):
+    # Past the model's context, or past what this machine's memory holds, whichever is smaller.
     engine = FakeEngine([("normal", "hi")])
-    engine.spec = ModelSpec(name="fake", path="fake", context=8192)
+    engine.spec = ModelSpec(name="fake", path="fake", context=model_context)
+    engine.max_context = fits
     engine.prompt_tokens = 9000
     port = serve(engine)
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)

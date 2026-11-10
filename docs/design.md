@@ -83,6 +83,14 @@ paragraph break, because chat templates re-render past reasoning as `text\n</thi
 as `text\n\n</think>` stops matching its own prompt cache, and the next turn re-reads from there.
 Budgets per effort are set per model, with defaults.
 
+### Context that fits
+
+mlx-lm grows a KV cache by concatenating a new block onto it, a full copy while both halves are alive. Blocks
+are 4096 tokens instead of 256, so the copies are rare, but one copy of a long context still has to fit. At
+startup the server works out how many tokens of KV cache fit beside the weights with room for that copy
+(about 55k for Arete-27B at 8 bits on a 48 GB Mac) and answers "prompt is too long" past it, below the model's
+own context if need be: Claude Code compacts the conversation instead of the server running out of memory.
+
 ### Claude Code's billing line
 
 Claude Code's system prompt carries an `x-anthropic-billing-header: cc_version=…` line whose

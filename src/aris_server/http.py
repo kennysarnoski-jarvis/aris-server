@@ -130,6 +130,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "invalid_request_error", str(e))
         if self.route.endswith("count_tokens"):
             return self._json(200, {"input_tokens": engine.count_tokens(p)})
+        fits = getattr(engine, "max_context", None)
+        if fits:
+            p.context = min(p.context or fits, fits)
         try:
             fit_context(p, engine.count_tokens(p))
         except RequestError as e:

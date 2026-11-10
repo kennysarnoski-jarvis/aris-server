@@ -2,18 +2,20 @@
 
 import argparse
 import gc
+import json
 import logging
 import os
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
 from mlx_lm import server as mls
 from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START, PromptProcessingBatch, TextStateMachine
-from mlx_lm.models.cache import ArraysCache, LRUPromptCache, can_trim_prompt_cache
+from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache, LRUPromptCache, can_trim_prompt_cache
 
 from .budget import BudgetTokens, ThinkBudget
 from .config import ModelSpec, home
@@ -56,6 +58,18 @@ def _split(self, indices):
 
 
 PromptProcessingBatch.split = _split
+
+# mlx-lm grows a KV cache by concatenating a new block onto the old one, a full copy of the conversation's keys and
+# values, every 256 tokens. At 60k tokens on a 27B model that is a 4 GB copy each time (both halves alive while it
+# runs): the spikes behind running out of memory, and memory bandwidth taken from generation. Grow in larger blocks.
+KV_GROWTH_TOKENS = 4096
+KVCache.step = BatchKVCache.step = KV_GROWTH_TOKENS
+
+
+def context_that_fits(limit: int, weights: int, kv_bytes_per_token: int, overhead: int) -> int:
+    """Tokens of context whose KV cache fits beside the weights, with room for the copy made while it grows."""
+    room = limit - weights - overhead
+    return max(0, room // (2 * kv_bytes_per_token)) // 1024 * 1024
 
 
 _orig_generate = mls.ResponseGenerator._generate
@@ -390,6 +404,7 @@ class Engine:
         self.budget_tokens = BudgetTokens(self.tokenizer)
         self.cache = cache
         self.generator.on_stop = cache.flush
+        self.max_context = self._context_that_fits()
         self._fit_memory(cache, ns, prompt_cache_bytes, reserve_gb)
         if disk_cache_gb > 0:
             disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)), spec.adapter)
@@ -403,6 +418,34 @@ class Engine:
         logging.info("loaded %s%s (thinking=%s, tools=%s, think-end id=%s)", spec.path,
                      f" + adapter {spec.adapter}" if spec.adapter else "", self.tokenizer.has_thinking,
                      self.tokenizer.has_tool_calling, self.budget_tokens.end_id)
+
+    def _kv_bytes_per_token(self) -> int | None:
+        try:
+            layers = sum(isinstance(c, KVCache) for c in self.provider.model.make_cache())
+            path = Path(self.spec.path)
+            if not (path / "config.json").is_file():
+                return None
+            config = json.loads((path / "config.json").read_text())
+            text = config.get("text_config", config)
+            heads = text.get("num_key_value_heads") or text["num_attention_heads"]
+            head_dim = text.get("head_dim") or text["hidden_size"] // text["num_attention_heads"]
+            return layers * 2 * heads * head_dim * 2 if layers else None
+        except Exception:  # noqa: BLE001  an unusual model: no memory-derived context limit
+            return None
+
+    def _context_that_fits(self) -> int | None:
+        """A context limit this machine can hold. Past it the server answers "prompt is too long" (Claude Code then
+        compacts the conversation) instead of running out of memory mid-turn."""
+        per_token = self._kv_bytes_per_token()
+        if per_token is None:
+            return None
+        gb = 1 << 30
+        weights = sum(v.nbytes for _, v in tree_flatten(self.provider.model.parameters()))
+        limit = mx.device_info()["max_recommended_working_set_size"]
+        fits = context_that_fits(limit, weights, per_token, overhead=4 * gb)
+        logging.info("memory: about %d tokens of context fit (%d KB of KV cache per token; model allows %s)", fits,
+                     per_token // 1024, self.spec.context or "unknown")
+        return fits
 
     def _fit_memory(self, cache, ns, prompt_cache_bytes, reserve_gb):
         """Size the prompt cache and MLX's buffer pool to what the GPU can hold beside the weights: unbounded,

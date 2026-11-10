@@ -84,3 +84,12 @@ def test_a_finished_turn_larger_than_the_budget_stays_and_older_entries_go():
     cache.insert_cache("m", TURN1, turn, cache_type="assistant")              # bigger than the whole budget
     assert cache.fetch_nearest_cache("m", TURN1 + [1])[0] is turn               # still there for the next turn
     assert cache.fetch_nearest_cache("m", [7] * 50 + [1])[0] is None            # the older one went instead
+
+
+def test_the_context_that_fits_leaves_room_for_the_copy_made_while_the_kv_cache_grows():
+    from aris_server.engine import context_that_fits
+
+    gb = 1 << 30
+    # A 48 GB Mac (37.4 GB for the GPU) running Arete-27B at 8 bits: 64 KB of KV cache per token.
+    assert context_that_fits(int(37.4 * gb), int(26.6 * gb), 65536, 4 * gb) == 55296
+    assert context_that_fits(int(10 * gb), int(9 * gb), 65536, 3 * gb) == 0
