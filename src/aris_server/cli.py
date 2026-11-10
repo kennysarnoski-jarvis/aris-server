@@ -78,7 +78,9 @@ def main(argv=None):
     if a.host not in ("127.0.0.1", "localhost", "::1") and not a.api_key:
         logging.warning("serving on %s without --api-key: anyone who can reach this port can use the model", a.host)
 
-    from .engine import Engine
+    import mlx.core as mx
+
+    from .engine import Engine, NotEnoughMemory, check_memory, weights_on_disk
     from .http import Server
 
     _wired_limit()
@@ -90,9 +92,18 @@ def main(argv=None):
     if spec.adapter and not (Path(spec.adapter) / "adapter_config.json").is_file():
         print(f"no adapter_config.json in {spec.adapter}", file=sys.stderr)
         return 2
-    engine = Engine(spec, decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
-                    disk_cache_gb=a.disk_cache_gb,
-                    prompt_cache_bytes=int(a.prompt_cache_gb * (1 << 30)) if a.prompt_cache_gb else None)
+    try:
+        # Before loading: a model this Mac can't hold would swap it to a standstill, and under the service, again
+        # after every restart.
+        weights = weights_on_disk(spec.path, spec.adapter)
+        if weights is not None:
+            check_memory(name, mx.device_info()["max_recommended_working_set_size"], weights)
+        engine = Engine(spec, decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
+                        disk_cache_gb=a.disk_cache_gb,
+                        prompt_cache_bytes=int(a.prompt_cache_gb * (1 << 30)) if a.prompt_cache_gb else None)
+    except NotEnoughMemory as e:
+        logging.error("%s", e)
+        return 2
     server = Server((a.host, a.port), engine, models, a.api_key)
     logging.info("Aris Server %s serving %s on http://%s:%d", __version__, name, a.host, a.port)
 

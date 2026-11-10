@@ -88,6 +88,43 @@ def context_that_fits(limit: int, weights: int, kv_bytes_per_token: int, overhea
     return max(0, int(room // (PEAK_PER_KV_BYTE * kv_bytes_per_token))) // 1024 * 1024
 
 
+# Claude Code's own system prompt and tools take 9-15k tokens.
+MIN_USEFUL_CONTEXT = 16384
+
+
+class NotEnoughMemory(RuntimeError):
+    """The model can't run in this Mac's GPU memory."""
+
+
+def weights_on_disk(*folders: str | None) -> int | None:
+    """The bytes a model's weights (and adapter) will take once loaded: their safetensors files. None for a model that
+    isn't a local folder (a Hugging Face repo id), which is checked once loaded instead."""
+    total = 0
+    for folder in folders:
+        if folder is None:
+            continue
+        path = Path(folder)
+        if not path.is_dir():
+            return None
+        total += sum(p.stat().st_size for p in path.glob("*.safetensors"))
+    return total
+
+
+def check_memory(name: str, limit: int, weights: int, fits: int | None = None) -> None:
+    """Refuse a model this Mac can't hold rather than serve it without a context limit, which runs out of memory on
+    the first long prompt (and under the service, again after every restart)."""
+    gb = 1 << 30
+    if limit - weights - CONTEXT_OVERHEAD <= 0 or fits == 0:
+        raise NotEnoughMemory(
+            f"{name} does not fit this Mac's GPU memory: its weights take {weights / gb:.1f} GB, the GPU can use "
+            f"{limit / gb:.1f} GB, and reading a prompt needs {CONTEXT_OVERHEAD / gb:.1f} GB more beside the weights. "
+            "Use a smaller quantization of the model: 4-bit weights take about half the memory of 8-bit.")
+    if fits is not None and fits < MIN_USEFUL_CONTEXT:
+        logging.warning("only about %d tokens of context fit beside %s's weights, and Claude Code needs at least %d: "
+                        "kv_bits = 8 or a smaller quantization of the model leaves more room", fits, name,
+                        MIN_USEFUL_CONTEXT)
+
+
 _orig_generate = mls.ResponseGenerator._generate
 
 
@@ -445,7 +482,11 @@ class Engine:
         self.budget_tokens = BudgetTokens(self.tokenizer)
         self.cache = cache
         self.generator.on_stop = cache.flush
-        self.max_context = self._context_that_fits()
+        try:
+            self.max_context = self._context_that_fits()
+        except NotEnoughMemory:
+            self.generator.stop_and_join()  # its thread holds the loaded model
+            raise
         self._fit_memory(cache, ns, prompt_cache_bytes, reserve_gb)
         if disk_cache_gb > 0:
             disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)), spec.adapter, spec.kv_bits)
@@ -478,16 +519,17 @@ class Engine:
     def _context_that_fits(self) -> int | None:
         """A context limit this machine can hold. Past it the server answers "prompt is too long" (Claude Code then
         compacts the conversation) instead of running out of memory mid-turn."""
-        per_token = self._kv_bytes_per_token()
-        if per_token is None:
-            return None
-        self.cache.kv_bytes_per_token = per_token
-        gb = 1 << 30
         weights = sum(v.nbytes for _, v in tree_flatten(self.provider.model.parameters()))
         limit = mx.device_info()["max_recommended_working_set_size"]
+        per_token = self._kv_bytes_per_token()
+        if per_token is None:
+            check_memory(self.spec.name, limit, weights)
+            return None
+        self.cache.kv_bytes_per_token = per_token
         fits = context_that_fits(limit, weights, per_token, overhead=CONTEXT_OVERHEAD)
         logging.info("memory: about %d tokens of context fit (%d KB of KV cache per token; model allows %s)", fits,
                      per_token // 1024, self.spec.context or "unknown")
+        check_memory(self.spec.name, limit, weights, fits)
         return fits
 
     def _fit_memory(self, cache, ns, prompt_cache_bytes, reserve_gb):

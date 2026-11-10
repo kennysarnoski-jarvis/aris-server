@@ -98,6 +98,40 @@ def test_the_context_that_fits_leaves_room_for_the_peak_reading_a_prompt_reaches
     assert context_that_fits(int(10 * gb), int(9 * gb), 65536, CONTEXT_OVERHEAD) == 0
 
 
+def test_a_model_that_cannot_fit_stops_the_server_with_the_reason_instead_of_running_without_a_limit(caplog):
+    from aris_server.engine import NotEnoughMemory, check_memory
+
+    gb = 1 << 30
+    # Arete-27B at 8 bits on a 32 GB Mac (about 21 GB for the GPU): the weights alone are more than it can hold.
+    with pytest.raises(NotEnoughMemory, match=r"arete:27b does not fit .* 26\.6 GB, the GPU can use 21\.3 GB"):
+        check_memory("arete:27b", int(21.3 * gb), int(26.6 * gb))
+    # The weights fit, but not a single block of context beside them: still no use, and no limit would mean OOM.
+    with pytest.raises(NotEnoughMemory):
+        check_memory("arete:27b", int(30.2 * gb), int(26.6 * gb), fits=0)
+    # Room for a little context: it serves, and says what to change.
+    caplog.set_level("WARNING")
+    check_memory("arete:27b-4bit", int(21.3 * gb), int(15.1 * gb), fits=8192)
+    assert "only about 8192 tokens of context fit" in caplog.text
+    caplog.clear()
+    check_memory("arete:27b", int(37.4 * gb), int(26.6 * gb), fits=62464)
+    assert not caplog.text
+
+
+def test_the_weights_a_model_will_take_are_known_from_its_files_before_it_loads(tmp_path):
+    from aris_server.engine import weights_on_disk
+
+    model, adapter = tmp_path / "model", tmp_path / "adapter"
+    for folder, sizes in ((model, [5 << 30, 4 << 30]), (adapter, [1 << 28])):
+        folder.mkdir()
+        for i, size in enumerate(sizes):
+            with open(folder / f"part-{i}.safetensors", "wb") as f:
+                f.truncate(size)  # sparse: no disk used
+        (folder / "config.json").write_text("{}")
+    assert weights_on_disk(str(model)) == 9 << 30
+    assert weights_on_disk(str(model), str(adapter)) == (9 << 30) + (1 << 28)
+    assert weights_on_disk("NousResearch/Arete-27B") is None  # a Hugging Face repo id: checked once loaded
+
+
 @pytest.mark.parametrize("prompt_tokens,older_kept", [(4_000, False), (100, True)])
 def test_room_for_the_cache_a_prompt_builds_is_made_before_the_prompt_is_read(prompt_tokens, older_kept):
     # mlx-lm trims saved entries to the budget minus what active sequences hold right after a request takes its
