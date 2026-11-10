@@ -92,6 +92,17 @@ byte of cache. At startup the server works out how many tokens fit at that rate 
 overhead (about 64k for Arete-27B at 8 bits on that Mac) and answers "prompt is too long" past it, below the model's
 own context if need be: Claude Code compacts the conversation instead of the server running out of memory.
 
+### Quantized KV cache
+
+`kv_bits = 8` in a model's settings (or `--kv-bits 8`) keeps keys and values at 8 bits in groups of 64: 34 KB per token
+for Arete-27B instead of 64 KB, so about twice the context fits in the same memory (`kv_bits = 4`: 18 KB). mlx-lm
+quantizes the cache only outside batching (its server stops batching when `kv_bits` is set), and its quantized attention
+suits neither job here: it holds the whole score matrix (about 1.5 GB per layer to read a 512-token chunk of prompt
+against 60k tokens of context) and reads a KV head's cache once for each query head sharing it (six times for Arete).
+Aris Server's cache batches like mlx-lm's own. A chunk of prompt attends on a dequantized copy of one layer's cache
+through the fused kernel (about 250 MB at 60k tokens for Arete), and a decode step attends on the quantized cache
+directly, all of a KV head's query heads in one matmul. Saved caches are kept apart by KV precision.
+
 Saved caches make room when a request takes its own, before its prompt is read. mlx-lm trims them to the budget
 minus what active sequences hold at that moment, which for a cold prompt is next to nothing, so the cache the prompt
 is about to build is counted as well. Without that, a cold 53k-token prompt built 3.2 GB of cache beside 3.5 GB of
@@ -167,6 +178,7 @@ context = 131072
 effort_kwarg = "reasoning_effort"         # template variable for effort, if the model has one
 effort_map = { low = "low", medium = "medium", high = "xhigh", xhigh = "xhigh", max = "xhigh" }
 think_budget = { low = 1024, medium = 4096, high = 8192, xhigh = 16384, max = 0 }  # 0 = no limit
+kv_bits = 8                               # KV cache precision: 8 or 4 bits; leave out for full precision
 ```
 
 `adapter` applies a LoRA adapter folder on top of `path` (mlx-lm's format). One configuration is

@@ -15,11 +15,19 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 from mlx_lm import server as mls
 from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START, PromptProcessingBatch, TextStateMachine
-from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache, LRUPromptCache, can_trim_prompt_cache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    KVCache,
+    LRUPromptCache,
+    QuantizedKVCache,
+    can_trim_prompt_cache,
+)
 
 from .budget import BudgetTokens, ThinkBudget
 from .config import ModelSpec, home
 from .disk_cache import DiskCache
+from .kv_quant import BatchQuantizedKVCache, kv_bytes_per_token, quantize_kv
 from .translate import Plan
 
 
@@ -63,7 +71,7 @@ PromptProcessingBatch.split = _split
 # values, every 256 tokens. At 60k tokens on a 27B model that is a 4 GB copy each time (both halves alive while it
 # runs): the spikes behind running out of memory, and memory bandwidth taken from generation. Grow in larger blocks.
 KV_GROWTH_TOKENS = 4096
-KVCache.step = BatchKVCache.step = KV_GROWTH_TOKENS
+KVCache.step = BatchKVCache.step = QuantizedKVCache.step = BatchQuantizedKVCache.step = KV_GROWTH_TOKENS
 
 
 # Reading a prompt peaks above the cache it builds (prefill scratch, the cache's growth copies), and the peak grows
@@ -431,6 +439,8 @@ class Engine:
                 raise RuntimeError(f"could not load {spec.path}")
             time.sleep(0.2)
         self.tokenizer = self.provider.tokenizer
+        if spec.kv_bits:  # before any request makes a cache
+            quantize_kv(self.provider.model, spec.kv_bits)
         cache.decode = self.tokenizer.decode
         self.budget_tokens = BudgetTokens(self.tokenizer)
         self.cache = cache
@@ -438,7 +448,7 @@ class Engine:
         self.max_context = self._context_that_fits()
         self._fit_memory(cache, ns, prompt_cache_bytes, reserve_gb)
         if disk_cache_gb > 0:
-            disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)), spec.adapter)
+            disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)), spec.adapter, spec.kv_bits)
             key = self.provider.model_key
             restored = disk.restore(lambda t, c, kind: LRUPromptCache.insert_cache(cache, key, t, c, cache_type=kind),
                                     cache.max_bytes)
@@ -446,13 +456,14 @@ class Engine:
             if restored:
                 logging.info("restored %.1f GB of prompt caches from disk", restored / (1 << 30))
         threading.Thread(target=self._watch, daemon=True).start()
-        logging.info("loaded %s%s (thinking=%s, tools=%s, think-end id=%s)", spec.path,
+        logging.info("loaded %s%s (thinking=%s, tools=%s, think-end id=%s, KV cache %s)", spec.path,
                      f" + adapter {spec.adapter}" if spec.adapter else "", self.tokenizer.has_thinking,
-                     self.tokenizer.has_tool_calling, self.budget_tokens.end_id)
+                     self.tokenizer.has_tool_calling, self.budget_tokens.end_id,
+                     f"{spec.kv_bits}-bit" if spec.kv_bits else "full precision")
 
     def _kv_bytes_per_token(self) -> int | None:
         try:
-            layers = sum(isinstance(c, KVCache) for c in self.provider.model.make_cache())
+            layers = sum(isinstance(c, (KVCache, QuantizedKVCache)) for c in self.provider.model.make_cache())
             path = Path(self.spec.path)
             if not (path / "config.json").is_file():
                 return None
@@ -460,7 +471,7 @@ class Engine:
             text = config.get("text_config", config)
             heads = text.get("num_key_value_heads") or text["num_attention_heads"]
             head_dim = text.get("head_dim") or text["hidden_size"] // text["num_attention_heads"]
-            return layers * 2 * heads * head_dim * 2 if layers else None
+            return kv_bytes_per_token(layers, heads, head_dim, self.spec.kv_bits) if layers else None
         except Exception:  # noqa: BLE001  an unusual model: no memory-derived context limit
             return None
 

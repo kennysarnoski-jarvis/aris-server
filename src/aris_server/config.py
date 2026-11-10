@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+KV_BITS_CHOICES = (4, 8)
 DEFAULT_THINK_BUDGET = {"low": 1024, "medium": 4096, "high": 8192, "xhigh": 16384, "max": 0}
 
 
@@ -19,6 +20,9 @@ class ModelSpec:
     path: str
     context: int | None = None
     adapter: str | None = None  # a LoRA adapter folder (adapter_config.json + adapters.safetensors) on top of path
+    # Bits per value of the KV cache (8 or 4), None for full precision: 8 bits holds about twice the context in the
+    # same memory.
+    kv_bits: int | None = None
     # Template variable that carries effort (e.g. "reasoning_effort"), and how request efforts map to its values.
     effort_kwarg: str | None = None
     effort_map: dict[str, str] = field(default_factory=dict)
@@ -48,11 +52,14 @@ def load_models(path: Path | None = None) -> dict[str, ModelSpec]:
             raise ValueError(f"model {name!r} in {path} has no path")
         budget = dict(DEFAULT_THINK_BUDGET)
         budget.update(raw.get("think_budget") or {})
+        if raw.get("kv_bits") not in (None, *KV_BITS_CHOICES):
+            raise ValueError(f"model {name!r} in {path}: kv_bits must be one of {KV_BITS_CHOICES}")
         out[name] = ModelSpec(
             name=name,
             path=str(Path(raw["path"]).expanduser()) if raw["path"].startswith(("~", "/", ".")) else raw["path"],
             context=raw.get("context"),
             adapter=str(Path(raw["adapter"]).expanduser()) if raw.get("adapter") else None,
+            kv_bits=raw.get("kv_bits"),
             effort_kwarg=raw.get("effort_kwarg"),
             effort_map=dict(raw.get("effort_map") or {}),
             think_budget=budget,

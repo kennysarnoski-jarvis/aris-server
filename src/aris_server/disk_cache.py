@@ -16,8 +16,9 @@ from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
 MIN_TOKENS = 1024  # shorter prompts are quick to re-read
 
 
-def model_id(model_path: str, adapter: str | None = None) -> str:
-    """Caches are only valid for the exact weights that made them: the base model and any adapter on it."""
+def model_id(model_path: str, adapter: str | None = None, kv_bits: int | None = None) -> str:
+    """Caches are only valid for the exact weights that made them (the base model and any adapter on it) and for the
+    precision of the KV cache they hold."""
     parts = []
     for folder in (model_path, adapter):
         if folder is None:
@@ -26,12 +27,15 @@ def model_id(model_path: str, adapter: str | None = None) -> str:
         parts.append(str(path))
         if path.is_dir():
             parts += [f"{p.name}:{p.stat().st_size}:{int(p.stat().st_mtime)}" for p in sorted(path.glob("*.safetensors"))]
+    if kv_bits:
+        parts.append(f"kv_bits={kv_bits}")
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
 class DiskCache:
-    def __init__(self, root: Path, model_path: str, max_bytes: int, adapter: str | None = None):
-        self.dir = root / model_id(model_path, adapter)
+    def __init__(self, root: Path, model_path: str, max_bytes: int, adapter: str | None = None,
+                 kv_bits: int | None = None):
+        self.dir = root / model_id(model_path, adapter, kv_bits)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_bytes
         self.index: dict[Path, tuple[tuple[int, ...], str]] = {}
