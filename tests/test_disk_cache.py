@@ -213,3 +213,18 @@ def test_a_diverged_turn_is_rebuilt_to_its_prompt_end_in_memory_without_a_disk_s
     assert got[0].offset == 2699 and rest == rendered[2699:]                         # attention trimmed
     assert mx.all(got[1][1] == 1).item()                                              # recurrent state put back
     assert len(cache) == 0 and cache.disk.index == {}
+
+
+def test_only_the_latest_turns_prompt_end_state_is_kept():
+    cache = MovingPromptCache(max_size=10)
+    convo = list(range(2000))
+    for turn in range(4):                                       # four turns of one conversation
+        prompt = convo + [9000 + turn]
+        cache.reading.append(prompt)
+        cache.insert_cache("m", prompt[:-1], layers(len(prompt) - 1, turn), cache_type="assistant")
+        cache.reading.remove(prompt)
+        convo = prompt + [7, 7]
+        cache.insert_cache("m", convo, layers(len(convo), turn), cache_type="assistant")
+    assert len(cache._turn_state) == 1 and len(cache._prompt_state) == 0
+    cache.fetch_nearest_cache("m", convo + [1])                 # continued as-is: no rebuild needed
+    assert cache._turn_state == {}

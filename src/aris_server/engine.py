@@ -79,6 +79,7 @@ mls.ResponseGenerator._generate = _generate_then_stop_hook
 
 
 DISK_MIN_GAIN = 1024  # fewer extra tokens than this are as quick to read as the cache file
+MAX_KEPT_STATES = 2  # prompt-end recurrent states kept per kind (requests in flight; finished turns)
 
 
 class _EvictionTrie:
@@ -146,16 +147,19 @@ class MovingPromptCache(LRUPromptCache):
         mid_request = cache_type != "system" and any(
             len(tokens) < len(p) and p[:len(tokens)] == list(tokens) for p in self.reading)
         if mid_request and len(tokens) >= self.light_min_tokens:
+            # ~150 MB each for a 27B model: keep only what a request in flight or a conversation's latest turn needs.
             self._prompt_state[tuple(tokens)] = [list(c.cache) if isinstance(c, ArraysCache) else None
                                                  for c in prompt_cache]
-            while len(self._prompt_state) > 8:
+            while len(self._prompt_state) > MAX_KEPT_STATES:
                 self._prompt_state.pop(next(iter(self._prompt_state)))
         elif cache_type != "system":
             key = tuple(tokens)
             at = max((k for k in self._prompt_state if len(k) < len(key) and key[:len(k)] == k), key=len, default=None)
+            for older in [k for k in self._turn_state if len(k) < len(key) and key[:len(k)] == k]:
+                self._turn_state.pop(older)  # this conversation's earlier turns: superseded
             if at is not None:
                 self._turn_state[key] = (len(at), self._prompt_state.pop(at))
-                while len(self._turn_state) > 8:
+                while len(self._turn_state) > MAX_KEPT_STATES:
                     self._turn_state.pop(next(iter(self._turn_state)))
         if not mid_request:
             before = {k for k in self._entry_keys()}
@@ -189,6 +193,17 @@ class MovingPromptCache(LRUPromptCache):
         return [(kind, len(key)) for kind, lru in self._lru._lrus.items() for _, key in lru] \
             if hasattr(self._lru, "_lrus") else []
 
+    decode = None  # the tokenizer's decode, for logging where a turn and its re-rendered history part ways
+
+    def _show_divergence(self, generated, rendered, at: int) -> str:
+        if self.decode is None:
+            return ""
+        try:
+            show = lambda ids: repr(self.decode(list(ids[max(0, at - 12):at + 8])))  # noqa: E731
+            return f": generated {show(generated)}, history {show(rendered)}"
+        except Exception:  # noqa: BLE001  logging only
+            return ""
+
     def _rebuild_diverged(self, model, tokens, have: int):
         """The finished turn of this conversation, rebuilt to its prompt's end, when the request diverges from it
         after that point and the rebuild covers more than `have` tokens."""
@@ -218,8 +233,10 @@ class MovingPromptCache(LRUPromptCache):
                     layer.cache = list(state)
                 else:
                     layer.trim(layer.offset - n)
+            at = next((i for i, (a, b) in enumerate(zip(entry_key, key)) if a != b), n)
             logging.info("rebuilt a %d-token cache in memory from a %d-token turn whose history came back "
-                         "tokenized differently", n, len(entry_key))
+                         "tokenized differently at token %d%s", n, len(entry_key), at, self._show_divergence(
+                             entry_key, key, at))
             return entry.prompt_cache, key[n:]
         return None
 
@@ -298,6 +315,7 @@ class MovingPromptCache(LRUPromptCache):
             self._trie.pop(result.model, key)
         finally:
             self._trie.taking = False
+        self._turn_state.pop(tuple(key), None)  # continued as-is: it won't need rebuilding
         self._lru.remove(result.model, key)
         self._n_bytes -= entry.nbytes
         self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
@@ -368,6 +386,7 @@ class Engine:
                 raise RuntimeError(f"could not load {spec.path}")
             time.sleep(0.2)
         self.tokenizer = self.provider.tokenizer
+        cache.decode = self.tokenizer.decode
         self.budget_tokens = BudgetTokens(self.tokenizer)
         self.cache = cache
         self.generator.on_stop = cache.flush
