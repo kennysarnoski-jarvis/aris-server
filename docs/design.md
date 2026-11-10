@@ -91,6 +91,11 @@ startup the server works out how many tokens of KV cache fit beside the weights 
 (about 55k for Arete-27B at 8 bits on a 48 GB Mac) and answers "prompt is too long" past it, below the model's
 own context if need be: Claude Code compacts the conversation instead of the server running out of memory.
 
+Saved caches make room when a request takes its own, before its prompt is read. mlx-lm trims them to the budget
+minus what active sequences hold at that moment, which for a cold prompt is next to nothing, so the cache the prompt
+is about to build is counted as well. Without that, a cold 53k-token prompt built 3.2 GB of cache beside 3.5 GB of
+saved ones and came within 0.5 GB of the limit on a 48 GB Mac.
+
 ### Claude Code's billing line
 
 Claude Code's system prompt carries an `x-anthropic-billing-header: cc_version=…` line whose

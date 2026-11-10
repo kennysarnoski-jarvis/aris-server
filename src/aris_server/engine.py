@@ -125,6 +125,8 @@ class MovingPromptCache(LRUPromptCache):
     # rebuild below covers what they were for, and at 2-4 GB each they wrote ~45 GB an hour).
     snapshot_min_tokens = 1 << 62
     light_min_tokens = 1024  # shorter prompts are quick to re-read
+    kv_bytes_per_token = None  # set by the engine: the cache one token of context adds to a sequence
+    _pending_bytes = 0  # the cache the request just handed its own is about to build (see trim_to)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -255,6 +257,27 @@ class MovingPromptCache(LRUPromptCache):
         return None
 
     def fetch_nearest_cache(self, model, tokens):
+        cache, rest = self._fetch_nearest(model, tokens)
+        if self.kv_bytes_per_token:
+            # Its prompt's unread tokens, plus a growth block: the cache grows in blocks, and the reply grows it too.
+            self._pending_bytes = (len(rest) + KV_GROWTH_TOKENS) * self.kv_bytes_per_token
+        return cache, rest
+
+    def trim_to(self, *, n_sequences=None, n_bytes=None):
+        """mlx-lm trims saved entries to the budget minus what active sequences hold right after a request takes its
+        cache, before the prompt is read. What that prompt is about to build counts too: without it, a cold 53k-token
+        prompt built 3.2 GB of cache beside 3.5 GB of saved ones and peaked at 36.9 of 37.4 GB on a 48 GB Mac."""
+        pending, self._pending_bytes = self._pending_bytes, 0
+        before = set(self._entry_keys())
+        super().trim_to(n_sequences=n_sequences, n_bytes=None if n_bytes is None else n_bytes - pending)
+        gone = before - set(self._entry_keys())
+        if gone and pending:
+            gb = 1 << 30
+            logging.info("memory cache: making room for %.1f GB a prompt will build evicted %s; %d left, %.1f of "
+                         "%.1f GB", pending / gb, ", ".join(f"{n}-token {kind}" for kind, n in sorted(gone)),
+                         len(self), self.nbytes / gb, self.max_bytes / gb)
+
+    def _fetch_nearest(self, model, tokens):
         cache, rest = self._fetch_from_memory(model, tokens)
         rebuilt = self._rebuild_diverged(model, tokens, len(tokens) - len(rest))
         if rebuilt is not None:
@@ -439,6 +462,7 @@ class Engine:
         per_token = self._kv_bytes_per_token()
         if per_token is None:
             return None
+        self.cache.kv_bytes_per_token = per_token
         gb = 1 << 30
         weights = sum(v.nbytes for _, v in tree_flatten(self.provider.model.parameters()))
         limit = mx.device_info()["max_recommended_working_set_size"]

@@ -1,3 +1,5 @@
+import pytest
+
 from aris_server.engine import MovingPromptCache
 
 
@@ -93,3 +95,20 @@ def test_the_context_that_fits_leaves_room_for_the_copy_made_while_the_kv_cache_
     # A 48 GB Mac (37.4 GB for the GPU) running Arete-27B at 8 bits: 64 KB of KV cache per token.
     assert context_that_fits(int(37.4 * gb), int(26.6 * gb), 65536, 4 * gb) == 55296
     assert context_that_fits(int(10 * gb), int(9 * gb), 65536, 3 * gb) == 0
+
+
+@pytest.mark.parametrize("prompt_tokens,older_kept", [(4_000, False), (100, True)])
+def test_room_for_the_cache_a_prompt_builds_is_made_before_the_prompt_is_read(prompt_tokens, older_kept):
+    # mlx-lm trims saved entries to the budget minus what active sequences hold right after a request takes its
+    # cache, before the prompt is read: a cold 53k-token prompt then built 3.2 GB of cache beside 3.5 GB of saved
+    # ones and peaked at 36.9 of 37.4 GB on a 48 GB Mac. What the prompt is about to build has to count too.
+    cache = MovingPromptCache(max_size=10, max_bytes=100_000)
+    cache.kv_bytes_per_token = 10
+    cache.insert_cache("m", SYSTEM, [Layer(1_000)], cache_type="system")
+    cache.insert_cache("m", [7] * 50, [Layer(40_000)], cache_type="assistant")      # an older conversation
+    prompt = [9] * prompt_tokens                                                    # nothing in memory matches
+    assert cache.fetch_nearest_cache("m", prompt) == (None, prompt)
+    cache.trim_to(n_bytes=cache.max_bytes)                  # mlx-lm's next call: nothing is active yet
+    # 4,000 tokens plus a growth block build 80,960 bytes, so the older conversation has to make room; 100 tokens
+    # build 41,960, which fits beside it. The system prompt stays either way.
+    assert cache.nbytes == (41_000 if older_kept else 1_000)
