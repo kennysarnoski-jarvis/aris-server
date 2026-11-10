@@ -88,13 +88,14 @@ def test_a_finished_turn_larger_than_the_budget_stays_and_older_entries_go():
     assert cache.fetch_nearest_cache("m", [7] * 50 + [1])[0] is None            # the older one went instead
 
 
-def test_the_context_that_fits_leaves_room_for_the_copy_made_while_the_kv_cache_grows():
-    from aris_server.engine import context_that_fits
+def test_the_context_that_fits_leaves_room_for_the_peak_reading_a_prompt_reaches():
+    from aris_server.engine import CONTEXT_OVERHEAD, context_that_fits
 
     gb = 1 << 30
-    # A 48 GB Mac (37.4 GB for the GPU) running Arete-27B at 8 bits: 64 KB of KV cache per token.
-    assert context_that_fits(int(37.4 * gb), int(26.6 * gb), 65536, 4 * gb) == 55296
-    assert context_that_fits(int(10 * gb), int(9 * gb), 65536, 3 * gb) == 0
+    # A 48 GB Mac (37.4 GB for the GPU) running Arete-27B at 8 bits: 64 KB of KV cache per token. Cold prompts of
+    # 30k and 53k tokens peaked at 31.8 and 34.3 GB there, so a 64.5k one peaks near 35.6 GB.
+    assert context_that_fits(int(37.4 * gb), int(26.6 * gb), 65536, CONTEXT_OVERHEAD) == 65536
+    assert context_that_fits(int(10 * gb), int(9 * gb), 65536, CONTEXT_OVERHEAD) == 0
 
 
 @pytest.mark.parametrize("prompt_tokens,older_kept", [(4_000, False), (100, True)])

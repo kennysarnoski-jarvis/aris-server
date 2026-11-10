@@ -66,10 +66,18 @@ KV_GROWTH_TOKENS = 4096
 KVCache.step = BatchKVCache.step = KV_GROWTH_TOKENS
 
 
+# Reading a prompt peaks above the cache it builds (prefill scratch, the cache's growth copies), and the peak grows
+# with the context: cold prompts of 30k and 53k tokens on Arete-27B at 8 bits peaked at 31.8 and 34.3 GB on a 48 GB
+# Mac, 1.8 bytes of peak for each byte of KV cache.
+PEAK_PER_KV_BYTE = 1.8
+# Beside the weights and that peak: the shared system-prompt cache, kept states, MLX's buffer pool, and headroom.
+CONTEXT_OVERHEAD = int(3.5 * (1 << 30))
+
+
 def context_that_fits(limit: int, weights: int, kv_bytes_per_token: int, overhead: int) -> int:
-    """Tokens of context whose KV cache fits beside the weights, with room for the copy made while it grows."""
+    """Tokens of context this machine can read and hold beside the weights, at the peak reading a prompt reaches."""
     room = limit - weights - overhead
-    return max(0, room // (2 * kv_bytes_per_token)) // 1024 * 1024
+    return max(0, int(room // (PEAK_PER_KV_BYTE * kv_bytes_per_token))) // 1024 * 1024
 
 
 _orig_generate = mls.ResponseGenerator._generate
@@ -466,7 +474,7 @@ class Engine:
         gb = 1 << 30
         weights = sum(v.nbytes for _, v in tree_flatten(self.provider.model.parameters()))
         limit = mx.device_info()["max_recommended_working_set_size"]
-        fits = context_that_fits(limit, weights, per_token, overhead=4 * gb)
+        fits = context_that_fits(limit, weights, per_token, overhead=CONTEXT_OVERHEAD)
         logging.info("memory: about %d tokens of context fit (%d KB of KV cache per token; model allows %s)", fits,
                      per_token // 1024, self.spec.context or "unknown")
         return fits

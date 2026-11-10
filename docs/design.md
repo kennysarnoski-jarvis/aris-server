@@ -85,10 +85,11 @@ Budgets per effort are set per model, with defaults.
 
 ### Context that fits
 
-mlx-lm grows a KV cache by concatenating a new block onto it, a full copy while both halves are alive. Blocks
-are 4096 tokens instead of 256, so the copies are rare, but one copy of a long context still has to fit. At
-startup the server works out how many tokens of KV cache fit beside the weights with room for that copy
-(about 55k for Arete-27B at 8 bits on a 48 GB Mac) and answers "prompt is too long" past it, below the model's
+Reading a prompt peaks above the KV cache it builds, and the peak grows with the context: prefill's scratch, and the
+copy mlx-lm makes when it grows a cache (in 4096-token blocks here, not 256, so rarely). Measured on Arete-27B at
+8 bits on a 48 GB Mac, cold prompts of 30k and 53k tokens peaked at 31.8 and 34.3 GB: 1.8 bytes of peak for each
+byte of cache. At startup the server works out how many tokens fit at that rate beside the weights and 3.5 GB of
+overhead (about 64k for Arete-27B at 8 bits on that Mac) and answers "prompt is too long" past it, below the model's
 own context if need be: Claude Code compacts the conversation instead of the server running out of memory.
 
 Saved caches make room when a request takes its own, before its prompt is read. mlx-lm trims them to the budget
