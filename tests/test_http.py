@@ -150,3 +150,34 @@ def test_slow_prompt_reading_shows_up_as_thinking_so_claude_code_keeps_waiting(s
     thinking = "".join(e["delta"]["thinking"] for e in events if e.get("delta", {}).get("type") == "thinking_delta")
     assert thinking.startswith("⟨reading prompt 512/1536⟩\n⟨reading prompt 1024/1536⟩\n")
     assert thinking.endswith("plan")
+
+
+def test_a_dead_engine_drops_the_stream_so_the_client_retries_instead_of_giving_up(serve):
+    class Dead:
+        def generation_available(self):
+            return False
+
+    engine = FakeEngine([("normal", "hi")])
+    engine.generator = Dead()
+
+    def run(plan, on_progress=None):
+        def pieces():
+            raise RuntimeError("generation thread died")
+            yield  # noqa: unreachable
+
+        return Run(prompt_tokens=10, cached_tokens=0, tool_parser=parse_tool_call, pieces=pieces(),
+                   stop=engine.stopped.set, budget=[])
+
+    engine.run = run
+    port = serve(engine)
+    data = json.dumps({**BODY, "stream": True}).encode()
+    sock = socket.create_connection(("127.0.0.1", port))
+    sock.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\ncontent-type: application/json\r\n"
+                 b"content-length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
+    got = b""
+    try:
+        while chunk := sock.recv(65536):
+            got += chunk
+    except ConnectionResetError:
+        pass
+    assert b"message_start" in got and b"generation thread died" not in got and b'"type": "error"' not in got

@@ -6,6 +6,7 @@ import logging
 import os
 import select
 import socket
+import struct
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -218,10 +219,28 @@ class Handler(BaseHTTPRequestHandler):
             return
         except Exception as e:  # report engine failures in-stream; the status line is already sent
             logging.exception("generation failed")
+            if _engine_died(self.server.engine):
+                # The server exits and is back within seconds. Clients give up on an error event but retry a
+                # dropped connection, so drop it and let the retry land on the restarted server.
+                _drop(self.connection)
+                return
             try:
                 write([{"type": "error", "error": {"type": "api_error", "message": str(e)}}])
             except OSError:
                 pass
+
+
+def _engine_died(engine) -> bool:
+    generator = getattr(engine, "generator", None)
+    return generator is not None and not generator.generation_available()
+
+
+def _drop(sock):
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # reset, not a clean close
+        sock.close()
+    except OSError:
+        pass
 
 
 def _usage(run, n):
