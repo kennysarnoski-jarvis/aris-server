@@ -101,7 +101,11 @@ suits neither job here: it holds the whole score matrix (about 1.5 GB per layer 
 against 60k tokens of context) and reads a KV head's cache once for each query head sharing it (six times for Arete).
 Aris Server's cache batches like mlx-lm's own. A chunk of prompt attends on a dequantized copy of one layer's cache
 through the fused kernel (about 250 MB at 60k tokens for Arete), and a decode step attends on the quantized cache
-directly, all of a KV head's query heads in one matmul. Saved caches are kept apart by KV precision.
+directly, all of a KV head's query heads in one matmul. Saved caches are kept apart by KV precision. The peak keeps
+the same 1.8 bytes per byte of cache: with 8-bit Arete plus an adapter (27.0 GB) on a 48 GB Mac, cold prompts of 30k,
+60k, 100k and 115k tokens peaked at 30.2, 33.4, 34.8 and 35.6 GB, so about 118k tokens fit there instead of 62k.
+Reading a cold 115k-token prompt took 23 minutes (82 tokens/s); a conversation that grows turn by turn reads only
+what's new.
 
 Saved caches make room when a request takes its own, before its prompt is read. mlx-lm trims them to the budget
 minus what active sequences hold at that moment, which for a cold prompt is next to nothing, so the cache the prompt
