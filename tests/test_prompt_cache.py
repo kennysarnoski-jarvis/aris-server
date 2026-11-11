@@ -236,18 +236,22 @@ def test_a_model_whose_own_context_is_short_takes_the_best_weights_that_hold_it(
     assert choose_weights(spec, int(32.5 * gb)).path == q8
 
 
-@pytest.mark.parametrize("prompt_tokens,older_kept", [(4_000, False), (100, True)])
-def test_room_for_the_cache_a_prompt_builds_is_made_before_the_prompt_is_read(prompt_tokens, older_kept):
+@pytest.mark.parametrize("prompt_tokens,older_bytes,left", [
+    (2_000, 40_000, 0),        # reading it peaks at 109,728 bytes, more than the whole budget: nothing saved stays
+    (100, 40_000, 1_000),      # its 41,960 bytes of cache would fit beside the older one; reading peaks at 75,528
+    (100, 20_000, 21_000),     # 75,528 beside 21,000 saved fits the 100,000-byte budget
+])
+def test_room_for_the_peak_reading_a_prompt_reaches_is_made_before_it_is_read(prompt_tokens, older_bytes, left):
     # mlx-lm trims saved entries to the budget minus what active sequences hold right after a request takes its
     # cache, before the prompt is read: a cold 53k-token prompt then built 3.2 GB of cache beside 3.5 GB of saved
-    # ones and peaked at 36.9 of 37.4 GB on a 48 GB Mac. What the prompt is about to build has to count too.
+    # ones and peaked at 36.9 of 37.4 GB on a 48 GB Mac. What reading the prompt needs has to count too, and that is
+    # more than the cache it builds: a cold 100k-token prompt beside 9.7 GB of saved conversations ran a 64 GB Mac's
+    # GPU out of memory.
     cache = MovingPromptCache(max_size=10, max_bytes=100_000)
     cache.kv_bytes_per_token = 10
     cache.insert_cache("m", SYSTEM, [Layer(1_000)], cache_type="system")
-    cache.insert_cache("m", [7] * 50, [Layer(40_000)], cache_type="assistant")      # an older conversation
-    prompt = [9] * prompt_tokens                                                    # nothing in memory matches
+    cache.insert_cache("m", [7] * 50, [Layer(older_bytes)], cache_type="assistant")  # an older conversation
+    prompt = [9] * prompt_tokens                                                     # nothing in memory matches
     assert cache.fetch_nearest_cache("m", prompt) == (None, prompt)
     cache.trim_to(n_bytes=cache.max_bytes)                  # mlx-lm's next call: nothing is active yet
-    # 4,000 tokens plus a growth block build 80,960 bytes, so the older conversation has to make room; 100 tokens
-    # build 41,960, which fits beside it. The system prompt stays either way.
-    assert cache.nbytes == (41_000 if older_kept else 1_000)
+    assert cache.nbytes == left

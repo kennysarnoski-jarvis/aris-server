@@ -397,21 +397,24 @@ class MovingPromptCache(LRUPromptCache):
     def fetch_nearest_cache(self, model, tokens):
         cache, rest = self._fetch_nearest(model, tokens)
         if self.kv_bytes_per_token:
-            # Its prompt's unread tokens, plus a growth block: the cache grows in blocks, and the reply grows it too.
-            self._pending_bytes = (len(rest) + KV_GROWTH_TOKENS) * self.kv_bytes_per_token
+            # Reading the prompt's unread tokens, plus a growth block (the cache grows in blocks, and the reply grows it
+            # too), peaks above the cache they build, by the same rate the context limit allows for.
+            self._pending_bytes = int(PEAK_PER_KV_BYTE * (len(rest) + KV_GROWTH_TOKENS) * self.kv_bytes_per_token)
         return cache, rest
 
     def trim_to(self, *, n_sequences=None, n_bytes=None):
         """mlx-lm trims saved entries to the budget minus what active sequences hold right after a request takes its
-        cache, before the prompt is read. What that prompt is about to build counts too: without it, a cold 53k-token
-        prompt built 3.2 GB of cache beside 3.5 GB of saved ones and peaked at 36.9 of 37.4 GB on a 48 GB Mac."""
+        cache, before the prompt is read. What reading that prompt is about to need counts too: without it, a cold
+        53k-token prompt built 3.2 GB of cache beside 3.5 GB of saved ones and peaked at 36.9 of 37.4 GB on a 48 GB
+        Mac. Room for only the cache it builds isn't enough either: a cold 100k-token prompt beside 9.7 GB of saved
+        conversations ran a 64 GB Mac's GPU out of memory before it finished reading."""
         pending, self._pending_bytes = self._pending_bytes, 0
         before = set(self._entry_keys())
         super().trim_to(n_sequences=n_sequences, n_bytes=None if n_bytes is None else n_bytes - pending)
         gone = before - set(self._entry_keys())
         if gone and pending:
             gb = 1 << 30
-            logging.info("memory cache: making room for %.1f GB a prompt will build evicted %s; %d left, %.1f of "
+            logging.info("memory cache: making room for the %.1f GB reading a prompt needs evicted %s; %d left, %.1f of "
                          "%.1f GB", pending / gb, ", ".join(f"{n}-token {kind}" for kind, n in sorted(gone)),
                          len(self), self.nbytes / gb, self.max_bytes / gb)
 
