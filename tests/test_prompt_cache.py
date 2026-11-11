@@ -190,6 +190,52 @@ def test_the_weights_a_model_will_take_are_known_from_its_files_before_it_loads(
     assert weights_on_disk(str(model), str(trained)) == (9 << 30) + (1 << 28)
 
 
+def _arete_folder(folder, weight_bytes):
+    """Weights the size of Arete-27B at some quantization, with its config: 16 of 64 layers keep a KV cache."""
+    import json
+
+    folder.mkdir()
+    with open(folder / "model.safetensors", "wb") as f:
+        f.truncate(weight_bytes)  # sparse: no disk used
+    layers = (["linear_attention"] * 3 + ["full_attention"]) * 16
+    (folder / "config.json").write_text(json.dumps({"text_config": {
+        "num_hidden_layers": 64, "layer_types": layers, "num_attention_heads": 24, "num_key_value_heads": 4,
+        "head_dim": 256, "hidden_size": 5120}}))
+    return str(folder)
+
+
+@pytest.mark.parametrize("gpu_gb,kv_bits,chosen", [
+    (37.4, 8, "8bit"),    # a 48 GB Mac: about 125k tokens beside the 8-bit weights
+    (27.0, 8, "4bit"),    # a 36 GB Mac: the 8-bit weights leave no room to read a prompt
+    (32.0, 8, "4bit"),    # 8-bit would leave about 32k tokens, 4-bit about 229k: context wins
+    (21.3, 8, "4bit"),    # a 32 GB Mac: only the 4-bit fits, with about 45k tokens (short of 64k, but the most)
+    (21.3, None, "4bit"),
+    (10.0, 8, "4bit"),    # nothing fits: the smaller one, whose refusal names the smallest option
+])
+def test_a_model_given_several_weights_loads_the_best_this_mac_holds_with_room_for_a_conversation(
+        tmp_path, gpu_gb, kv_bits, chosen):
+    from aris_server.config import ModelSpec
+    from aris_server.engine import choose_weights
+
+    gb = 1 << 30
+    q8 = _arete_folder(tmp_path / "8bit", int(26.6 * gb))
+    q4 = _arete_folder(tmp_path / "4bit", int(15.1 * gb))
+    spec = ModelSpec(name="arete:27b", path=q8, choices=(q8, "NousResearch/Arete-27B", q4), kv_bits=kv_bits)
+    assert choose_weights(spec, int(gpu_gb * gb)).path == str(tmp_path / chosen)  # a repo id can't be sized: skipped
+
+
+def test_a_model_whose_own_context_is_short_takes_the_best_weights_that_hold_it(tmp_path):
+    from aris_server.config import ModelSpec
+    from aris_server.engine import choose_weights
+
+    gb = 1 << 30
+    q8 = _arete_folder(tmp_path / "8bit", int(26.6 * gb))
+    q4 = _arete_folder(tmp_path / "4bit", int(15.1 * gb))
+    # The 8-bit weights leave about 41k tokens on this Mac: short of 64k, but more than a 32k model can use anyway.
+    spec = ModelSpec(name="m", path=q8, choices=(q8, q4), kv_bits=8, context=32768)
+    assert choose_weights(spec, int(32.5 * gb)).path == q8
+
+
 @pytest.mark.parametrize("prompt_tokens,older_kept", [(4_000, False), (100, True)])
 def test_room_for_the_cache_a_prompt_builds_is_made_before_the_prompt_is_read(prompt_tokens, older_kept):
     # mlx-lm trims saved entries to the budget minus what active sequences hold right after a request takes its

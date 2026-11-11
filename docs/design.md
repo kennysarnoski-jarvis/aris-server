@@ -200,6 +200,15 @@ kv_bits = 8                               # KV cache precision: 8 or 4 bits; lea
 resident at a time; base and adapted weights don't fit side by side on most Macs, so switching is a
 restart. Prompt caches are keyed on the base and adapter files, so they never cross between them.
 
+`path` can also list several weights, best first: `path = ["~/models/arete-27b-mlx-8bit",
+"~/models/arete-27b-mlx-4bit"]`. Before loading, the server works out from each one's files how much
+context it would leave on this Mac (the same reckoning as the context limit above, at the entry's
+`kv_bits`) and loads the first that leaves `min_context` tokens (65536 unless set, or the model's own
+`context` if that is less); failing that, the one that leaves the most. A coding agent's conversation
+outgrows a small window and pays a long re-read at every compaction, so a 4-bit model with room beats
+an 8-bit one squeezed. One `models.toml` then fits every Mac. Weights given by Hugging Face repo id
+can't be sized before they load and are skipped while any local folder can.
+
 Models without an entry still load by path or repo id with defaults (no effort kwarg, budgets
 only).
 

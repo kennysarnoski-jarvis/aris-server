@@ -65,7 +65,7 @@ def main(argv=None):
         if not models:
             print(f"no models configured in {home() / 'models.toml'}")
         for name, spec in models.items():
-            print(f"{name:24} {spec.path}")
+            print(f"{name:24} {' or '.join(spec.choices) or spec.path}")
         return 0
 
     logging.basicConfig(level=getattr(logging, a.log_level.upper(), logging.INFO),
@@ -80,7 +80,7 @@ def main(argv=None):
 
     import mlx.core as mx
 
-    from .engine import Engine, NotEnoughMemory, check_memory, weights_on_disk
+    from .engine import Engine, NotEnoughMemory, check_memory, choose_weights, weights_on_disk
     from .http import Server
 
     _wired_limit()
@@ -95,9 +95,11 @@ def main(argv=None):
     try:
         # Before loading: a model this Mac can't hold would swap it to a standstill, and under the service, again
         # after every restart.
+        limit = mx.device_info()["max_recommended_working_set_size"]
+        spec = choose_weights(spec, limit)
         weights = weights_on_disk(spec.path, spec.adapter)
         if weights is not None:
-            check_memory(name, mx.device_info()["max_recommended_working_set_size"], weights)
+            check_memory(name, limit, weights)
         engine = Engine(spec, decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
                         disk_cache_gb=a.disk_cache_gb,
                         prompt_cache_bytes=int(a.prompt_cache_gb * (1 << 30)) if a.prompt_cache_gb else None)

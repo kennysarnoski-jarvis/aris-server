@@ -55,6 +55,20 @@ a model entry, or pass `--adapter`. Switching between a base model and its adapt
 `kv_bits = 8` in a model entry (or `--kv-bits 8`) keeps the KV cache at 8 bits: about twice the context
 in the same memory. `--kv-bits 16` turns it back to full precision.
 
+To serve the best weights each Mac can hold, give `path` a list, best first. Before loading, the server
+works out how much context each would leave on this Mac and loads the first that leaves `min_context`
+tokens (65536 unless set), or else the one that leaves the most:
+
+```toml
+[models."arete:27b"]
+path = ["~/models/arete-27b-mlx-8bit", "~/models/arete-27b-mlx-4bit"]
+kv_bits = 8
+```
+
+With the 8-bit KV cache, Arete-27B's 8-bit weights leave about 124k tokens of context on a 48 GB Mac and
+more than the model's whole context on a 64 GB one. A 32 GB Mac can't hold them and gets the 4-bit
+weights, with about 63k.
+
 ## Run it as a service
 
 ```bash

@@ -201,6 +201,24 @@ def test_models_toml_reads_an_adapter(tmp_path, monkeypatch):
     assert spec.adapter.endswith("/adapters/expert1") and not spec.adapter.startswith("~")
 
 
+def test_models_toml_reads_weights_to_choose_from_by_memory(tmp_path):
+    from aris_server.config import DEFAULT_MIN_CONTEXT, load_models
+
+    (tmp_path / "models.toml").write_text(
+        '[models."arete:27b"]\npath = ["~/models/arete-8bit", "~/models/arete-4bit"]\n'
+        '[models."small"]\npath = "~/models/small"\nmin_context = 32768\n')
+    models = load_models(tmp_path / "models.toml")
+    arete, small = models["arete:27b"], models["small"]
+    assert arete.choices == (arete.path, arete.path.replace("8bit", "4bit"))
+    assert arete.path.endswith("/models/arete-8bit") and not arete.path.startswith("~")
+    assert arete.min_context == DEFAULT_MIN_CONTEXT
+    assert (small.choices, small.min_context) == ((), 32768)
+
+    (tmp_path / "models.toml").write_text('[models."x"]\npath = []\n')
+    with pytest.raises(ValueError, match="path must be"):
+        load_models(tmp_path / "models.toml")
+
+
 def test_claude_codes_per_request_billing_line_never_reaches_the_prompt():
     # Its suffix changes between requests mid-system-prompt, which would re-read everything after it.
     for suffix in ("5de", "eed"):

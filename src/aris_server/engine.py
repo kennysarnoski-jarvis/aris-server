@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -168,6 +168,46 @@ def check_memory(name: str, limit: int, weights: int, fits: int | None = None) -
         logging.warning("only about %d tokens of context fit beside %s's weights, and Claude Code needs at least %d: "
                         "kv_bits = 8 or a smaller quantization of the model leaves more room", fits, name,
                         MIN_USEFUL_CONTEXT)
+
+
+def _kv_shape(config: dict) -> tuple[dict, int, int]:
+    """A model config's text settings, its KV heads and its head size."""
+    text = config.get("text_config", config)
+    heads = text.get("num_key_value_heads") or text["num_attention_heads"]
+    return text, heads, text.get("head_dim") or text["hidden_size"] // text["num_attention_heads"]
+
+
+def context_on_disk(path: str, adapter: str | None, kv_bits: int | None, limit: int) -> int | None:
+    """Tokens of context the weights in `path` would leave on this Mac, from their files, before loading them. None
+    for weights that aren't a local folder with a config."""
+    weights, config = weights_on_disk(path, adapter), Path(path) / "config.json"
+    if weights is None or not config.is_file():
+        return None
+    text, heads, head_dim = _kv_shape(json.loads(config.read_text()))
+    if types := text.get("layer_types"):
+        layers = sum(t == "full_attention" for t in types)  # hybrid models: only these layers keep a KV cache
+    elif interval := text.get("full_attention_interval"):
+        layers = text["num_hidden_layers"] // interval
+    else:
+        layers = text["num_hidden_layers"]
+    return context_that_fits(limit, weights, kv_bytes_per_token(layers, heads, head_dim, kv_bits), CONTEXT_OVERHEAD)
+
+
+def choose_weights(spec: ModelSpec, limit: int) -> ModelSpec:
+    """Of a model's weights, best first, the first that leaves `min_context` tokens of context on this Mac (or the
+    model's whole context, if that is less); failing that, the one that leaves the most."""
+    if not spec.choices:
+        return spec
+    fits = {p: context_on_disk(p, spec.adapter, spec.kv_bits, limit) for p in spec.choices}
+    want = min(spec.min_context, spec.context or spec.min_context)
+    sized = [p for p in spec.choices if fits[p] is not None]
+    # Among weights that leave the same (no context at all, say), the later ones are the smaller.
+    most = max(sized, key=lambda p: (fits[p], spec.choices.index(p)), default=spec.choices[0])
+    chosen = next((p for p in sized if fits[p] >= want), most)
+    logging.info("memory: %s; loading %s", "; ".join(
+        f"{p} leaves about {fits[p]} tokens of context" if fits[p] is not None else f"{p} can't be sized before loading"
+        for p in spec.choices), chosen)
+    return replace(spec, path=chosen)
 
 
 _orig_generate = mls.ResponseGenerator._generate
@@ -553,10 +593,7 @@ class Engine:
             path = Path(self.spec.path)
             if not (path / "config.json").is_file():
                 return None
-            config = json.loads((path / "config.json").read_text())
-            text = config.get("text_config", config)
-            heads = text.get("num_key_value_heads") or text["num_attention_heads"]
-            head_dim = text.get("head_dim") or text["hidden_size"] // text["num_attention_heads"]
+            _, heads, head_dim = _kv_shape(json.loads((path / "config.json").read_text()))
             return kv_bytes_per_token(layers, heads, head_dim, self.spec.kv_bits) if layers else None
         except Exception:  # noqa: BLE001  an unusual model: no memory-derived context limit
             return None
