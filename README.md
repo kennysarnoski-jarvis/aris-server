@@ -4,7 +4,7 @@ Run open-weight models on your Mac and use them from Claude Code, Aris Code, or 
 speaks the Anthropic Messages API.
 
 ```bash
-uv tool install git+https://github.com/kennysarnoski-jarvis/aris-server
+uv tool install aris-server
 aris-server serve --model mlx-community/Qwen3.5-9B-MLX-8bit
 ```
 
