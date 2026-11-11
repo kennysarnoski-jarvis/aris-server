@@ -191,8 +191,11 @@ def convert_tools(tools, messages) -> tuple[list[dict] | None, list[str], list[d
 def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
     if not isinstance(body.get("messages"), list) or not body["messages"]:
         raise RequestError("messages must be a non-empty list")
+    # As in Anthropic's API, a request thinks only when it asks to. Claude Code asks on every turn of its agent loop
+    # ("adaptive") and leaves thinking out of its side requests, such as summarizing a page WebFetch read, which a
+    # reasoning model would otherwise spend minutes thinking through.
     thinking_cfg = body.get("thinking") or {}
-    thinking = thinking_cfg.get("type", "enabled") != "disabled"
+    thinking = thinking_cfg.get("type", "disabled") != "disabled"
     effort = (body.get("output_config") or {}).get("effort") or "high"
     if effort not in EFFORTS:
         raise RequestError(f"unknown effort {effort!r}")

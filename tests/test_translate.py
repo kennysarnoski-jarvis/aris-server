@@ -8,7 +8,9 @@ ARETE = ModelSpec(name="arete:27b", path="x", context=131072, effort_kwarg="reas
 
 
 def body(**kw):
-    return {"model": "arete:27b", "max_tokens": 32000, "messages": [{"role": "user", "content": "hi"}], **kw}
+    """A turn of Claude Code's agent loop, which always asks for thinking."""
+    return {"model": "arete:27b", "max_tokens": 32000, "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive", "display": "omitted"}, **kw}
 
 
 def test_tool_loop_history_becomes_template_messages():
@@ -75,6 +77,16 @@ def test_effort_and_thinking(req, kwargs, budget):
     p = plan(body(**req), ARETE)
     assert p.template_kwargs == kwargs
     assert p.think_budget == budget
+
+
+def test_a_request_that_does_not_ask_for_thinking_does_not_think():
+    # Claude Code's side requests (here summarizing a page WebFetch read) carry an effort but no `thinking`; Arete
+    # thought through each one for minutes.
+    side = {"model": "arete:27b", "max_tokens": 32000, "output_config": {"effort": "high"},
+            "messages": [{"role": "user", "content": "Web page content:\n---\nExample Domain\n---\nWhat is the title?"}]}
+    p = plan(side, ARETE)
+    assert p.template_kwargs == {"enable_thinking": False}
+    assert p.think_budget == 0
 
 
 def test_model_without_effort_control_gets_budgets_only():

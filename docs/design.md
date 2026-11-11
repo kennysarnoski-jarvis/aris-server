@@ -70,7 +70,8 @@ Claude Code ──/v1/messages──▶ Anthropic layer ──▶ mlx-lm engine 
 
 | Request | Model sees |
 | --- | --- |
-| `thinking.type: "disabled"` | Thinking off (the template's `enable_thinking=False`). |
+| `thinking.type: "enabled"` or `"adaptive"` | Thinking on. Claude Code asks for `"adaptive"` on every turn of its agent loop. |
+| `thinking.type: "disabled"`, or no `thinking` | Thinking off (the template's `enable_thinking=False`). As in Anthropic's API, a request thinks only when it asks to: Claude Code leaves `thinking` out of its side requests, such as summarizing a page WebFetch read. |
 | `output_config.effort` low / medium / high / xhigh / max | The model's own effort control if it has one (for example Arete's `reasoning_effort`), else nothing, plus that effort's think budget. |
 | `thinking.budget_tokens` | Overrides the think budget. |
 
