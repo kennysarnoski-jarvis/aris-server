@@ -91,14 +91,19 @@ class DiskCache:
         self.index: dict[Path, tuple[tuple[int, ...], str]] = {}
         for data in self.dir.glob("*.safetensors"):
             if not data.with_suffix(".json").exists():  # a write cut off by a crash or a kill
-                data.unlink(missing_ok=True)
+                _remove(data)
         for f in self.dir.glob("*.json"):
             data = f.with_suffix(".safetensors")
             if not data.exists():
-                f.unlink(missing_ok=True)
+                _remove(data)
                 continue
-            meta = json.loads(f.read_text())
-            self.index[data] = (tuple(meta["tokens"]), meta["type"])
+            try:
+                meta = json.loads(f.read_text())
+                self.index[data] = (tuple(meta["tokens"]), meta["type"])
+            except (OSError, ValueError, KeyError, TypeError) as e:  # cut off mid-write: no turn can match it
+                # Raised here, it stopped the server before it served, and under the service at every restart.
+                logging.warning("dropping prompt cache %s: its metadata can't be read: %s", data.name, e)
+                _remove(data)
         self._trim()  # started on another setup: what the last one left over the cap goes now
 
     def _hold(self):
@@ -184,11 +189,11 @@ class DiskCache:
             for folder, _ in claimed:
                 if any(folder.glob("*.safetensors")):
                     continue
-                for leftover in [*folder.glob("*.json"), folder / LOCK]:
-                    leftover.unlink(missing_ok=True)
                 try:
+                    for leftover in [*folder.glob("*.json"), folder / LOCK]:
+                        leftover.unlink(missing_ok=True)
                     folder.rmdir()
-                except OSError:  # something else is in it: leave the folder
+                except OSError:  # something else is in it, or it can't be changed: leave the folder
                     pass
         finally:
             for _, lock in claimed:

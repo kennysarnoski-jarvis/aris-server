@@ -355,3 +355,44 @@ def test_a_cache_folder_deleted_while_serving_is_made_again_and_held(tmp_path):
     assert sorted(len(t) for t, _ in cache.disk.index.values()) == [1200, 2200]
     assert all(p.exists() for p in cache.disk.index)
     assert _claim(cache.disk.dir) is None                                       # held again: no other server clears it
+
+
+def test_a_cache_whose_metadata_was_cut_off_is_dropped_at_startup(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    other = list(range(9000, 11000))
+    cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")
+    cache.insert_cache("m", other, layers(2000, 4), cache_type="assistant")
+    cache.flush()
+    (data,) = [p for p, (t, _) in cache.disk.index.items() if t == tuple(TURN1)]
+    meta = data.with_suffix(".json")
+    meta.write_text(meta.read_text()[:100])                                     # killed mid-write
+    fresh = DiskCache(tmp_path, "model-a", max_bytes=1 << 30)                   # raised at every start
+    assert [t for t, _ in fresh.index.values()] == [tuple(other)]
+    assert not data.exists() and not meta.exists()
+
+
+def test_a_read_only_cache_folder_never_stops_startup(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")
+    cache.flush()
+    (data,) = cache.disk.index
+    data.with_suffix(".json").unlink()                                          # a write cut off by a kill
+    cache.disk.dir.chmod(0o500)
+    try:
+        fresh = DiskCache(tmp_path, "model-a", max_bytes=1 << 30)               # raised: it couldn't clean up
+    finally:
+        cache.disk.dir.chmod(0o700)
+    assert fresh.index == {}
+
+
+def test_another_setups_folder_that_cannot_be_cleared_is_left_at_startup(tmp_path):
+    before = DiskCache(tmp_path, "model-b", max_bytes=1 << 30)
+    data = saved(before, 0, 1, age=1000)
+    del before
+    data.unlink()                                                               # its caches gone; metadata, lock left
+    data.parent.chmod(0o500)
+    try:
+        DiskCache(tmp_path, "model-a", max_bytes=1 << 30)                       # raised: it couldn't clear the folder
+    finally:
+        data.parent.chmod(0o700)
+    assert data.with_suffix(".json").exists()

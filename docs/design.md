@@ -185,8 +185,8 @@ conversation plus the system prompt doesn't fit the memory budget, the conversat
 every turn, and re-reading 40k tokens costs minutes where the file costs a second. A cache that can't be loaded
 (deleted by hand, or damaged) is dropped and the turn looks again, so it reads on from what memory holds rather than
 from its first token; one whose file is gone is forgotten before the turn gives up what memory holds. A cache file
-without its metadata file is a write
-that was cut off and is deleted. Loaded caches are evaluated before generation uses them: MLX binds
+without its metadata file, or with its metadata cut off, is a write that was cut off and is deleted: metadata that
+couldn't be read stopped the server at every start. A folder that can't be changed never stops startup. Loaded caches are evaluated before generation uses them: MLX binds
 a lazy load to the loading thread's stream.
 
 Decoding evaluates the batch's caches every 64 steps. Each step, every linear-attention layer counts its cache's
