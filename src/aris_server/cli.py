@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import home, load_models, resolve
+from .config import builtin_models, home, load_models, resolve
 
 
 def _wired_limit():
@@ -48,7 +48,10 @@ def main(argv=None):
                    help="disk for saved prompt caches, all models together (0 turns it off)")
     s.add_argument("--reserve-gb", type=float, default=6.0, help="GPU memory kept free for active sequences")
     s.add_argument("--log-level", default="INFO")
-    sub.add_parser("models", help="list configured models")
+    sub.add_parser("models", help="list configured and built-in models")
+    p = sub.add_parser("pull", help="download the weights a model would load on this Mac, ahead of serving it")
+    p.add_argument("model", help="configured or built-in model name, or Hugging Face repo id")
+    p.add_argument("--json", action="store_true", help="report each step as a JSON line on stdout, for apps")
     svc = sub.add_parser("service", help="run as a login service that restarts itself (macOS launchd)")
     svc.add_argument("action", choices=["install", "uninstall", "status"])
     svc.add_argument("serve_args", nargs=argparse.REMAINDER, help="arguments for serve, after --")
@@ -67,7 +70,18 @@ def main(argv=None):
             print(f"no models configured in {home() / 'models.toml'}")
         for name, spec in models.items():
             print(f"{name:24} {' or '.join(spec.choices) or spec.path}")
+        for name, spec in builtin_models().items():
+            if name not in models:
+                print(f"{name:24} {' or '.join(spec.choices) or spec.path}  (built in)")
         return 0
+    if a.cmd == "pull":
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")  # stdout is the report
+        _quiet_dependencies(logging.WARNING)
+        import mlx.core as mx
+
+        from .pull import pull
+
+        return pull(resolve(a.model, models), mx.device_info()["max_recommended_working_set_size"], as_json=a.json)
 
     logging.basicConfig(level=getattr(logging, a.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(message)s")

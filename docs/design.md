@@ -228,11 +228,24 @@ what it has. Weights neither can size are skipped while any other can.
 Models without an entry still load by path or repo id with defaults (no effort kwarg, budgets
 only).
 
+Some models are built in, known by name with no entry: `aris-3.8-27b` is Aris 3.8-27B at 8 and 4
+bits on the Hub (`YourAris/Aris-3.8-27B-MLX-8bit`, `-4bit`), with the settings its evals ran with.
+An entry of the same name in `models.toml` replaces a built-in one. A bare `serve` never picks a
+built-in model; it has to be named.
+
+`pull` downloads ahead of serving: it makes the same choice `serve` would (the best weights this Mac
+holds, sized before anything big downloads), refuses weights the Mac can't hold, and fetches exactly
+the files loading reads into Hugging Face's cache, where `serve` finds them. With `--json` each step is
+a JSON line on stdout (`chosen`, `progress` about once a second, `done` or `error`), for apps that
+show the download. Progress is the larger of bytes received and bytes written: Xet downloads write to
+disk in big flushes.
+
 ## Command line
 
 ```
 aris-server serve [--model NAME] [--host 127.0.0.1] [--port 8484]
-aris-server models          # list configured models
+aris-server pull NAME [--json]   # download the weights NAME would load on this Mac
+aris-server models               # list configured and built-in models
 ```
 
 ## Not in scope (for now)

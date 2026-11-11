@@ -49,38 +49,59 @@ class ModelSpec:
         return int(self.think_budget.get(effort, DEFAULT_THINK_BUDGET.get(effort, 0)))
 
 
+# Models the server knows by name with no models.toml entry; an entry there with the same name replaces one. Their
+# weights are on the Hugging Face Hub, best first: the server picks what each Mac holds before downloading anything.
+BUILTIN_MODELS = {
+    # Aris 3.8-27B: Arete-27B (Nous Research, on Qwen3.8-27B) trained on its own passing agent runs. The settings are
+    # the ones its evals ran with: Claude Code's effort onto Arete's trained effort levels, and a think budget each.
+    "aris-3.8-27b": {
+        "path": ["YourAris/Aris-3.8-27B-MLX-8bit", "YourAris/Aris-3.8-27B-MLX-4bit"],
+        "kv_bits": 8,
+        "effort_kwarg": "reasoning_effort",
+        "effort_map": {"low": "low", "medium": "medium", "high": "medium", "xhigh": "xhigh", "max": "xhigh"},
+        "think_budget": {"low": 1024, "medium": 3072, "high": 4096, "xhigh": 12288, "max": 0},
+    },
+}
+
+
 def load_models(path: Path | None = None) -> dict[str, ModelSpec]:
+    """The models configured in models.toml (not the built-in ones: see builtin_models)."""
     path = path or home() / "models.toml"
     if not path.is_file():
         return {}
     data = tomllib.loads(path.read_text())
-    out = {}
-    for name, raw in (data.get("models") or {}).items():
-        if "path" not in raw:
-            raise ValueError(f"model {name!r} in {path} has no path")
-        paths = raw["path"] if isinstance(raw["path"], list) else [raw["path"]]
-        if not paths or not all(isinstance(p, str) and p for p in paths):
-            raise ValueError(f"model {name!r} in {path}: path must be a folder or repo id, or a list of them")
-        paths = [_weights_path(p) for p in paths]
-        budget = dict(DEFAULT_THINK_BUDGET)
-        budget.update(raw.get("think_budget") or {})
-        if raw.get("kv_bits") not in (None, *KV_BITS_CHOICES):
-            raise ValueError(f"model {name!r} in {path}: kv_bits must be one of {KV_BITS_CHOICES}")
-        out[name] = ModelSpec(
-            name=name,
-            path=paths[0],
-            choices=tuple(paths) if len(paths) > 1 else (),
-            min_context=int(raw.get("min_context", DEFAULT_MIN_CONTEXT)),
-            context=raw.get("context"),
-            adapter=str(Path(raw["adapter"]).expanduser()) if raw.get("adapter") else None,
-            kv_bits=raw.get("kv_bits"),
-            effort_kwarg=raw.get("effort_kwarg"),
-            effort_map=dict(raw.get("effort_map") or {}),
-            think_budget=budget,
-            template_kwargs=dict(raw.get("template_kwargs") or {}),
-            **{k: raw[k] for k in ("temperature", "top_p", "top_k", "followup_budget") if k in raw},
-        )
-    return out
+    return {name: _spec(name, raw, f"model {name!r} in {path}") for name, raw in (data.get("models") or {}).items()}
+
+
+def builtin_models() -> dict[str, ModelSpec]:
+    return {name: _spec(name, raw, f"built-in model {name!r}") for name, raw in BUILTIN_MODELS.items()}
+
+
+def _spec(name: str, raw: dict, where: str) -> ModelSpec:
+    if "path" not in raw:
+        raise ValueError(f"{where} has no path")
+    paths = raw["path"] if isinstance(raw["path"], list) else [raw["path"]]
+    if not paths or not all(isinstance(p, str) and p for p in paths):
+        raise ValueError(f"{where}: path must be a folder or repo id, or a list of them")
+    paths = [_weights_path(p) for p in paths]
+    budget = dict(DEFAULT_THINK_BUDGET)
+    budget.update(raw.get("think_budget") or {})
+    if raw.get("kv_bits") not in (None, *KV_BITS_CHOICES):
+        raise ValueError(f"{where}: kv_bits must be one of {KV_BITS_CHOICES}")
+    return ModelSpec(
+        name=name,
+        path=paths[0],
+        choices=tuple(paths) if len(paths) > 1 else (),
+        min_context=int(raw.get("min_context", DEFAULT_MIN_CONTEXT)),
+        context=raw.get("context"),
+        adapter=str(Path(raw["adapter"]).expanduser()) if raw.get("adapter") else None,
+        kv_bits=raw.get("kv_bits"),
+        effort_kwarg=raw.get("effort_kwarg"),
+        effort_map=dict(raw.get("effort_map") or {}),
+        think_budget=budget,
+        template_kwargs=dict(raw.get("template_kwargs") or {}),
+        **{k: raw[k] for k in ("temperature", "top_p", "top_k", "followup_budget") if k in raw},
+    )
 
 
 def _weights_path(p: str) -> str:
@@ -89,7 +110,10 @@ def _weights_path(p: str) -> str:
 
 
 def resolve(name: str, models: dict[str, ModelSpec]) -> ModelSpec:
-    """A configured model by name, or an unconfigured one by local path or Hugging Face repo id."""
+    """A configured model by name, then a built-in one, or else an unconfigured one by local path or Hugging Face repo
+    id."""
     if name in models:
         return models[name]
+    if name in BUILTIN_MODELS:
+        return builtin_models()[name]
     return ModelSpec(name=name, path=_weights_path(name))
