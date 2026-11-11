@@ -14,6 +14,31 @@ Then point Claude Code at it:
 ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude
 ```
 
+Claude Code assumes a 200k-token window and compacts its conversation about 33k tokens short of the
+window it's given. A local model's window is whatever fits beside its weights, so tell Claude Code
+what it is: the server logs it at startup, and `/v1/models` lists it as `context_window`. With
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` set to it, the conversation compacts before the server's limit:
+
+```bash
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=124928 ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude
+```
+
+## Aris 3.8-27B
+
+Aris 3.8-27B is built in as `aris-3.8-27b`. It's Aris's coding-agent fine-tune of
+[Arete-27B](https://huggingface.co/NousResearch/Arete-27B) by Nous Research, which is built on
+[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) by the Qwen team at Alibaba Cloud. `pull`
+picks the best build this Mac can hold, before anything big downloads, and downloads it:
+
+```bash
+aris-server pull aris-3.8-27b
+aris-server serve --model aris-3.8-27b
+```
+
+The 8-bit build takes 27 GB, so it needs a Mac with 48 GB of memory or more, where it has about
+125k tokens of context. Its [model card](https://huggingface.co/YourAris/Aris-3.8-27B-MLX-8bit) has
+the details and evals.
+
 ## Why not Ollama?
 
 Aris Server does one job: serve a local model to coding agents properly.
@@ -57,7 +82,8 @@ in the same memory. `--kv-bits 16` turns it back to full precision.
 
 To serve the best weights each Mac can hold, give `path` a list, best first. Before loading, the server
 works out how much context each would leave on this Mac and loads the first that leaves `min_context`
-tokens (65536 unless set), or else the one that leaves the most:
+tokens (65536 unless set), or else the one that leaves the most. Hugging Face repos are sized from the
+Hub before anything downloads, so a Mac only ever fetches weights it can run:
 
 ```toml
 [models."arete:27b"]
@@ -72,10 +98,13 @@ weights, with about 63k.
 ## Run it as a service
 
 ```bash
-aris-server service install -- --model arete:27b
+aris-server service install -- --model aris-3.8-27b
 aris-server service status
 aris-server service uninstall
 ```
+
+`aris-server pull --json` reports each step of a download as a JSON line, for apps that set the
+server up for their users. `aris-server models` lists configured and built-in models.
 
 The service starts at login and restarts the server within seconds of any exit (it exits on purpose
 if the GPU runs out of memory). Saved prompt caches mean the conversation picks up where it left off;
