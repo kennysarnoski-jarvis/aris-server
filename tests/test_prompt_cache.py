@@ -236,6 +236,25 @@ def test_a_model_whose_own_context_is_short_takes_the_best_weights_that_hold_it(
     assert choose_weights(spec, int(32.5 * gb)).path == q8
 
 
+@pytest.mark.parametrize("system_bytes,older_bytes,left", [
+    (40_000, 0, 0),            # beside the 77,328 bytes reading its prompt needs, over the budget: not kept
+    (20_000, 15_000, 20_000),  # kept, and the older conversation goes to make room for it beside the read
+    (20_000, 0, 20_000),
+])
+def test_a_system_prompt_is_kept_only_where_it_fits_beside_reading_its_prompt(system_bytes, older_bytes, left):
+    # mlx-lm copies the cache at the end of the system prompt while the rest of that prompt is still being read: a
+    # 100k-token system prompt's 3.7 GB copy beside its 6.1 GB read ran a 48 GB Mac's GPU out of memory.
+    cache = MovingPromptCache(max_size=10, max_bytes=100_000)
+    cache.kv_bytes_per_token = 10
+    if older_bytes:
+        cache.insert_cache("m", [7] * 50, [Layer(older_bytes)], cache_type="assistant")
+    prompt = SYSTEM + [9] * 100
+    assert cache.fetch_nearest_cache("m", prompt) == (None, prompt)  # reading it peaks at 1.8 * (200 + 4096) * 10
+    cache.trim_to(n_bytes=cache.max_bytes)
+    cache.insert_cache("m", SYSTEM, [Layer(system_bytes)], cache_type="system")  # mlx-lm, at the system prompt's end
+    assert cache.nbytes == left
+
+
 @pytest.mark.parametrize("prompt_tokens,older_bytes,left", [
     (2_000, 40_000, 0),        # reading it peaks at 109,728 bytes, more than the whole budget: nothing saved stays
     (100, 40_000, 1_000),      # its 41,960 bytes of cache would fit beside the older one; reading peaks at 75,528

@@ -159,7 +159,11 @@ every kept conversation held the whole batch's cache alive (13 GB for eight kept
 model). One alone in its batch is not copied; it is the batch. A turn that just finished is never the entry evicted to
 make room: its conversation's next turn continues it within seconds, and evicting it sent that
 turn to disk while mlx-lm still held the evicted copy. Evictions are logged. The cache's
-budget is what the GPU holds beside the weights less a reserve for prefill scratch. And entries go to
+budget is what the GPU holds beside the weights less a reserve for prefill scratch. Before a prompt is read, saved
+entries make room for the peak reading it reaches (1.8 times the cache it builds, as for the context limit), and the
+system-prompt snapshot, which mlx-lm copies while the rest of the prompt is still being read, is kept only where it
+fits beside that: a 100k-token system prompt's copy beside its read ran a 48 GB Mac's GPU out of memory. A system
+prompt too long to keep is read again by the next conversation that starts from it. And entries go to
 `~/.aris-server/cache/<model>/` when memory lets them go: a finished turn when the LRU evicts it or
 at a graceful stop (usually its next turn takes it from memory first and it is never written), the
 shared system prompt at once. Writing every turn put 445 GB on an SSD in one day. A model sometimes

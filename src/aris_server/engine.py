@@ -265,6 +265,7 @@ class MovingPromptCache(LRUPromptCache):
     light_min_tokens = 1024  # shorter prompts are quick to re-read
     kv_bytes_per_token = None  # set by the engine: the cache one token of context adds to a sequence
     _pending_bytes = 0  # the cache the request just handed its own is about to build (see trim_to)
+    _read_peak = 0  # what reading the latest prompt needs at its peak, while its system-prompt copy may arrive
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -315,15 +316,27 @@ class MovingPromptCache(LRUPromptCache):
                 self._turn_state[key] = (len(at), self._prompt_state.pop(at))
                 while len(self._turn_state) > MAX_KEPT_STATES:
                     self._turn_state.pop(next(iter(self._turn_state)))
+        cap, size = self.max_bytes, sum(c.nbytes for c in prompt_cache)
+        if cache_type == "system" and size + self._read_peak > cap:
+            # mlx-lm copies the cache at the end of the system prompt, while the rest of that prompt is still being
+            # read. Kept beside what the read needs, a long system prompt's copy ran a 48 GB Mac's GPU out of memory
+            # just after it read a 100k-token one (3.7 GB of copy beside a 6.1 GB read, with a 4.8 GB budget).
+            # Without it, a conversation that starts from this system prompt reads it again.
+            gb = 1 << 30
+            logging.info("memory cache: not keeping the %d-token system prompt: its %.1f GB beside the %.1f GB reading "
+                         "its prompt needs is more than the %.1f GB budget", len(tokens), size / gb,
+                         self._read_peak / gb, cap / gb)
+            return
         if not mid_request:
             before = {k for k in self._entry_keys()}
             # The turn that just finished is the cache its conversation's next turn continues, often within seconds:
             # when it's larger than the budget, other entries go and it stays. Evicting it sent that next turn to
             # disk while mlx-lm still briefly held the evicted copy, putting two copies of the conversation in memory.
-            cap, size = self.max_bytes, sum(c.nbytes for c in prompt_cache)
             keep = size + self._n_bytes_by_type.get("system", 0)
             if cache_type != "system" and keep > cap:
                 self.max_bytes = keep
+            elif cache_type == "system":  # room for it beside the read still under way: other saved entries go
+                self.max_bytes = cap - self._read_peak
             try:
                 super().insert_cache(model, tokens, prompt_cache, cache_type=cache_type)
             finally:
@@ -400,6 +413,7 @@ class MovingPromptCache(LRUPromptCache):
             # Reading the prompt's unread tokens, plus a growth block (the cache grows in blocks, and the reply grows it
             # too), peaks above the cache they build, by the same rate the context limit allows for.
             self._pending_bytes = int(PEAK_PER_KV_BYTE * (len(rest) + KV_GROWTH_TOKENS) * self.kv_bytes_per_token)
+            self._read_peak = self._pending_bytes
         return cache, rest
 
     def trim_to(self, *, n_sequences=None, n_bytes=None):
