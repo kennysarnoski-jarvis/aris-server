@@ -1,6 +1,8 @@
 """mlx-lm's server engine (batching, prompt cache, thinking and tool parsing), driven by Aris Server."""
 
 import argparse
+import fnmatch
+import functools
 import gc
 import json
 import logging
@@ -141,7 +143,7 @@ class NotEnoughMemory(RuntimeError):
 
 def weights_on_disk(*folders: str | None) -> int | None:
     """The bytes a model's weights (and adapter) will take once loaded: their safetensors files. None for a model that
-    isn't a local folder (a Hugging Face repo id), which is checked once loaded instead."""
+    isn't a local folder (a Hugging Face repo id: see weights_and_config)."""
     total = 0
     for folder in folders:
         if folder is None:
@@ -177,13 +179,66 @@ def _kv_shape(config: dict) -> tuple[dict, int, int]:
     return text, heads, text.get("head_dim") or text["hidden_size"] // text["num_attention_heads"]
 
 
-def context_on_disk(path: str, adapter: str | None, kv_bits: int | None, limit: int) -> int | None:
-    """Tokens of context the weights in `path` would leave on this Mac, from their files, before loading them. None
-    for weights that aren't a local folder with a config."""
-    weights, config = weights_on_disk(path, adapter), Path(path) / "config.json"
-    if weights is None or not config.is_file():
+# The weight files mlx-lm loads from a Hugging Face repo, and everything it downloads with them.
+HUB_WEIGHTS = "model*.safetensors"
+
+
+@functools.lru_cache(maxsize=32)
+def hub_info(repo: str):
+    """A Hugging Face repo's file listing, with sizes, from the Hub (None when it can't be reached or doesn't know the
+    repo: offline, misspelled, or private without a login). Asked once per process."""
+    import huggingface_hub
+
+    try:
+        return huggingface_hub.HfApi().model_info(repo, files_metadata=True)
+    except Exception as e:  # noqa: BLE001  offline, a missing or private repo: the caller falls back to the cache
+        logging.debug("could not ask the Hugging Face Hub about %s: %s", repo, e)
         return None
-    text, heads, head_dim = _kv_shape(json.loads(config.read_text()))
+
+
+def _hub_weights_and_config(repo: str) -> tuple[int, dict] | None:
+    """A Hugging Face repo's weight bytes and config before its weights download: their sizes from the Hub (the config
+    is a few kilobytes), or else from the local cache when the Hub can't be reached."""
+    import huggingface_hub
+
+    if (info := hub_info(repo)) is not None:
+        weights = sum(s.size or 0 for s in info.siblings or [] if fnmatch.fnmatch(s.rfilename, HUB_WEIGHTS))
+        try:
+            config = Path(huggingface_hub.hf_hub_download(repo, "config.json", revision=info.sha))
+            return (weights, json.loads(config.read_text())) if weights else None
+        except Exception as e:  # noqa: BLE001  the listing came back but the download didn't: try the cache
+            logging.debug("could not read %s's config from the Hub: %s", repo, e)
+    try:
+        folder = huggingface_hub.snapshot_download(repo, local_files_only=True,
+                                                   allow_patterns=["*.json", HUB_WEIGHTS])
+    except Exception:  # noqa: BLE001  not in the cache either
+        return None
+    weights, config = weights_on_disk(folder), Path(folder) / "config.json"
+    return (weights, json.loads(config.read_text())) if weights and config.is_file() else None
+
+
+def weights_and_config(path: str, adapter: str | None = None) -> tuple[int, dict] | None:
+    """The bytes a model's weights (and adapter) will take once loaded, and its config, known before anything loads or
+    downloads: from a local folder's files, or for a Hugging Face repo id from the Hub (or the local cache when the
+    Hub can't be reached). None when neither can say."""
+    if Path(path).is_dir():
+        weights, config = weights_on_disk(path, adapter), Path(path) / "config.json"
+        return (weights, json.loads(config.read_text())) if weights is not None and config.is_file() else None
+    hub = _hub_weights_and_config(path)
+    extra = weights_on_disk(adapter) if adapter else 0
+    if hub is None or extra is None:
+        return None
+    return hub[0] + extra, hub[1]
+
+
+def context_before_loading(path: str, adapter: str | None, kv_bits: int | None, limit: int) -> int | None:
+    """Tokens of context the weights in `path` would leave on this Mac, known before they load (or download). None
+    for weights that can't be sized: see weights_and_config."""
+    sized = weights_and_config(path, adapter)
+    if sized is None:
+        return None
+    weights, config = sized
+    text, heads, head_dim = _kv_shape(config)
     if types := text.get("layer_types"):
         layers = sum(t == "full_attention" for t in types)  # hybrid models: only these layers keep a KV cache
     elif interval := text.get("full_attention_interval"):
@@ -198,7 +253,7 @@ def choose_weights(spec: ModelSpec, limit: int) -> ModelSpec:
     model's whole context, if that is less); failing that, the one that leaves the most."""
     if not spec.choices:
         return spec
-    fits = {p: context_on_disk(p, spec.adapter, spec.kv_bits, limit) for p in spec.choices}
+    fits = {p: context_before_loading(p, spec.adapter, spec.kv_bits, limit) for p in spec.choices}
     want = min(spec.min_context, spec.context or spec.min_context)
     sized = [p for p in spec.choices if fits[p] is not None]
     # Among weights that leave the same (no context at all, say), the later ones are the smaller.

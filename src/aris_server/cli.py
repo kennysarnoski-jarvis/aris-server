@@ -81,7 +81,7 @@ def main(argv=None):
 
     import mlx.core as mx
 
-    from .engine import Engine, NotEnoughMemory, check_memory, choose_weights, weights_on_disk
+    from .engine import Engine, NotEnoughMemory, check_memory, choose_weights, weights_and_config
     from .http import Server
 
     _wired_limit()
@@ -94,13 +94,12 @@ def main(argv=None):
         print(f"no adapter_config.json in {spec.adapter}", file=sys.stderr)
         return 2
     try:
-        # Before loading: a model this Mac can't hold would swap it to a standstill, and under the service, again
-        # after every restart.
+        # Before loading, and for a Hugging Face repo before downloading: a model this Mac can't hold would swap it to
+        # a standstill, and under the service, again after every restart.
         limit = mx.device_info()["max_recommended_working_set_size"]
         spec = choose_weights(spec, limit)
-        weights = weights_on_disk(spec.path, spec.adapter)
-        if weights is not None:
-            check_memory(name, limit, weights)
+        if (sized := weights_and_config(spec.path, spec.adapter)) is not None:
+            check_memory(name, limit, sized[0])
         engine = Engine(spec, decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
                         disk_cache_gb=a.disk_cache_gb,
                         prompt_cache_bytes=int(a.prompt_cache_gb * (1 << 30)) if a.prompt_cache_gb else None)
