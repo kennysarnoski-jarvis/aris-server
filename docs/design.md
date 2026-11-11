@@ -164,9 +164,14 @@ entries make room for the peak reading it reaches (1.8 times the cache it builds
 system-prompt snapshot, which mlx-lm copies while the rest of the prompt is still being read, is kept only where it
 fits beside that: a 100k-token system prompt's copy beside its read ran a 48 GB Mac's GPU out of memory. A system
 prompt too long to keep is read again by the next conversation that starts from it. And entries go to
-`~/.aris-server/cache/<model>/` when memory lets them go: a finished turn when the LRU evicts it or
+`~/.aris-server/cache/<setup>/` when memory lets them go: a finished turn when the LRU evicts it or
 at a graceful stop (usually its next turn takes it from memory first and it is never written), the
-shared system prompt at once. Writing every turn put 445 GB on an SSD in one day. A model sometimes
+shared system prompt at once. Writing every turn put 445 GB on an SSD in one day. Each setup (weights, adapter, KV
+precision) has its own folder, and one cap, 20 GB by default, covers them all: a server reads only its own folder, so
+at startup and whenever a save goes over the cap, the caches of setups no running server holds go first, oldest first,
+then its own oldest. A cap per folder let a day of trying seven setups on one Mac fill 116 GB, 96 of them for setups
+no longer served. A running server holds a shared lock on its folder, and another server sharing the directory leaves
+it alone. A model sometimes
 generates a non-canonical tokenization, so its finished turn no longer matches the history the
 client sends back; instead of a multi-gigabyte snapshot of each prompt, the recurrent layers' state
 at the prompt's end (fixed-size, megabytes) is kept, and such a turn is rebuilt to its prompt's end

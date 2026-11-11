@@ -2,11 +2,18 @@
 conversation (minutes for a 27B model at 40k tokens). A conversation evicted from memory is also loaded back from
 here. Each finished turn's cache and the shared system-prompt snapshot
 are written as they enter the in-memory cache; a conversation's older snapshot is deleted when its next turn is saved.
+
+Each setup (weights, adapter, KV precision) has a folder of its own, and one cap covers them all. A server reads only
+its own folder, so the caches of setups no running server holds go first, then its own oldest. A running server holds
+a shared lock on its folder; another server sharing the directory clears only folders nobody holds.
 """
 
+import fcntl
 import hashlib
 import json
 import logging
+import os
+import re
 import time
 from pathlib import Path
 
@@ -14,6 +21,7 @@ import mlx.core as mx
 from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
 
 MIN_TOKENS = 1024  # shorter prompts are quick to re-read
+LOCK = "lock"      # shared by each server using the folder, exclusive for one clearing it
 
 
 def model_id(model_path: str, adapter: str | None = None, kv_bits: int | None = None) -> str:
@@ -32,12 +40,41 @@ def model_id(model_path: str, adapter: str | None = None, kv_bits: int | None = 
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
+def _stat(data: Path) -> tuple[float, int]:
+    """A cache file's (mtime, size), or (0, 0) once it is gone."""
+    try:
+        s = data.stat()
+    except FileNotFoundError:
+        return 0.0, 0
+    return s.st_mtime, s.st_size
+
+
+def _claim(folder: Path):
+    """The folder's lock, held exclusively, or None while a server uses the folder or another is clearing it."""
+    try:
+        lock = open(folder / LOCK, "a")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return None
+    return lock
+
+
+def _remove(data: Path):
+    data.unlink(missing_ok=True)
+    data.with_suffix(".json").unlink(missing_ok=True)
+
+
 class DiskCache:
     def __init__(self, root: Path, model_path: str, max_bytes: int, adapter: str | None = None,
                  kv_bits: int | None = None):
+        self.root = root
         self.dir = root / model_id(model_path, adapter, kv_bits)
-        self.dir.mkdir(parents=True, exist_ok=True)
         self.max_bytes = max_bytes
+        self._lock = self._hold()
         self.index: dict[Path, tuple[tuple[int, ...], str]] = {}
         for data in self.dir.glob("*.safetensors"):
             if not data.with_suffix(".json").exists():  # a write cut off by a crash or a kill
@@ -49,6 +86,28 @@ class DiskCache:
                 continue
             meta = json.loads(f.read_text())
             self.index[data] = (tuple(meta["tokens"]), meta["type"])
+        self._trim()  # started on another setup: what the last one left over the cap goes now
+
+    def _hold(self):
+        """A shared lock on this folder for as long as the server runs."""
+        while True:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            try:
+                lock = open(self.dir / LOCK, "a")
+            except FileNotFoundError:  # another server removed the folder just now
+                continue
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            try:
+                if os.path.samestat(os.stat(self.dir / LOCK), os.fstat(lock.fileno())):
+                    return lock
+            except FileNotFoundError:
+                pass
+            lock.close()  # the folder was cleared while this waited for it: make it again
+
+    def __del__(self):
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            lock.close()
 
     def has(self, tokens) -> bool:
         key = tuple(tokens)
@@ -76,17 +135,48 @@ class DiskCache:
                      time.time() - t0)
 
     def _delete(self, data: Path):
-        data.unlink(missing_ok=True)
-        data.with_suffix(".json").unlink(missing_ok=True)
+        _remove(data)
         self.index.pop(data, None)
 
     def _trim(self):
-        files = sorted(self.index, key=lambda p: p.stat().st_mtime if p.exists() else 0)
-        total = sum(p.stat().st_size for p in files if p.exists())
-        while files and total > self.max_bytes:
-            oldest = files.pop(0)
-            total -= oldest.stat().st_size if oldest.exists() else 0
-            self._delete(oldest)
+        """Keep this setup's caches, with those of setups no running server holds, under the cap: the others' go first,
+        oldest first, since this server can't read them; then this setup's oldest."""
+        claimed = [(folder, lock) for folder in self.root.iterdir()
+                   if folder != self.dir and folder.is_dir() and re.fullmatch(r"[0-9a-f]{16}", folder.name)
+                   and (lock := _claim(folder)) is not None]
+        try:
+            spare = sorted((p for folder, _ in claimed for p in folder.glob("*.safetensors")), key=_stat)
+            own = sorted(self.index, key=_stat)
+            total = sum(_stat(p)[1] for p in spare + own)
+            freed = removed = 0
+            for data in spare:
+                if total <= self.max_bytes:
+                    break
+                size = _stat(data)[1]
+                _remove(data)
+                total -= size
+                freed += size
+                removed += 1
+            for data in own:
+                if total <= self.max_bytes:
+                    break
+                total -= _stat(data)[1]
+                self._delete(data)
+            if removed:
+                logging.info("disk cache: removed %d caches (%.1f GB) that other models or settings left", removed,
+                             freed / (1 << 30))
+            for folder, _ in claimed:
+                if any(folder.glob("*.safetensors")):
+                    continue
+                for leftover in [*folder.glob("*.json"), folder / LOCK]:
+                    leftover.unlink(missing_ok=True)
+                try:
+                    folder.rmdir()
+                except OSError:  # something else is in it: leave the folder
+                    pass
+        finally:
+            for _, lock in claimed:
+                lock.close()
 
     def nearest(self, tokens, longer_than: int = 0) -> tuple[Path, int] | None:
         """The saved cache covering the longest proper prefix of `tokens`, if it covers more than `longer_than`."""

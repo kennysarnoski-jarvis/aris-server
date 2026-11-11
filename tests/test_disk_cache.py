@@ -1,7 +1,10 @@
+import os
+import threading
+
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, KVCache
 
-from aris_server.disk_cache import DiskCache
+from aris_server.disk_cache import DiskCache, _claim, model_id
 from aris_server.engine import MovingPromptCache
 
 
@@ -228,3 +231,64 @@ def test_only_the_latest_turns_prompt_end_state_is_kept():
     assert len(cache._turn_state) == 1 and len(cache._prompt_state) == 0
     cache.fetch_nearest_cache("m", convo + [1])                 # continued as-is: no rebuild needed
     assert cache._turn_state == {}
+
+
+def saved(disk, start, seed, age):
+    """A 2000-token conversation saved by `disk`, its file dated `age` seconds after the epoch."""
+    tokens = tuple(range(start, start + 2000))
+    disk.save(list(tokens), layers(2000, seed), "assistant")
+    (data,) = [p for p, (t, _) in disk.index.items() if t == tokens]
+    os.utime(data, (age, age))
+    return data
+
+
+def test_one_cap_covers_every_setup_and_other_setups_caches_go_first(tmp_path):
+    before = DiskCache(tmp_path, "model-b", max_bytes=1 << 30)            # the setup served before this one
+    old, new = saved(before, 0, 1, age=1000), saved(before, 10000, 2, age=2000)
+    size = old.stat().st_size
+    del before                                                             # that server stopped
+    here = DiskCache(tmp_path, "model-a", max_bytes=int(2.5 * size))
+    assert old.exists() and new.exists()                                   # under the cap: kept for a swap back
+    mine = saved(here, 20000, 3, age=3000)
+    assert not old.exists() and new.exists()                               # over it: the other setup's oldest goes
+    saved(here, 30000, 4, age=4000)
+    assert not new.parent.exists()                                         # then its last, and its folder
+    saved(here, 40000, 5, age=5000)
+    assert not mine.exists() and len(here.index) == 2                      # then this setup's own oldest
+
+
+def test_a_server_started_on_another_setup_clears_what_the_last_one_left_over_the_cap(tmp_path):
+    before = DiskCache(tmp_path, "model-b", max_bytes=1 << 30)
+    files = [saved(before, n * 10000, n, age=1000 * (n + 1)) for n in range(3)]
+    del before
+    (files[0].parent / "lock").unlink()                                    # a folder from before the lock
+    other = tmp_path / "not-a-cache"
+    other.mkdir()
+    (other / "x.safetensors").write_bytes(b"x" * (1 << 20))
+    DiskCache(tmp_path, "model-a", max_bytes=int(1.5 * files[0].stat().st_size))
+    assert [p.exists() for p in files] == [False, False, True]             # the newest fits under the cap
+    assert (other / "x.safetensors").exists()                              # only setup folders are touched
+
+
+def test_a_running_servers_caches_stay_whatever_another_server_saves(tmp_path):
+    running = DiskCache(tmp_path, "model-b", max_bytes=1 << 30)
+    theirs = saved(running, 0, 1, age=1000)
+    here = DiskCache(tmp_path, "model-a", max_bytes=1)
+    here.save(list(range(10000, 12000)), layers(2000, 2), "assistant")
+    assert theirs.exists() and here.index == {}                            # over the cap, only its own can go
+
+
+def test_a_server_starting_while_another_clears_its_folder_holds_the_folder_made_again(tmp_path):
+    folder = tmp_path / model_id("model-a")
+    folder.mkdir()
+    clearing = _claim(folder)                                              # another server clearing the folder
+    started = []
+    t = threading.Thread(target=lambda: started.append(DiskCache(tmp_path, "model-a", max_bytes=1 << 30)))
+    t.start()
+    t.join(0.5)
+    assert t.is_alive()                                                    # it waits for the clearing to finish
+    (folder / "lock").unlink()
+    folder.rmdir()
+    clearing.close()
+    t.join(5)
+    assert started and folder.exists() and _claim(folder) is None          # and holds the folder made again
