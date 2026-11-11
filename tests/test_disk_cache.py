@@ -1,4 +1,5 @@
 import os
+import shutil
 import threading
 
 import mlx.core as mx
@@ -330,3 +331,27 @@ def test_a_restarted_server_drops_a_damaged_cache_and_restores_the_rest(tmp_path
     restored = []
     DiskCache(tmp_path, "model-a", max_bytes=1 << 30).restore(lambda t, c, kind: restored.append(t), budget=1 << 30)
     assert restored == [other] and not damaged.exists()
+
+
+def test_a_cache_that_cannot_be_written_never_stops_generation(tmp_path, caplog):
+    caplog.set_level("WARNING")
+    cache = cache_with_disk(tmp_path)
+    cache.disk.dir.chmod(0o500)                                                 # MLX raises RuntimeError, not OSError
+    try:
+        cache.insert_cache("m", SYSTEM, layers(1200, 1), cache_type="system")    # used to raise into mlx-lm's loop
+    finally:
+        cache.disk.dir.chmod(0o700)
+    assert "could not save a prompt cache to disk" in caplog.text
+    assert len(cache) == 1 and cache.disk.index == {}                           # kept in memory all the same
+
+
+def test_a_cache_folder_deleted_while_serving_is_made_again_and_held(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    cache.insert_cache("m", SYSTEM, layers(1200, 1), cache_type="system")       # written at once
+    shutil.rmtree(cache.disk.dir)                                               # deleted by hand
+    assert not cache.disk.has(SYSTEM)                                           # gone: to be saved again
+    cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")
+    cache.trim_to(n_bytes=0)                                                    # both evicted: written on the way out
+    assert sorted(len(t) for t, _ in cache.disk.index.values()) == [1200, 2200]
+    assert all(p.exists() for p in cache.disk.index)
+    assert _claim(cache.disk.dir) is None                                       # held again: no other server clears it

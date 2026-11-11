@@ -49,6 +49,14 @@ def _stat(data: Path) -> tuple[float, int]:
     return s.st_mtime, s.st_size
 
 
+def _same_file(path: Path, f) -> bool:
+    """Whether `path` is still the file `f` has open: not once the file, or its folder, is deleted."""
+    try:
+        return os.path.samestat(os.stat(path), os.fstat(f.fileno()))
+    except FileNotFoundError:
+        return False
+
+
 def _claim(folder: Path):
     """The folder's lock, held exclusively, or None while a server uses the folder or another is clearing it."""
     try:
@@ -102,11 +110,8 @@ class DiskCache:
             except FileNotFoundError:  # another server removed the folder just now
                 continue
             fcntl.flock(lock, fcntl.LOCK_SH)
-            try:
-                if os.path.samestat(os.stat(self.dir / LOCK), os.fstat(lock.fileno())):
-                    return lock
-            except FileNotFoundError:
-                pass
+            if _same_file(self.dir / LOCK, lock):
+                return lock
             lock.close()  # the folder was cleared while this waited for it: make it again
 
     def __del__(self):
@@ -115,12 +120,18 @@ class DiskCache:
             lock.close()
 
     def has(self, tokens) -> bool:
+        """Whether these tokens' cache is saved. One whose file is gone (deleted by hand, say) isn't: it is saved again."""
         key = tuple(tokens)
-        return any(t == key for t, _ in self.index.values())
+        return any(t == key and data.exists() for data, (t, _) in self.index.items())
 
     def save(self, tokens, prompt_cache, cache_type: str):
         if len(tokens) < MIN_TOKENS or cache_type not in ("system", "assistant"):
             return
+        if not _same_file(self.dir / LOCK, self._lock):  # the folder was deleted while serving: make it, hold it again
+            logging.warning("prompt cache folder %s was deleted while serving; making it again", self.dir.name)
+            lock = self._hold()
+            self._lock.close()
+            self._lock = lock
         t0 = time.time()
         key = tuple(tokens)
         data = self.dir / f"{hashlib.sha1(json.dumps(key).encode()).hexdigest()[:20]}.safetensors"

@@ -283,7 +283,9 @@ class MovingPromptCache(LRUPromptCache):
             return
         try:
             self.disk.save(tokens, prompt_cache, cache_type)
-        except OSError as e:  # a full disk must not stop generation
+        except Exception as e:  # noqa: BLE001  a full disk, or a folder that can't be written
+            # MLX raises RuntimeError there, not OSError, and mlx-lm calls the prompt cache from its generation loop
+            # with no handler: an error here stopped that loop, and the server with it.
             logging.warning("could not save a prompt cache to disk: %s", e)
 
     def _evicted(self, tokens, entry):

@@ -171,7 +171,9 @@ precision) has its own folder, and one cap, 20 GB by default, covers them all: a
 at startup and whenever a save goes over the cap, the caches of setups no running server holds go first, oldest first,
 then its own oldest. A cap per folder let a day of trying seven setups on one Mac fill 116 GB, 96 of them for setups
 no longer served. A running server holds a shared lock on its folder, and another server sharing the directory leaves
-it alone. A model sometimes
+it alone. A cache that can't be written (a full disk, say) costs a warning, not the server: mlx-lm calls the cache from
+its generation loop with no handler, and MLX raises RuntimeError, not OSError. A folder deleted while serving is made
+and held again at the next save. A model sometimes
 generates a non-canonical tokenization, so its finished turn no longer matches the history the
 client sends back; instead of a multi-gigabyte snapshot of each prompt, the recurrent layers' state
 at the prompt's end (fixed-size, megabytes) is kept, and such a turn is rebuilt to its prompt's end
