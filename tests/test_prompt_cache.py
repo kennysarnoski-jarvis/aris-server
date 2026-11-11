@@ -180,6 +180,15 @@ def test_the_weights_a_model_will_take_are_known_from_its_files_before_it_loads(
     assert weights_on_disk(str(model), str(adapter)) == (9 << 30) + (1 << 28)
     assert weights_on_disk("NousResearch/Arete-27B") is None  # a Hugging Face repo id: checked once loaded
 
+    # An adapter folder as mlx-lm's trainer leaves it: only adapters.safetensors loads, not the checkpoints beside it.
+    trained = tmp_path / "trained"
+    trained.mkdir()
+    (trained / "adapter_config.json").write_text("{}")
+    for name in ("adapters.safetensors", "adapters-step75.safetensors"):
+        with open(trained / name, "wb") as f:
+            f.truncate(1 << 28)
+    assert weights_on_disk(str(model), str(trained)) == (9 << 30) + (1 << 28)
+
 
 @pytest.mark.parametrize("prompt_tokens,older_kept", [(4_000, False), (100, True)])
 def test_room_for_the_cache_a_prompt_builds_is_made_before_the_prompt_is_read(prompt_tokens, older_kept):

@@ -149,7 +149,9 @@ def weights_on_disk(*folders: str | None) -> int | None:
         path = Path(folder)
         if not path.is_dir():
             return None
-        total += sum(p.stat().st_size for p in path.glob("*.safetensors"))
+        # mlx-lm loads only adapters.safetensors from an adapter folder; the trainer leaves its checkpoints beside it.
+        files = [path / "adapters.safetensors"] if (path / "adapter_config.json").is_file() else path.glob("*.safetensors")
+        total += sum(p.stat().st_size for p in files if p.is_file())
     return total
 
 
