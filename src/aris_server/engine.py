@@ -454,11 +454,11 @@ class MovingPromptCache(LRUPromptCache):
         gc.collect()
         mx.clear_cache()
         before = mx.get_active_memory()
-        try:
-            loaded = self.disk.load(data)
-        except Exception as e:
-            logging.warning("could not load a prompt cache from disk: %s", e)
-            return None, tokens
+        loaded = self.disk.load(data)
+        if loaded is None:
+            # Dropped from disk, so it can't come up again: look again. Memory still has the system prompt, say;
+            # giving up here sent the turn back to its first token, minutes for a long conversation.
+            return self._fetch_nearest(model, tokens)
         gb = 1 << 30
         logging.info("loaded a %d-token cache from disk in place of %d cached tokens (%.1fs, active %.1f -> %.1f GB)",
                      n, len(tokens) - len(rest), time.time() - t0, before / gb, mx.get_active_memory() / gb)

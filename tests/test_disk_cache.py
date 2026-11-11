@@ -292,3 +292,41 @@ def test_a_server_starting_while_another_clears_its_folder_holds_the_folder_made
     clearing.close()
     t.join(5)
     assert started and folder.exists() and _claim(folder) is None          # and holds the folder made again
+
+
+def test_a_cache_gone_from_disk_is_forgotten_before_memory_lets_go_of_its_own(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    longer = TURN2 + list(range(8000, 9500))                                    # 4200 tokens
+    cache.insert_cache("m", longer, layers(4200, 3), cache_type="assistant")
+    cache.trim_to(n_bytes=0)                                                    # evicted: on disk
+    (data,) = cache.disk.index
+    cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")     # an earlier turn, in memory
+    data.unlink()                                                               # the cache deleted by hand
+    got, rest = cache.fetch_nearest_cache("m", longer + [1])
+    assert got is not None and got[0].offset == 2200 and rest == longer[2200:] + [1]  # memory's turn, not a re-read
+    assert cache.disk.index == {} and not data.with_suffix(".json").exists()    # forgotten: no later turn looks
+
+
+def test_a_damaged_cache_is_dropped_and_the_turn_reads_on_from_what_memory_has(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    cache.insert_cache("m", SYSTEM, layers(1200, 1), cache_type="system")
+    cache.insert_cache("m", TURN2, layers(2700, 3), cache_type="assistant")
+    cache.trim_to(n_bytes=cache._n_bytes_by_type["system"])                     # memory keeps only the system prompt
+    (data,) = [p for p, (t, _) in cache.disk.index.items() if t == tuple(TURN2)]
+    data.write_bytes(b"damaged")
+    got, rest = cache.fetch_nearest_cache("m", TURN2 + [1, 2])
+    assert got is not None and got[0].offset == 1200 and rest == TURN2[1200:] + [1, 2]  # not from the first token
+    assert not data.exists() and not cache.disk.has(TURN2)                      # dropped: no later turn tries it
+
+
+def test_a_restarted_server_drops_a_damaged_cache_and_restores_the_rest(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    other = list(range(9000, 11000))
+    cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")
+    cache.insert_cache("m", other, layers(2000, 4), cache_type="assistant")
+    cache.flush()
+    (damaged,) = [p for p, (t, _) in cache.disk.index.items() if t == tuple(TURN1)]
+    damaged.write_bytes(b"damaged")
+    restored = []
+    DiskCache(tmp_path, "model-a", max_bytes=1 << 30).restore(lambda t, c, kind: restored.append(t), budget=1 << 30)
+    assert restored == [other] and not damaged.exists()

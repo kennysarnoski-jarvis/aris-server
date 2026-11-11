@@ -64,8 +64,13 @@ def _claim(folder: Path):
 
 
 def _remove(data: Path):
-    data.unlink(missing_ok=True)
-    data.with_suffix(".json").unlink(missing_ok=True)
+    """Delete a cache and its metadata. One that can't be deleted (in a folder made read-only, say) stays, with a
+    warning: the disk cache must never stop the server."""
+    try:
+        data.unlink(missing_ok=True)
+        data.with_suffix(".json").unlink(missing_ok=True)
+    except OSError as e:
+        logging.warning("could not delete prompt cache %s: %s", data.name, e)
 
 
 class DiskCache:
@@ -135,8 +140,8 @@ class DiskCache:
                      time.time() - t0)
 
     def _delete(self, data: Path):
-        _remove(data)
         self.index.pop(data, None)
+        _remove(data)
 
     def _trim(self):
         """Keep this setup's caches, with those of setups no running server holds, under the cap: the others' go first,
@@ -179,19 +184,31 @@ class DiskCache:
                 lock.close()
 
     def nearest(self, tokens, longer_than: int = 0) -> tuple[Path, int] | None:
-        """The saved cache covering the longest proper prefix of `tokens`, if it covers more than `longer_than`."""
+        """The saved cache covering the longest proper prefix of `tokens`, if it covers more than `longer_than`. One
+        whose file is gone from disk (deleted by hand, say) is forgotten here, before the caller lets go of what memory
+        holds for the turn."""
         key = tuple(tokens)
-        best = None
-        for data, (t, _) in self.index.items():
-            if longer_than < len(t) < len(key) and key[:len(t)] == t and (best is None or len(t) > best[1]):
-                best = (data, len(t))
-        return best
+        while True:
+            best = None
+            for data, (t, _) in self.index.items():
+                if longer_than < len(t) < len(key) and key[:len(t)] == t and (best is None or len(t) > best[1]):
+                    best = (data, len(t))
+            if best is None or best[0].exists():
+                return best
+            logging.warning("prompt cache %s is gone from disk; forgetting it", best[0].name)
+            self._delete(best[0])
 
-    @staticmethod
-    def load(data: Path):
-        cache = load_prompt_cache(str(data))
-        # Loading is lazy and bound to the loading thread's stream; generation may run on another thread.
-        mx.eval([c.state for c in cache])
+    def load(self, data: Path):
+        """The cache saved in `data`, or None if it can't be read (damaged, or gone): then it is dropped, so no later
+        turn tries it again."""
+        try:
+            cache = load_prompt_cache(str(data))
+            # Loading is lazy and bound to the loading thread's stream; generation may run on another thread.
+            mx.eval([c.state for c in cache])
+        except Exception as e:  # noqa: BLE001  MLX raises RuntimeError for a damaged or missing file
+            logging.warning("dropping unreadable prompt cache %s: %s", data.name, e)
+            self._delete(data)
+            return None
         return cache
 
     def restore(self, insert, budget: int) -> int:
@@ -203,11 +220,8 @@ class DiskCache:
             size = data.stat().st_size
             if loaded + size > budget:
                 continue
-            try:
-                cache = self.load(data)
-            except Exception:  # a damaged file: drop it and carry on
-                logging.warning("dropping unreadable prompt cache %s", data.name)
-                self._delete(data)
+            cache = self.load(data)
+            if cache is None:  # damaged: dropped
                 continue
             tokens, cache_type = self.index[data]
             insert(list(tokens), cache, cache_type)

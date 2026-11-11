@@ -180,7 +180,10 @@ longest earlier snapshot. Caches are loaded at startup, so a restart or crash re
 in seconds instead of re-reading it for minutes. A turn that finds memory holding less of its
 prompt than disk does (at least 1024 tokens less) loads the disk copy: on a Mac where one long
 conversation plus the system prompt doesn't fit the memory budget, the conversation is evicted
-every turn, and re-reading 40k tokens costs minutes where the file costs a second. A cache file without its metadata file is a write
+every turn, and re-reading 40k tokens costs minutes where the file costs a second. A cache that can't be loaded
+(deleted by hand, or damaged) is dropped and the turn looks again, so it reads on from what memory holds rather than
+from its first token; one whose file is gone is forgotten before the turn gives up what memory holds. A cache file
+without its metadata file is a write
 that was cut off and is deleted. Loaded caches are evaluated before generation uses them: MLX binds
 a lazy load to the loading thread's stream.
 
