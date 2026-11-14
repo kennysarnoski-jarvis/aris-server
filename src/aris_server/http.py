@@ -31,9 +31,10 @@ DISCONNECT_CHECK_SECONDS = 2.0
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, engine: Engine, models: dict[str, ModelSpec], api_key: str | None = None):
+    def __init__(self, address, engine: Engine, models: dict[str, ModelSpec], api_key: str | None = None,
+                 guards: bool = True):
         super().__init__(address, Handler)
-        self.engine, self.models, self.api_key = engine, models, api_key
+        self.engine, self.models, self.api_key, self.guards = engine, models, api_key, guards
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -133,7 +134,7 @@ class Handler(BaseHTTPRequestHandler):
                                f"model {name!r} is configured but not loaded (loaded: {engine.spec.name!r})")
         spec = engine.spec if name not in self.server.models else resolve(name, self.server.models)
         try:
-            p = plan(body, spec)
+            p = plan(body, spec, guards=self.server.guards)
         except RequestError as e:
             return self._reject(e)
         if self.route.endswith("count_tokens"):
@@ -271,8 +272,12 @@ def _log(name, p, run, n, builder, reason, t0, engine=None):
     dt = time.time() - t0
     budget = run.budget[0] if run.budget else None
     think = f" think={budget.n}/{p.think_budget}{' FORCED' if budget.forced else ''}" if budget else ""
-    logging.info("%s effort=%s prompt=%d cached=%d out=%d%s tools=%d stop=%s %.1fs (%.1f tok/s) %s", name, p.effort,
-                 run.prompt_tokens, run.cached_tokens, n, think, builder.tool_calls, reason, dt, n / dt if dt else 0,
-                 Engine.memory())
+    guard = run.guard[0] if getattr(run, "guard", None) else None
+    guarded = (f" stuck-call-reminder={p.stuck_repeats}" if p.stuck_repeats else "") + (
+        f" loop-breaks={guard.breaks}{' LOOP-STOPPED' if guard.gave_up else ''}"
+        if guard and (guard.breaks or guard.gave_up) else "")
+    logging.info("%s effort=%s prompt=%d cached=%d out=%d%s%s tools=%d stop=%s %.1fs (%.1f tok/s) %s", name,
+                 p.effort, run.prompt_tokens, run.cached_tokens, n, think, guarded, builder.tool_calls, reason, dt,
+                 n / dt if dt else 0, Engine.memory())
     if engine is not None:
         engine.adapt_memory()

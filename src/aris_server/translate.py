@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 
 from .config import EFFORTS, ModelSpec
+from .guards import STUCK_REPEATS, stuck_call_note, stuck_call_repeats
 from .stream import PROGRESS_NOTE
 
 
@@ -30,6 +31,7 @@ class Plan:
     loaded_tools: list[dict] = field(default_factory=list)
     context: int | None = None
     context_capped: bool = False  # max_tokens was cut to fit the context window
+    stuck_repeats: int = 0  # the request ends with this many identical tool steps, and got a reminder about it
 
 
 def parse_tools(p: "Plan") -> list[dict] | None:
@@ -188,7 +190,7 @@ def convert_tools(tools, messages) -> tuple[list[dict] | None, list[str], list[d
     return out or None, hidden, late
 
 
-def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
+def plan(body: dict, spec: ModelSpec, default_max: int = 32000, guards: bool = True) -> Plan:
     if not isinstance(body.get("messages"), list) or not body["messages"]:
         raise RequestError("messages must be a non-empty list")
     # As in Anthropic's API, a request thinks only when it asks to. Claude Code asks on every turn of its agent loop
@@ -215,6 +217,14 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
     tools, hidden, late = convert_tools(body.get("tools"), body["messages"])
     messages = convert_messages(body.get("system"), body["messages"], {f["function"]["name"]: f for f in late})
     tools, messages = _apply_tool_choice(body.get("tool_choice"), tools, messages, late)
+    # A model stuck repeating one tool call gets told so before it answers (guards.py). The reminder goes last, so
+    # the prompt cache still covers everything before it.
+    stuck = stuck_call_repeats(body["messages"]) if guards else 0
+    if stuck >= STUCK_REPEATS:
+        messages = messages + [{"role": "user",
+                                "content": f"<system-reminder>\n{stuck_call_note(stuck)}\n</system-reminder>"}]
+    else:
+        stuck = 0
     return Plan(
         messages=messages,
         tools=tools,
@@ -230,6 +240,7 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000) -> Plan:
         hidden_tools=hidden,
         loaded_tools=late,
         context=spec.context,
+        stuck_repeats=stuck,
     )
 
 

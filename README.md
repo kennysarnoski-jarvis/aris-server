@@ -51,6 +51,10 @@ Aris Server does one job: serve a local model to coding agents properly.
 - **A think budget.** Reasoning models that overthink get their thinking closed at the end of
   the current line once they pass the budget for the requested effort, so they answer instead of
   burning every token deliberating.
+- **Loop guards.** A model that makes the same tool call three times in a row, and gets the same
+  result each time, gets a reminder to use what it already has. A response that degenerates into one
+  chunk repeated over and over is steered off it, and ended early if it keeps falling back in, instead
+  of running on to the token cap. `--no-guards` turns both off.
 - **Claude Code's tool search.** Deferred tools stay out of the prompt until the agent loads them.
 - **Fast on Apple Silicon.** Built on [MLX](https://github.com/ml-explore/mlx) and mlx-lm:
   continuous batching and a prompt cache that keeps the system prompt warm across conversations.

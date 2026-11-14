@@ -84,6 +84,31 @@ paragraph break, because chat templates re-render past reasoning as `text\n</thi
 as `text\n\n</think>` stops matching its own prompt cache, and the next turn re-reads from there.
 Budgets per effort are set per model, with defaults.
 
+**Loop guards** (`guards.py`) cover two ways a local model gets stuck in an agent loop, both seen in hard agent
+tasks.
+- **A stuck tool call.** When a request ends with the same tool step three times in a row (the same calls with the
+  same input, answered with the same results), a system reminder goes after the last result: running the call again
+  won't tell the model anything new. It goes last, so the prompt cache still covers everything before it. The next
+  request doesn't carry it, so that turn's saved cache is re-read from the reminder on.
+- **Looping output.** A logits processor watches each response. Once its last 400 tokens are one chunk of up to 50
+  tokens repeated, it blocks the token that would continue the chunk, so the model writes something else. After
+  three such breaks, the next loop ends the response as `max_tokens` would, rather than generating on to the cap.
+  Tokens that close something (thinking, a tool call, the turn) are never blocked, and the processor runs ahead of
+  the think budget, so a token the budget forces stays possible.
+
+`--no-guards` turns both off.
+
+Measured by replaying three collapses from a hard agent eval at their exact tokens (a fine-tuned Arete-27B at 8 bits):
+- **Stuck call.** After the third identical directory listing, the reminder had the model start writing its code in 3
+  of 4 samples; without it, all 4 listed the directory again, as the original run did 17 more times.
+- **Looping output.** One break pulled a run of zeros out in 2 of 2 samples, and the model closed its tool call. A
+  repeated test line kept coming back, so the guard gave up after three breaks: about 1.6k tokens into the loop
+  instead of the 32k cap.
+- **Cost.** The guard cost no measurable decode speed.
+
+A request that asks for "ok" 400 times is a loop by this definition. The guard broke it once, and the reply still
+ended normally.
+
 ### Context that fits
 
 Reading a prompt peaks above the KV cache it builds, and the peak grows with the context: prefill's scratch, and the

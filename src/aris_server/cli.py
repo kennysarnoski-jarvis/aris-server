@@ -48,6 +48,9 @@ def main(argv=None):
                    help="disk for saved prompt caches, all models together (0 turns it off)")
     s.add_argument("--reserve-gb", type=float, default=6.0, help="GPU memory kept free for active sequences")
     s.add_argument("--log-level", default="INFO")
+    s.add_argument("--no-guards", dest="guards", action="store_false",
+                   help="turn off the loop guards: no reminder when the model repeats one tool call, no steering when "
+                        "a response loops")
     sub.add_parser("models", help="list configured and built-in models")
     p = sub.add_parser("pull", help="download the weights a model would load on this Mac, ahead of serving it")
     p.add_argument("model", help="configured or built-in model name, or Hugging Face repo id")
@@ -115,12 +118,12 @@ def main(argv=None):
         if (sized := weights_and_config(spec.path, spec.adapter)) is not None:
             check_memory(name, limit, sized[0])
         engine = Engine(spec, decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
-                        disk_cache_gb=a.disk_cache_gb,
+                        disk_cache_gb=a.disk_cache_gb, guards=a.guards,
                         prompt_cache_bytes=int(a.prompt_cache_gb * (1 << 30)) if a.prompt_cache_gb else None)
     except NotEnoughMemory as e:
         logging.error("%s", e)
         return 2
-    server = Server((a.host, a.port), engine, models, a.api_key)
+    server = Server((a.host, a.port), engine, models, a.api_key, guards=a.guards)
     logging.info("Aris Server %s serving %s on http://%s:%d", __version__, name, a.host, a.port)
 
     def stop(*_):  # a service manager stops with SIGTERM: finish the current step (and any cache write) first

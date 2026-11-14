@@ -9,7 +9,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -29,6 +29,7 @@ from mlx_lm.models.cache import (
 from .budget import BudgetTokens, ThinkBudget
 from .config import ModelSpec, home
 from .disk_cache import DiskCache
+from .guards import LoopGuard, loop_exempt_ids
 from .kv_quant import BatchQuantizedKVCache, kv_bytes_per_token, quantize_kv
 from .translate import Plan
 
@@ -602,13 +603,15 @@ class Run:
     pieces: object       # iterator of (list[Piece], finish_reason | None, n_tokens)
     stop: Callable[[], None]
     budget: list         # [ThinkBudget] once generation has started, if a budget applies
+    guard: list = field(default_factory=list)  # [LoopGuard] once generation has started, unless guards are off
 
 
 class Engine:
     def __init__(self, spec: ModelSpec, decode_concurrency: int = 4, prompt_concurrency: int = 2,
                  prompt_cache_size: int = 8, prompt_cache_bytes: int | None = None, reserve_gb: float = 6.0,
-                 disk_cache_gb: float = 20.0):
+                 disk_cache_gb: float = 20.0, guards: bool = True):
         self.spec = spec
+        self.guards = guards
         ns = argparse.Namespace(
             model=spec.path, adapter_path=spec.adapter, draft_model=None, num_draft_tokens=3, trust_remote_code=False,
             chat_template="", use_default_chat_template=False, temp=spec.temperature, top_p=spec.top_p,
@@ -639,6 +642,7 @@ class Engine:
             quantize_kv(self.provider.model, spec.kv_bits)
         cache.decode = self.tokenizer.decode
         self.budget_tokens = BudgetTokens(self.tokenizer)
+        self.loop_exempt = loop_exempt_ids(self.tokenizer)
         self.cache = cache
         self.generator.on_stop = cache.flush
         try:
@@ -740,13 +744,19 @@ class Engine:
 
     def run(self, plan: Plan, on_progress: Callable[[int, int], None] | None = None) -> Run:
         budget: list[ThinkBudget] = []
+        guard: list[LoopGuard] = []
 
         def extra():
+            procs = []
+            if self.guards:
+                # Ahead of the budget: a token the budget forces replaces the logits whole, so it stays possible.
+                guard.append(LoopGuard(self.loop_exempt))
+                procs.append(guard[-1])
             b = self.budget_tokens.make(plan.think_budget)
-            if b is None:
-                return []
-            budget.append(b)
-            return [b]
+            if b is not None:
+                budget.append(b)
+                procs.append(b)
+            return procs
 
         args = _Args(
             model=mls.ModelDescription(model="default_model", draft="default_model", adapter=None),
@@ -757,7 +767,7 @@ class Engine:
                                                 frequency_penalty=0.0, frequency_context_size=20),
             stop_words=plan.stop, max_tokens=plan.max_tokens, num_draft_tokens=3, logprobs=False, top_logprobs=0,
             seed=None, chat_template_kwargs=plan.template_kwargs,
-            extra_processors=extra if plan.thinking else None,
+            extra_processors=extra,
         )
         request = mls.CompletionRequest(request_type="chat", prompt="", messages=plan.messages, tools=plan.tools,
                                         role_mapping=None)
@@ -765,17 +775,18 @@ class Engine:
 
         def pieces():
             try:
-                yield from _classify(ctx, responses)
+                yield from _classify(ctx, responses, lambda: bool(guard) and guard[0].gave_up)
             finally:
                 self.cache.reading = [p for p in self.cache.reading if p != ctx.prompt]
 
         return Run(prompt_tokens=len(ctx.prompt), cached_tokens=max(ctx.prompt_cache_count, 0),
-                   tool_parser=ctx.tool_parser, pieces=pieces(), stop=ctx.stop, budget=budget)
+                   tool_parser=ctx.tool_parser, pieces=pieces(), stop=ctx.stop, budget=budget, guard=guard)
 
 
-def _classify(ctx, responses):
+def _classify(ctx, responses, gave_up: Callable[[], bool] = lambda: False):
     """Split generated text into reasoning / normal / tool pieces with mlx-lm's state machine, which also strips
-    the control markers (<think>, <tool_call> ...)."""
+    the control markers (<think>, <tool_call> ...). A response the loop guard gave up on ends here as if it had hit
+    the token cap: generation stops, and the client sees a "length" finish."""
     sm = ctx.text_sm.make_state(ctx.initial_state)
     n = 0
     for gen in responses:
@@ -783,10 +794,14 @@ def _classify(ctx, responses):
         if gen.finish_reason == "stop":
             sm, state = TextStateMachine.discard(sm)
             segments = [(state, "")]
-        elif gen.finish_reason == "length":
+        elif gen.finish_reason == "length" or gave_up():
             sm, segments = TextStateMachine.split(sm, gen.text)
             sm, flushed, state = TextStateMachine.flush(sm)
             segments.append((state, flushed))
+            if gen.finish_reason != "length":
+                ctx.stop()
+                yield [Piece(s, t) for s, t in segments], "length", n
+                return
         else:
             sm, segments = TextStateMachine.split(sm, gen.text)
         yield [Piece(s, t) for s, t in segments], gen.finish_reason, n
