@@ -203,7 +203,21 @@ generates a non-canonical tokenization, so its finished turn no longer matches t
 client sends back; instead of a multi-gigabyte snapshot of each prompt, the recurrent layers' state
 at the prompt's end (fixed-size, megabytes) is kept, and such a turn is rebuilt to its prompt's end
 in memory: its attention caches trimmed and that state put back. A conversation keeps only its
-longest earlier snapshot. Caches are loaded at startup, so a restart or crash resumes a 40k-token conversation
+longest earlier snapshot. A request that leaves every cached entry part-way through (a client that rewrites a line of
+its system prompt on each request, say) reuses what it still shares with them. Attention caches cut back to any token,
+but a hybrid model's recurrent layers hold only their state at the end of what they read, so recurrent-state
+checkpoints are taken as prompts are read (157 MB each for Arete-27B): every 4096 tokens of a prompt's first message
+(its system prompt and tools, where a first change usually is; not further, where each would hold the conversation as
+of one version of its system prompt), and at the start of the line where a request left the cache, when that was well
+past what it reused (a client that rewrites a line once rewrites it again). Such a request resumes from the latest
+checkpoint before it leaves the cache, with the attention cache of an entry that shares that much, cut back as views:
+the entry stays as it was, for another conversation, or this one under its older system prompt, to continue.
+Checkpoints hold at most an eighth of the budget, least recently used go first, and saved entries make room for them.
+A coding agent's plugin that rewrote its check ledger, the last block of its system prompt, after each check it ran
+sent a 56k-token conversation back to its first token each time: 526 s on a 48 GB Mac, replayed. Now the first
+rewrite reads on from token 8192 (458 s) and later ones from the ledger's line, token 10,990 (435 s). Everything
+after a changed token is read again: the change itself is the limit.
+Caches are loaded at startup, so a restart or crash resumes a 40k-token conversation
 in seconds instead of re-reading it for minutes. A turn that finds memory holding less of its
 prompt than disk does (at least 1024 tokens less) loads the disk copy: on a Mac where one long
 conversation plus the system prompt doesn't fit the memory budget, the conversation is evicted
