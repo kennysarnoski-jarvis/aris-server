@@ -1,6 +1,8 @@
 # Vendored from mlx-lm pull request #2086 (jundot/mlx-lm @ e2b5bbd3), MIT License: see LICENSE.mlx-lm.
 # Imports of mlx-lm main-branch helpers go through `_compat`, which maps them onto mlx-lm 0.32.2.
 # Copyright © 2026 Apple Inc.
+# Local changes (Aris Server): TextModel takes `captures`, the layer visits whose input hidden states
+# (and the final normed output) a speculative drafter reads; Model.logits is split out of Model.__call__.
 
 from typing import Any, Callable
 
@@ -73,12 +75,17 @@ class TextModel(PipelineMixin, nn.Module):
             raise ValueError("Pipeline parallel does not support looped models.")
         super().pipeline(group, split)
 
-    def _run_loop(self, hidden_states, cache, conv_mask):
+    def _run_loop(self, hidden_states, cache, conv_mask, captures=None):
         core = self.args.loop_core
         caches = iter(cache)
+        visit = 0
 
         def run(layers, hidden_states, block_states, bank=None):
+            nonlocal visit
             for i, layer in enumerate(layers):
+                if captures is not None and visit in captures:
+                    captures[visit] = hidden_states
+                visit += 1
                 messages = None if bank is None else self.message_input(bank, i)
                 hidden_states, block_states = layer(
                     hidden_states,
@@ -109,7 +116,11 @@ class TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: list[Any] | None = None,
         input_embeddings: mx.array | None = None,
+        captures: dict[int, mx.array | None] | None = None,
     ) -> mx.array:
+        """`captures` maps layer visits (loop passes counted) to None; each is filled with that visit's input
+        hidden states (the attention-residual partial block), and the number of visits with the final normed
+        output."""
         if input_embeddings is None:
             input_embeddings = self.embed(inputs)
         hidden_states = input_embeddings
@@ -131,13 +142,15 @@ class TextModel(PipelineMixin, nn.Module):
             hidden_states, block_states = states[0].astype(dtype), states[1:]
 
         if self.args.loop_config is None:
-            for layer, c in zip(layers, cache):
+            for visit, (layer, c) in enumerate(zip(layers, cache)):
+                if captures is not None and visit in captures:
+                    captures[visit] = hidden_states
                 hidden_states, block_states = layer(
                     hidden_states, block_states, cache=c, conv_mask=conv_mask
                 )
         else:
             hidden_states, block_states = self._run_loop(
-                hidden_states, cache, conv_mask
+                hidden_states, cache, conv_mask, captures
             )
 
         if rank != 0:
@@ -158,6 +171,8 @@ class TextModel(PipelineMixin, nn.Module):
         if size > 1:
             batch = hidden_states.shape[0]
             hidden_states = mx.distributed.all_gather(hidden_states)[:batch]
+        if captures is not None and len(self.layer_visits) in captures:
+            captures[len(self.layer_visits)] = hidden_states
         return hidden_states
 
 
@@ -233,6 +248,9 @@ class Model(nn.Module):
         hidden_states = self.model.language_model(
             inputs, cache=cache, input_embeddings=input_embeddings
         )
+        return self.logits(hidden_states)
+
+    def logits(self, hidden_states: mx.array) -> mx.array:
         logits = self.lm_head(hidden_states)
         if self.sharding_group is not None:
             logits = gather_last_axis(logits, self.sharding_group)

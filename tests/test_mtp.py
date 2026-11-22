@@ -9,6 +9,7 @@ from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler
 
 from aris_server import mtp
+from aris_server.speculative import Sampling, SpeculativeStats, choose
 from tiny_models import tiny_hybrid_model
 
 PROMPT = [5, 17, 3, 42, 8, 9, 23, 61, 2, 14, 30, 7]
@@ -125,7 +126,7 @@ def oracle(reference, right):
 def test_greedy_output_is_plain_greedy_whatever_the_drafts(right, depth):
     model = tiny_hybrid_model()
     reference = plain_greedy(model, PROMPT, 40)
-    stats = mtp.MTPStats()
+    stats = SpeculativeStats()
     out = mtp.generate_mtp(model, None, PROMPT, max_tokens=40, depth=depth, drafter=oracle(reference, right),
                            stats=stats)
     assert out == reference
@@ -140,7 +141,7 @@ def test_greedy_output_with_a_real_head_is_plain_greedy(depth):
     model = tiny_hybrid_model()
     head = random_head(model)
     reference = plain_greedy(model, PROMPT, 40)
-    stats = mtp.MTPStats()
+    stats = SpeculativeStats()
     assert mtp.generate_mtp(model, head, PROMPT, max_tokens=40, depth=depth, stats=stats) == reference
     assert stats.rounds > 0 and stats.drafted > 0
 
@@ -151,7 +152,7 @@ def test_each_round_drafts_from_the_true_history(depth):
     run fresh over the whole committed sequence. Draft rows left behind, or true rows missed, would change it."""
     model = tiny_hybrid_model()
     head = random_head(model)
-    stats = mtp.MTPStats(log_drafts=True)
+    stats = SpeculativeStats(log_drafts=True)
     out = mtp.generate_mtp(model, head, PROMPT, max_tokens=30, depth=depth, stats=stats)
     seq = PROMPT + out
 
@@ -160,10 +161,11 @@ def test_each_round_drafts_from_the_true_history(depth):
     rows = head(mtp.embed(model, mx.array([seq[1:]])), hidden[:, :-1], head.make_cache())
     first_drafts = mx.argmax(mtp.lm_logits(model, rows), axis=-1)[0].tolist()  # row i predicts seq[i + 2]
 
-    assert stats.drafts_log
+    # The last round drafts nothing when it can only add the target's own token.
+    assert any(drafts for _, drafts in stats.drafts_log)
     for n_out, drafts in stats.drafts_log:
         newest = len(PROMPT) + n_out - 1  # position of the newest committed token
-        assert drafts[0] == first_drafts[newest - 1], (n_out, drafts)
+        assert not drafts or drafts[0] == first_drafts[newest - 1], (n_out, drafts)
 
 
 def test_stop_token_ends_generation_even_as_an_accepted_draft():
@@ -196,13 +198,13 @@ def test_speculative_sampling_draws_the_target_distribution(settings):
     """Whatever the draft, the chosen token is distributed as the target (accept p(d), else resample without d)."""
     mx.random.seed(3)
     logits = mx.random.normal((1, 24)) * 2.0
-    sampling = mtp.Sampling(**settings)
+    sampling = Sampling(**settings)
     target = sampling.probs(logits)[0]
     draft = int(mx.argsort(-target)[1].item())  # a likely but not top token
     n = 6000
     counts = mx.zeros((24,))
     keys = mx.random.split(mx.random.key(7), n)
-    picks = [mtp._choose(logits, draft, sampling, keys[i])[0] for i in range(n)]
+    picks = [choose(logits, draft, sampling, keys[i])[0] for i in range(n)]
     counts = mx.array([picks.count(t) for t in range(24)], dtype=mx.float32) / n
     total_variation = 0.5 * mx.abs(counts - target).sum().item()
     assert total_variation < 0.04, total_variation
@@ -215,7 +217,7 @@ def test_target_distribution_matches_mlx_lm_sampler(settings):
     """Sampling.probs is the distribution mlx-lm's own sampler draws from (same filters, same order)."""
     mx.random.seed(5)
     logits = mx.random.normal((1, 24)) * 2.0
-    ours = mtp.Sampling(temperature=settings["temp"], top_p=settings.get("top_p", 0.0),
+    ours = Sampling(temperature=settings["temp"], top_p=settings.get("top_p", 0.0),
                         top_k=settings.get("top_k", 0)).probs(logits)[0]
     sampler = make_sampler(**settings)
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)

@@ -22,6 +22,7 @@ from mlx_lm.generate import GenerationBatch
 from mlx_lm.models.cache import ArraysCache
 
 from . import mtp
+from .speculative import Sampling, SpeculativeStats, choose
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class MTPConfig:
     depth: int = 2
-    stats: mtp.MTPStats = field(default_factory=mtp.MTPStats)
+    stats: SpeculativeStats = field(default_factory=SpeculativeStats)
     drafter: object = None  # tests only: tokens so far -> drafts, instead of the head
     draft_override: object = None  # tests only: the head drafts as usual (rows, trims), then these replace its drafts
 
@@ -93,7 +94,7 @@ def _make_sampler(args, tokenizer):
         return sampler
     # A new function per request, except at temperature 0, where every request shares mlx-lm's greedy sampler (and
     # batches its sampling as one call): the label is the same for all of them, so it goes on the shared function.
-    sampler.mtp_sampling = mtp.Sampling(temperature=s.temperature, top_p=s.top_p, top_k=s.top_k, min_p=s.min_p)
+    sampler.mtp_sampling = Sampling(temperature=s.temperature, top_p=s.top_p, top_k=s.top_k, min_p=s.min_p)
     return sampler
 
 
@@ -105,7 +106,7 @@ mls._make_sampler = _make_sampler
 _original_next = GenerationBatch.next
 
 
-def _sampling_of(batch) -> mtp.Sampling | None:
+def _sampling_of(batch) -> Sampling | None:
     sampler = (batch.samplers or [None])[0] or batch.fallback_sampler
     return getattr(sampler, "mtp_sampling", None)
 
@@ -168,7 +169,7 @@ def _speculative_next(batch):
         logprobs = (logits - mx.logsumexp(logits, axis=-1, keepdims=True))[0]
         key, sub = mx.random.split(key)
         draft = drafts[i] if i < len(drafts) else None
-        chosen, accepted = mtp._choose(logits, draft, sampling, sub)
+        chosen, accepted = choose(logits, draft, sampling, sub)
         if not accepted:
             break
         fed.append((chosen, logprobs))

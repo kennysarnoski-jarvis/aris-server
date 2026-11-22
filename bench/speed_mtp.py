@@ -25,6 +25,7 @@ from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler
 
 from aris_server import mtp
+from aris_server.speculative import Sampling, SpeculativeStats, choose
 
 
 def read_prompt(model, prompt, step=2048):
@@ -45,7 +46,7 @@ def plain_decode(model, prompt, n, sampling, seed, stop):
     t0 = None
     while len(out) < n:
         key, sub = mx.random.split(key)
-        token, _ = mtp._choose(logits, None, sampling, sub)
+        token, _ = choose(logits, None, sampling, sub)
         out.append(token)
         if t0 is None:
             t0 = time.perf_counter()  # decode timing starts after the first token, as for MTP
@@ -137,7 +138,7 @@ def main():
 
     model, tokenizer = load(str(Path(a.model).expanduser()))
     head = mtp.load_mtp_head(Path(a.mtp).expanduser(), mtp.text_model(model).args, bits=a.mtp_bits or None)
-    sampling = mtp.Sampling(temperature=a.temperature, top_p=a.top_p, top_k=a.top_k)
+    sampling = Sampling(temperature=a.temperature, top_p=a.top_p, top_k=a.top_k)
     pairs = [v.split(":") for v in a.variants.split(",") if v] or [[str(a.draft_bits), a.head_hidden]]
     variants = [(int(bits), hidden, mtp.draft_lm_head(model, int(bits) or None)) for bits, hidden in pairs]
     stop = sorted(getattr(tokenizer, "eos_token_ids", None) or [tokenizer.eos_token_id])
@@ -179,7 +180,7 @@ def main():
         mx.clear_cache()
 
         for (bits, hidden, draft_logits), depth in ((v, depth) for v in variants for depth in depths):
-            stats = mtp.MTPStats()
+            stats = SpeculativeStats()
             out = mtp.generate_mtp(model, head, prompt, max_tokens=a.max_tokens, depth=depth, sampling=sampling,
                                    seed=0, stop_tokens=stop, stats=stats, draft_logits=draft_logits,
                                    head_hidden=hidden)

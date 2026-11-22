@@ -1,6 +1,8 @@
 # Vendored from mlx-lm pull request #2086 (jundot/mlx-lm @ e2b5bbd3), MIT License: see LICENSE.mlx-lm.
 # Imports of mlx-lm main-branch helpers go through `_compat`, which maps them onto mlx-lm 0.32.2.
 # Copyright © 2026 Apple Inc.
+# Local change (Aris Server): DecoderLayer hands each convolution's whole input window to a cache that
+# keeps `windows`, so speculative decoding can rewind the convolution state to any accepted length.
 
 import math
 from functools import partial
@@ -670,7 +672,10 @@ class DecoderLayer(nn.Module):
 
         if conv is not None:
             n = self.post_mlp_convolution.kernel_size - 1
+            windows = getattr(conv, "windows", None)
             for i, window in enumerate(conv_states):
+                if windows is not None:
+                    windows[i] = window
                 conv[i] = _conv_state(window, conv.lengths, n)
             conv.advance(block_residual.shape[1])
         hidden_states = residual + hidden_states.astype(mx.float32)

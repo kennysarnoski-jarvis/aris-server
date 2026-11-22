@@ -7,6 +7,7 @@ from mlx_lm.generate import BatchGenerator
 from mlx_lm.models.cache import ArraysCache, KVCache, QuantizedKVCache
 
 from aris_server import mtp, mtp_serve
+from aris_server.speculative import Sampling
 from aris_server.kv_quant import QUANTIZED_ATTENTION_TOKENS, quantize_kv
 from tiny_models import tiny_hybrid_model
 
@@ -23,7 +24,7 @@ def greedy(logprobs):
     return mx.argmax(logprobs, axis=-1)
 
 
-greedy.mtp_sampling = mtp.Sampling(0.0)
+greedy.mtp_sampling = Sampling(0.0)
 
 
 def with_mtp(depth=2, drafter=None):
@@ -208,7 +209,7 @@ def test_processors_see_the_same_calls_as_plain_decoding():
 
 
 def test_sampled_requests_decode_and_count_acceptance():
-    s = mtp.Sampling(temperature=0.6, top_p=0.95, top_k=20)
+    s = Sampling(temperature=0.6, top_p=0.95, top_k=20)
 
     def sampler(logprobs):
         return mx.random.categorical(logprobs / 0.6)

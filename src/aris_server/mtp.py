@@ -10,15 +10,12 @@ rejected. Its Gated DeltaNet layers keep a recurrent state, which can't. During 
 their projections for every position at once (the costly part) but run the cheap recurrence one position at a time,
 saving the state after each, so a rejection restores the state at the last accepted position exactly.
 
-Drafts are greedy, so the draft distribution is a point mass and speculative sampling stays exact: a draft is
-accepted with the target's probability of it, and a rejection resamples from the target with the draft removed. At
-temperature 0 that means: accept while a draft equals the target's argmax. Batched verify math rounds differently
-from one-token decode math, so greedy output can drift from plain decoding at near-ties; the distribution doesn't.
+Drafts are greedy, so speculative sampling stays exact: the loop and its acceptance rule are speculative.py's,
+shared with Inkling's draft head (dspark.py).
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -29,7 +26,8 @@ from mlx_lm.models import qwen3_5
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import gated_delta_update, normalize_qk
-from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
+
+from .speculative import DraftHook, Processor, Sampling, SpeculativeStats, speculate
 
 # Qwen stores these RMSNorm weights zero-centered (applied as 1 + w); mlx-lm's RMSNorm applies w as is.
 _ZERO_CENTERED = (
@@ -216,7 +214,7 @@ class _NormTap(nn.Module):
         return self.inner(x)
 
 
-def verify_forward(model, tokens: Sequence[int], cache) -> tuple[mx.array, list]:
+def verify_forward(model, tokens: Sequence[int] | mx.array, cache) -> tuple[mx.array, list]:
     """Run the trunk over `tokens` (the newest committed token, then the drafts), recording what `commit` needs."""
     captures = []
     for c in cache:
@@ -224,7 +222,8 @@ def verify_forward(model, tokens: Sequence[int], cache) -> tuple[mx.array, list]
             c.mtp_capture = _Capture()
             captures.append(c)
     try:
-        hidden = trunk_hidden(model, mx.array([list(tokens)]), cache)
+        tokens = tokens if isinstance(tokens, mx.array) else mx.array(list(tokens))
+        hidden = trunk_hidden(model, tokens[None], cache)
         mx.eval(hidden)
     finally:
         for c in captures:
@@ -249,86 +248,74 @@ def commit(cache, length: int, kept: int) -> None:
             c.trim(drop)
 
 
-# --- Sampling ------------------------------------------------------------------------------------------------------
-
-Processor = Callable[[mx.array, mx.array], mx.array]
-
-
-@dataclass
-class Sampling:
-    """The target distribution, built exactly as mlx-lm's `make_sampler` builds it: the filters (top-p, min-p,
-    top-k, in that order) act on log-probabilities at temperature 1, then the temperature applies. 0 means greedy."""
-
-    temperature: float = 0.0
-    top_p: float = 0.0
-    top_k: int = 0
-    min_p: float = 0.0
-
-    def probs(self, logits: mx.array) -> mx.array:
-        logits = logits.astype(mx.float32)
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if 0 < self.top_p < 1.0:
-            logprobs = apply_top_p(logprobs, self.top_p)
-        if self.min_p != 0.0:
-            logprobs = apply_min_p(logprobs, self.min_p, 1)
-        if self.top_k > 0:
-            logprobs = apply_top_k(logprobs, self.top_k)
-        return mx.softmax(logprobs / self.temperature, axis=-1)
-
-
-def _choose(logits: mx.array, draft: int | None, sampling: Sampling, key) -> tuple[int, bool]:
-    """Pick the token for one verify row (`logits` is (1, vocab)). Returns (token, whether it is the draft).
-
-    A greedy draft is a point mass, so exact speculative sampling accepts it with the target's probability of it,
-    and a rejection samples the target with the draft taken out."""
-    if sampling.temperature == 0:
-        token = int(mx.argmax(logits, axis=-1).item())
-        return token, token == draft
-    probs = sampling.probs(logits)[0]
-    k_accept, k_sample = mx.random.split(key)
-    if draft is not None:
-        if mx.random.uniform(key=k_accept).item() < probs[draft].item():
-            return draft, True
-        probs = probs.at[draft].multiply(0.0)
-        probs = probs / probs.sum()
-    token = int(mx.random.categorical(mx.log(probs), key=k_sample).item())
-    return token, False
-
-
 # --- Generation ----------------------------------------------------------------------------------------------------
 
-@dataclass
-class MTPStats:
-    rounds: int = 0
-    drafted: int = 0
-    accepted: int = 0
-    accepted_at: list = field(default_factory=list)  # accepted[i] counts rounds where draft i+1 was accepted
-    log_drafts: bool = False  # keep (tokens generated so far, drafts) for every round, for tests and diagnosis
-    drafts_log: list = field(default_factory=list)
-    prefill_seconds: float = 0.0  # reading the prompt, through the first token
-    decode_seconds: float = 0.0  # everything after the first token
+class _MTPSpeculator:
+    """The `Speculator` (speculative.py) for a Qwen 3.5-architecture trunk and its MTP head, or None when drafts come
+    from the loop's test drafter. The head reads (hidden t, token t+1) for every committed position, then drafts by
+    chaining on its own output; those chained rows leave its cache at commit."""
 
-    @property
-    def decode_tok_s(self) -> float:
-        generated = self.accepted + self.rounds  # tokens produced after the first one
-        return generated / self.decode_seconds if self.decode_seconds else 0.0
+    def __init__(self, model, head: MTPHead | None, draft_logits: Callable[[mx.array], mx.array],
+                 rows_of: Callable[[mx.array], mx.array]):
+        self.model, self.head, self.draft_logits, self.rows_of = model, head, draft_logits, rows_of
+        self.cache = make_prompt_cache(model)
+        self.head_cache = head.make_cache() if head is not None else None
+        # Committed rows the head hasn't read: their hidden states, and the tokens after them but the newest, which
+        # draft() receives.
+        self.rows_hidden, self.rows_tokens = None, []
+        self._chained = 0
+        self._verified = None
 
-    @property
-    def acceptance(self) -> float:
-        return self.accepted / self.drafted if self.drafted else 0.0
+    def prefill(self, prompt: Sequence[int], step: int) -> mx.array:
+        hidden = rows = None
+        for start in range(0, len(prompt), step):
+            chunk = list(prompt[start:start + step])
+            hidden = trunk_hidden(self.model, mx.array([chunk]), self.cache)
+            rows = self.rows_of(hidden)
+            if self.head is not None:
+                nxt = list(prompt[start + 1:start + 1 + len(chunk)])
+                if nxt:
+                    self.head(embed(self.model, mx.array([nxt])), rows[:, :len(nxt)], self.head_cache)
+            mx.eval(hidden, *[c.state for c in self.cache],
+                    *([self.head_cache.state] if self.head is not None else []))
+        self.rows_hidden = rows[:, -1:]
+        return lm_logits(self.model, hidden[:, -1:])[:, -1]
 
-    @property
-    def tokens_per_round(self) -> float:
-        return (self.accepted + self.rounds) / self.rounds if self.rounds else 0.0
+    def draft(self, token: int, depth: int) -> list[int]:
+        if self.head is None:
+            return []
+        # The newest true rows first, even when nothing is drafted, so the head's cache never falls behind.
+        tokens = self.rows_tokens + [token]
+        h = self.head(embed(self.model, mx.array([tokens])), self.rows_hidden, self.head_cache)[:, -1:]
+        self.rows_tokens, self._chained = [], 0
+        drafts = []
+        for i in range(depth):
+            drafts.append(int(mx.argmax(self.draft_logits(h)[0, -1]).item()))
+            if i + 1 < depth:
+                h = self.head(embed(self.model, mx.array([[drafts[-1]]])), h, self.head_cache)
+                self._chained += 1
+        return drafts
 
+    def verify(self, tokens: mx.array) -> mx.array:
+        hidden, _ = verify_forward(self.model, tokens, self.cache)
+        self._verified = (tokens, self.rows_of(hidden))
+        return lm_logits(self.model, hidden)[0]
 
-Drafter = Callable[[int], list]
+    def commit(self, total: int, kept: int) -> None:
+        commit(self.cache, total, kept)
+        if self._chained:
+            self.head_cache.trim(self._chained)
+            self._chained = 0
+        tokens, rows = self._verified
+        self._verified = None
+        self.rows_hidden = rows[:, :kept]
+        self.rows_tokens = tokens[1:kept].tolist()
 
 
 def generate_mtp(model, head: MTPHead | None, prompt: Sequence[int], *, max_tokens: int, depth: int = 1,
                  sampling: Sampling | None = None, processors: Sequence[Processor] = (), seed: int = 0,
-                 stop_tokens: Sequence[int] = (), prefill_step: int = 2048, drafter: Drafter | None = None,
-                 stats: MTPStats | None = None, draft_logits: Callable[[mx.array], mx.array] | None = None,
+                 stop_tokens: Sequence[int] = (), prefill_step: int = 2048, drafter: DraftHook | None = None,
+                 stats: SpeculativeStats | None = None, draft_logits: Callable[[mx.array], mx.array] | None = None,
                  head_hidden: str = "post") -> list[int]:
     """Generate up to `max_tokens` tokens after `prompt` (batch size 1) with MTP drafts checked by the trunk.
 
@@ -343,102 +330,10 @@ def generate_mtp(model, head: MTPHead | None, prompt: Sequence[int], *, max_toke
         tap = _NormTap(text.model.norm)
         text.model.norm = tap
     try:
-        return _generate_mtp(model, head, prompt, max_tokens=max_tokens, depth=depth, sampling=sampling,
-                             processors=processors, seed=seed, stop_tokens=stop_tokens, prefill_step=prefill_step,
-                             drafter=drafter, stats=stats,
-                             draft_logits=draft_logits or (lambda hidden: lm_logits(model, hidden)),
-                             rows_of=(lambda hidden: tap.last) if tap is not None else (lambda hidden: hidden))
+        spec = _MTPSpeculator(model, head, draft_logits or (lambda hidden: lm_logits(model, hidden)),
+                              (lambda hidden: tap.last) if tap is not None else (lambda hidden: hidden))
+        return speculate(spec, prompt, max_tokens=max_tokens, depth=depth, sampling=sampling, processors=processors,
+                         seed=seed, stop_tokens=stop_tokens, prefill_step=prefill_step, drafter=drafter, stats=stats)
     finally:
         if tap is not None:
             text.model.norm = tap.inner
-
-
-def _generate_mtp(model, head, prompt, *, max_tokens, depth, sampling, processors, seed, stop_tokens, prefill_step,
-                  drafter, stats, draft_logits, rows_of) -> list[int]:
-    sampling = sampling or Sampling()
-    stats = stats if stats is not None else MTPStats()
-    started = time.perf_counter()
-    key = mx.random.key(seed)
-    cache = make_prompt_cache(model)
-    mtp_cache = head.make_cache() if head is not None else None
-    prompt = list(prompt)
-    history = mx.array(prompt)
-
-    # Prefill: the trunk reads the prompt, and the head reads (hidden t, token t+1) for every prompt position.
-    hidden = None
-    for start in range(0, len(prompt), prefill_step):
-        chunk = prompt[start:start + prefill_step]
-        hidden = trunk_hidden(model, mx.array([chunk]), cache)
-        rows = rows_of(hidden)
-        if head is not None:
-            nxt = prompt[start + 1:start + 1 + len(chunk)]
-            if nxt:
-                head(embed(model, mx.array([nxt])), rows[:, :len(nxt)], mtp_cache)
-        mx.eval(hidden, *[c.state for c in cache], *([mtp_cache.state] if head is not None else []))
-    last_hidden = hidden[:, -1:]
-
-    logits = lm_logits(model, last_hidden)[:, -1]
-    for p in processors:
-        logits = p(history, logits)
-    key, sub = mx.random.split(key)
-    token, _ = _choose(logits, None, sampling, sub)
-    out = [token]
-    history = mx.concatenate([history, mx.array([token])])
-    rows_hidden, rows_tokens = rows[:, -1:], [token]
-    first_token_at = time.perf_counter()
-    stats.prefill_seconds = first_token_at - started
-
-    while len(out) < max_tokens and token not in stop_tokens:
-        # Draft: add the newest true rows to the head's cache, then chain the head on its own output.
-        if drafter is not None:
-            drafts = list(drafter(len(out)))[:depth]
-        else:
-            h = head(embed(model, mx.array([rows_tokens])), rows_hidden, mtp_cache)[:, -1:]
-            drafts = []
-            for i in range(depth):
-                d = int(mx.argmax(draft_logits(h)[0, -1]).item())
-                drafts.append(d)
-                if i + 1 < depth:
-                    h = head(embed(model, mx.array([[d]])), h, mtp_cache)
-        drafts = drafts[:max(0, max_tokens - len(out))]
-        if stats.log_drafts:
-            stats.drafts_log.append((len(out), list(drafts)))
-
-        # Verify: the trunk reads the newest token and the drafts in one pass.
-        verify_tokens = [token, *drafts]
-        hidden, _ = verify_forward(model, verify_tokens, cache)
-        rows = rows_of(hidden)
-        rows_logits = lm_logits(model, hidden)[0]
-        new, accepted_now = [], 0
-        for i in range(len(verify_tokens)):
-            logits = rows_logits[i:i + 1]
-            for p in processors:
-                logits = p(history, logits)
-            key, sub = mx.random.split(key)
-            draft = drafts[i] if i < len(drafts) else None
-            chosen, accepted = _choose(logits, draft, sampling, sub)
-            new.append(chosen)
-            history = mx.concatenate([history, mx.array([chosen])])
-            accepted_now += accepted
-            if not accepted or chosen in stop_tokens:
-                break
-        # The trunk keeps the newest token and each accepted draft it read; the last chosen token is read next round.
-        kept = len(new)
-        commit(cache, len(verify_tokens), kept)
-        if head is not None and depth > 1:
-            mtp_cache.trim(depth - 1)
-
-        stats.rounds += 1
-        stats.drafted += len(drafts)
-        stats.accepted += accepted_now
-        while len(stats.accepted_at) < len(drafts):
-            stats.accepted_at.append(0)
-        for i in range(accepted_now):
-            stats.accepted_at[i] += 1
-
-        out.extend(new)
-        token = new[-1]
-        rows_hidden = rows[:, :kept]
-        rows_tokens = new
-    stats.decode_seconds = time.perf_counter() - first_token_at
-    return out[:max_tokens]
