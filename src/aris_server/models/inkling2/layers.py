@@ -1,8 +1,9 @@
 # Vendored from mlx-lm pull request #2086 (jundot/mlx-lm @ e2b5bbd3), MIT License: see LICENSE.mlx-lm.
 # Imports of mlx-lm main-branch helpers go through `_compat`, which maps them onto mlx-lm 0.32.2.
 # Copyright © 2026 Apple Inc.
-# Local change (Aris Server): DecoderLayer hands each convolution's whole input window to a cache that
-# keeps `windows`, so speculative decoding can rewind the convolution state to any accepted length.
+# Local changes (Aris Server): DecoderLayer hands each convolution's whole input window to a cache that
+# keeps `windows`, so speculative decoding can rewind the convolution state to any accepted length; and a few
+# query rows of a full-attention layer (a speculative verify) use fused attention (_rows_attention).
 
 import math
 from functools import partial
@@ -232,6 +233,50 @@ def _attention_reference(
     return attn_output.reshape(B, Hq, L, D).transpose(0, 2, 1, 3)
 
 
+# A speculative verify reads 2 to 8 rows at the end of a long context. The relative-attention kernel takes as long for
+# them as for a prompt chunk: 2.4 ms per full-attention visit at 13k keys on an M4 Pro, 3.7 ms at 22k, where fused
+# attention takes 1.0-2.1 ms and 1.5-3.0 ms (2 to 8 rows). Inkling 2 Mini has 8 such visits a token.
+VERIFY_ROWS = 8
+
+
+def _rows_attention(
+    query: mx.array,
+    key: mx.array,
+    value: mx.array,
+    position_bias: mx.array,
+    sinks: mx.array,
+    *,
+    scale: float,
+    query_positions: mx.array,
+    key_positions: mx.array,
+) -> mx.array:
+    """_attention_reference for a few query rows of one sequence without a window, by fused attention. That takes
+    sinks per head only, so each row's sink is a zero key of its own, masked to the other rows, with the sink's logit
+    as its mask: softmax over [scores, sink] exactly, as the reference concatenates them."""
+    _, Hq, L, D = query.shape
+    S, R = key.shape[2], position_bias.shape[-1]
+    distance = query_positions.reshape(L, 1) - key_positions.reshape(1, S)
+    bias = mx.take_along_axis(
+        position_bias[0].transpose(1, 0, 2),
+        mx.broadcast_to(mx.clip(distance, 0, R - 1), (Hq, L, S)),
+        axis=-1,
+    )
+    bias = mx.where(distance < R, bias, mx.zeros_like(bias))
+    visible = (distance >= 0) & (key_positions.reshape(1, S) >= 0)
+    mask = mx.where(visible, bias, -mx.inf)
+    sink_columns = mx.where(mx.eye(L, dtype=mx.bool_), sinks[0].T[:, :, None], -mx.inf)
+    mask = mx.concatenate([mask, sink_columns.astype(mask.dtype)], axis=-1)
+    zeros = mx.zeros((1, key.shape[1], L, D), key.dtype)
+    attn_output = mx.fast.scaled_dot_product_attention(
+        query,
+        mx.concatenate([key, zeros], axis=2),
+        mx.concatenate([value, zeros.astype(value.dtype)], axis=2),
+        scale=scale,
+        mask=mask.astype(query.dtype)[None],
+    )
+    return attn_output.transpose(0, 2, 1, 3)
+
+
 class Attention(nn.Module):
     def __init__(self, args: TextArgs, *, sliding: bool):
         super().__init__()
@@ -320,6 +365,17 @@ class Attention(nn.Module):
         S = key.shape[2]
         end = cache.offset if cache is not None else L
         bf16 = query.dtype == key.dtype == value.dtype == mx.bfloat16
+        if B == 1 and 1 < L <= VERIFY_ROWS and not self.sliding_window:
+            return _rows_attention(
+                query,
+                key,
+                value,
+                position_bias,
+                sinks,
+                scale=self.scaling,
+                query_positions=_positions(end - L, L),
+                key_positions=_key_positions(cache, S, L, end),
+            )
         if L > 1 and _use_kernels() and bf16:
             key_start = mx.broadcast_to(S - end, (B,))
             return relative_attention(
