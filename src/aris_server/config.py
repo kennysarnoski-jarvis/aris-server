@@ -7,7 +7,7 @@ from pathlib import Path
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 KV_BITS_CHOICES = (4, 8)
-MAX_MTP_DEPTH = 4  # drafts per round; acceptance compounds downward, and past 3 the extra drafts rarely survive
+MAX_MTP_DEPTH = 7  # drafts per round: an Inkling 2 draft block holds 7; past 3, Qwen's chained MTP drafts rarely survive
 DEFAULT_THINK_BUDGET = {"low": 1024, "medium": 4096, "high": 8192, "xhigh": 16384, "max": 0}
 
 
@@ -47,8 +47,9 @@ class ModelSpec:
     temperature: float = 0.6
     top_p: float = 0.95
     top_k: int = 20
-    # An MTP head (a safetensors file of `mtp.*` tensors, as Qwen3.8-27B ships) for speculative decoding: it drafts
-    # `mtp_depth` tokens ahead and one trunk pass checks them. `mtp_bits` quantizes its linear layers (0 keeps them).
+    # A draft head for speculative decoding: Qwen3.8-27B's MTP head (a safetensors file of its `mtp.*` tensors) or
+    # Inkling 2's (its mtp.safetensors). It drafts `mtp_depth` tokens ahead and one pass of the model checks them.
+    # `mtp_bits` quantizes its linear layers (0 keeps them).
     mtp: str | None = None
     mtp_depth: int = 2
     mtp_bits: int = 8

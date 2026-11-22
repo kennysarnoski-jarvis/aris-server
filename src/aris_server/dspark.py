@@ -30,7 +30,15 @@ from typing import Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx.utils import tree_flatten
+from mlx_lm.models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    BatchRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 
 from .speculative import DraftHook, Processor, Sampling, SpeculativeStats, speculate
 
@@ -97,53 +105,41 @@ def _add_norm(x: mx.array, residual: mx.array, norm: nn.RMSNorm) -> tuple[mx.arr
     return total.astype(residual.dtype), _rms(total, norm.weight, norm.eps).astype(x.dtype)
 
 
-class _Context:
-    """One drafter layer's attention context: keys and values of committed positions, each rotated at its own
-    position. A local layer reads only the last `window` positions, so it keeps only those."""
-
-    def __init__(self, window: int | None):
-        self.window = window
-        self.offset = 0
-        self._full = KVCache() if window is None else None
-        self.keys = self.values = None
-
-    def append(self, keys: mx.array, values: mx.array) -> None:
-        self.offset += keys.shape[2]
-        if self._full is not None:
-            self._full.update_and_fetch(keys, values)
-            return
-        if self.keys is not None:
-            keys = mx.concatenate([self.keys, keys], axis=2)
-            values = mx.concatenate([self.values, values], axis=2)
-        self.keys, self.values = keys[:, :, -self.window:], values[:, :, -self.window:]
-
-    def read(self) -> tuple[mx.array | None, mx.array | None]:
-        if self._full is not None:
-            if self._full.keys is None:
-                return None, None
-            return self._full.keys_and_values()
-        return self.keys, self.values
-
-    def arrays(self) -> list[mx.array]:
-        return [a for a in self.read() if a is not None]
+def context_rows(context) -> tuple[mx.array | None, mx.array | None]:
+    """A drafter layer's context keys and values in temporal order: every committed position for a full layer (a
+    KVCache), the last window's for a local one (a RotatingKVCache), each rotated at its own position."""
+    if context.keys is None:
+        return None, None
+    if isinstance(context, RotatingKVCache):
+        return (context._temporal_order(context.keys)[..., -context.max_size:, :],
+                context._temporal_order(context.values)[..., -context.max_size:, :])
+    return context.keys_and_values()
 
 
-class DraftCache:
-    """What the drafter keeps between rounds: each layer's context, and the recurrent head's input from the newest
-    committed position."""
+def one_sequence(cache) -> list:
+    """A drafter cache read as one sequence's (propose reads one): a batch's rotating context through mlx-lm's own
+    extract (ring order and left padding undone, at most a window of rows copied), a batch's full context as a slice
+    of its rows after its left padding (none for a lone sequence in mlx-lm 0.32.2, whose filter() strips the
+    padding the sequences left share), everything else as it is."""
+    out = []
+    for c in cache:
+        if isinstance(c, BatchRotatingKVCache):
+            c = c.extract(0)
+        elif isinstance(c, BatchKVCache):
+            start = int(c.left_padding[0].item())
+            view = KVCache()
+            if c.keys is not None:
+                view.keys, view.values = c.keys[:1, :, start:c._idx], c.values[:1, :, start:c._idx]
+                view.offset = c._idx - start
+            c = view
+        out.append(c)
+    return out
 
-    def __init__(self, config: DraftConfig):
-        self.contexts = [_Context(config.sliding_window_size if i in config.local_layer_ids else None)
-                         for i in range(config.num_hidden_layers)]
-        self.f_rnn: mx.array | None = None
 
-    @property
-    def offset(self) -> int:
-        return self.contexts[0].offset
-
-    def arrays(self) -> list[mx.array]:
-        out = [a for c in self.contexts for a in c.arrays()]
-        return out + ([self.f_rnn] if self.f_rnn is not None else [])
+def draft_arrays(cache) -> list[mx.array]:
+    """The arrays of a drafter cache (Drafter.make_cache), to evaluate."""
+    out = [a for c in cache[:-1] for a in (c.keys, c.values) if a is not None]
+    return out + [a for a in cache[-1].cache if a is not None]
 
 
 def _heads(x: mx.array, head_dim: int) -> mx.array:
@@ -178,13 +174,13 @@ class DraftAttention(nn.Module):
         keys = self._rope(self.k_norm_ctx(_heads(self.k_proj_ctx(features), self.head_dim)), offset)
         return keys, _heads(self.v_proj_ctx(features), self.head_dim)
 
-    def __call__(self, x: mx.array, context: _Context) -> mx.array:
+    def __call__(self, x: mx.array, context) -> mx.array:
         B, L, _ = x.shape
         offset = context.offset  # the block's first position, the anchor's
         q = self._rope(self.q_norm(_heads(self.q_proj(x), self.head_dim)), offset)
         k = self._rope(self.k_norm(_heads(self.k_proj(x), self.head_dim)), offset)
         v = _heads(self.v_proj(x), self.head_dim)
-        ctx_k, ctx_v = context.read()
+        ctx_k, ctx_v = context_rows(context)
         if ctx_k is not None:
             k = mx.concatenate([ctx_k, k], axis=2)
             v = mx.concatenate([ctx_v, v], axis=2)
@@ -216,15 +212,12 @@ class DraftLayer(nn.Module):
         self.self_attn = DraftAttention(config)
         self.mlp = DraftMLP(config)
 
-    def observe(self, features: mx.array, context: _Context) -> None:
-        """Add mixed target features of newly committed positions to the context."""
-        if self.window is not None and features.shape[1] > self.window:
-            skipped = features.shape[1] - self.window  # a local layer never reads them
-            context.offset += skipped
-            features = features[:, -self.window:]
-        context.append(*self.self_attn.context(features, context.offset))
+    def observe(self, features: mx.array, context) -> None:
+        """Add mixed target features of newly committed positions to the context (a KVCache, or for a local layer a
+        RotatingKVCache over its window; a batch's caches give each sequence its own offset)."""
+        context.update_and_fetch(*self.self_attn.context(features, context.offset))
 
-    def __call__(self, x: mx.array, residual: mx.array | None, context: _Context) -> tuple[mx.array, mx.array]:
+    def __call__(self, x: mx.array, residual: mx.array | None, context) -> tuple[mx.array, mx.array]:
         """Returns the MLP output and the residual, which the next layer (or the final norm) adds."""
         if residual is None:
             residual, h = x, self.input_layernorm(x)
@@ -276,8 +269,20 @@ class Drafter(nn.Module):
         self._rnn_step = self._rnn_rows = None
         self._fold_bits = self._fold_q = None  # set by quantize(): the folded table, quantized
 
-    def make_cache(self) -> DraftCache:
-        return DraftCache(self.config)
+    @property
+    def nbytes(self) -> int:
+        """Its weights and the tables attach() derives from them and the target's output layer."""
+        derived = [self._alpha, self._fold_weight, self._fold_bias, self._rnn_bias, self._rnn_step, self._rnn_rows,
+                   *(self._fold_q or ())]
+        return (sum(v.nbytes for _, v in tree_flatten(self.parameters()))
+                + sum(a.nbytes for a in derived if a is not None))
+
+    def make_cache(self) -> list:
+        """Each layer's attention context, then the recurrent head's input from the newest committed position:
+        mlx-lm cache types, so a batch generator pads, merges, extracts and saves them as it does a layer's."""
+        window = self.config.sliding_window_size
+        return [RotatingKVCache(max_size=window) if i in self.config.local_layer_ids else KVCache()
+                for i in range(self.config.num_hidden_layers)] + [ArraysCache(1)]
 
     def attach(self, model) -> "Drafter":
         """Derive what depends on the loaded weights and the target's output layer. Call again after either changes."""
@@ -325,13 +330,13 @@ class Drafter(nn.Module):
             mixed = mixed + taps[i].astype(_F32) * alpha[i]
         return _rms(mixed, norm.weight, norm.eps).astype(taps[0].dtype)
 
-    def observe(self, taps: Sequence[mx.array], cache: DraftCache) -> None:
-        """Read the target's taps for newly committed positions (each (1, n, hidden), in target_layer_ids order)."""
-        for i, (layer, context) in enumerate(zip(self.layers, cache.contexts)):
-            layer.observe(self._mix(taps, i, layer.dflare_norm), context)
-        cache.f_rnn = self._mix([t[:, -1:] for t in taps], -1, self.markov_head.dflare_norm)
+    def observe(self, taps: Sequence[mx.array], cache) -> None:
+        """Read the target's taps for newly committed positions (each (B, n, hidden), in target_layer_ids order)."""
+        for i, layer in enumerate(self.layers):
+            layer.observe(self._mix(taps, i, layer.dflare_norm), cache[i])
+        cache[-1][0] = self._mix([t[:, -1:] for t in taps], -1, self.markov_head.dflare_norm)
 
-    def propose(self, model, anchor: int, count: int, cache: DraftCache) -> mx.array:
+    def propose(self, model, anchor: int, count: int, cache) -> mx.array:
         """Up to `count` (< block_size) greedy guesses to follow `anchor`, unevaluated (shape (count,))."""
         if not 1 <= count < self.width:
             raise ValueError(f"a DSpark block guesses 1 to {self.width - 1} tokens, not {count}")
@@ -342,13 +347,13 @@ class Drafter(nn.Module):
         dtype = embed.dtype
         masks = mx.broadcast_to(self.mask_embed.astype(dtype), (1, self.width - 1, embed.shape[-1]))
         x, residual = mx.concatenate([embed, masks], axis=1), None
-        for layer, context in zip(self.layers, cache.contexts):
+        for layer, context in zip(self.layers, cache):
             x, residual = layer(x, residual, context)
         rows = _add_norm(x, residual, self.norm)[1][:, 1:count + 1]
         base = model.lm_head(rows)  # bf16 base logits, as vLLM's draft (the target's own head is float32)
 
         head, cap = self.markov_head, self.config.final_logit_softcapping
-        inputs = mx.concatenate([rows, mx.broadcast_to(cache.f_rnn, rows.shape)], axis=-1)
+        inputs = mx.concatenate([rows, mx.broadcast_to(cache[-1][0], rows.shape)], axis=-1)
         context = inputs.astype(_F32) @ self._rnn_rows.T + self._rnn_bias  # every step's [row, f_rnn] term
         state = mx.zeros((1, self.config.markov_rank), dtype)
         prev = mx.array([anchor])
@@ -399,24 +404,32 @@ def _visits(cache) -> list:
     return [(entry[0], entry[1]) for entry in cache]
 
 
-def read(model, tokens: mx.array, cache, taps: Sequence[int], *, record: bool = False):
-    """The target reads `tokens` (1, n). Returns its final hidden states and the taps (each (1, n, hidden)).
+def read(model, tokens: mx.array, cache, taps: Sequence[int], *, record: bool = False,
+         input_embeddings: mx.array | None = None):
+    """The target reads `tokens` (B, n). Returns its final hidden states and the taps (each (B, n, hidden)).
     `record` keeps what `rewind` needs to undo this read."""
     if record:
         for _, conv in _visits(cache):
             conv.windows = [None] * len(conv.cache)
     captures = dict.fromkeys(taps)
-    hidden = model.model.language_model(tokens, cache=cache, captures=captures)
+    hidden = model.model.language_model(tokens, cache=cache, input_embeddings=input_embeddings, captures=captures)
     return hidden, [captures[t] for t in taps]
 
 
-def _drop_tail(kv: RotatingKVCache, n: int) -> None:
-    if kv._idx != kv.keys.shape[2]:
+def _drop_tail(kv, n: int) -> None:
+    """Drop the last `n` rows a multi-token read appended to a rotating cache, which that read leaves in temporal
+    order. A batch's rotating cache (mlx-lm's BatchRotatingKVCache, not a RotatingKVCache) keeps its counters
+    per sequence; its own trim() moves them but leaves the rows, which a later one-token write would then read."""
+    if kv._idx != kv.keys.shape[2] or getattr(kv, "rotated", False):
         raise RuntimeError("a rotating cache rewinds only after a multi-token read, which leaves it in temporal order")
     end = kv.keys.shape[2] - n
     kv.keys, kv.values = kv.keys[..., :end, :], kv.values[..., :end, :]
-    kv.offset -= n
     kv._idx = end
+    if isinstance(kv, BatchRotatingKVCache):
+        kv._offset -= n
+        kv.offset = kv.offset - n
+    else:
+        kv.offset -= n
 
 
 def rewind(cache, total: int, kept: int) -> None:
@@ -429,7 +442,7 @@ def rewind(cache, total: int, kept: int) -> None:
             continue
         if windows is None:
             raise RuntimeError("rewind needs the read it undoes to be recorded")
-        if isinstance(kv, RotatingKVCache):
+        if isinstance(kv, (RotatingKVCache, BatchRotatingKVCache)):
             _drop_tail(kv, drop)
         else:
             kv.trim(drop)
@@ -463,7 +476,7 @@ class DSparkSpeculator:
             if self.drafter is not None:
                 self.drafter.observe(taps, self.draft_cache)
             hidden = hidden[:, -1:]
-            mx.eval(hidden, cache_arrays(self.cache), self.draft_cache.arrays() if self.drafter is not None else [])
+            mx.eval(hidden, cache_arrays(self.cache), draft_arrays(self.draft_cache) if self.drafter is not None else [])
         return self.model.logits(hidden)[:, -1]
 
     def draft(self, token: int, depth: int) -> mx.array | list[int]:

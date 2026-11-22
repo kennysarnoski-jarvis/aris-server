@@ -204,17 +204,19 @@ def test_drafter_context_follows_the_target(model):
     out = speculate(spec, prompt, max_tokens=30, depth=7)
     read = len(prompt) + len(out) - 1
     window = MTP_CONFIG["sliding_window_size"]
-    for i, context in enumerate(spec.draft_cache.contexts):
+    for i, context in enumerate(spec.draft_cache[:-1]):
         assert context.offset == read
-        keys, _ = context.read()
+        keys, _ = dspark.context_rows(context)
         assert keys.shape[2] == (min(read, window) if i in MTP_CONFIG["local_layer_ids"] else read)
 
     # The context holds exactly what reading the committed tokens in one go would give it.
     fresh = drafter.make_cache()
     _, taps = dspark.read(model, mx.array([prompt + out[:-1]]), make_prompt_cache(model), drafter.config.target_layer_ids)
     drafter.observe(taps, fresh)
-    for a, b in zip(spec.draft_cache.arrays(), fresh.arrays()):
-        assert a.shape == b.shape and mx.allclose(a, b, atol=1e-4)
+    for a, b in zip(spec.draft_cache[:-1], fresh[:-1]):
+        for x, y in zip(dspark.context_rows(a), dspark.context_rows(b)):
+            assert x.shape == y.shape and mx.allclose(x, y, atol=1e-4)
+    assert mx.allclose(spec.draft_cache[-1][0], fresh[-1][0], atol=1e-4)
 
 
 def test_proposals_are_tokens_of_the_vocabulary(model):

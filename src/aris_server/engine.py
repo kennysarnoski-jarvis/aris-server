@@ -868,7 +868,8 @@ def model_bytes(model) -> int:
     total = sum(v.nbytes for _, v in tree_flatten(model.parameters()))
     head = getattr(model, "_mtp_head", None)
     if head is not None:
-        total += sum(v.nbytes for _, v in tree_flatten(head.parameters()))
+        # A DSpark drafter also keeps tables derived from the target's output layer (Drafter.nbytes).
+        total += getattr(head, "nbytes", None) or sum(v.nbytes for _, v in tree_flatten(head.parameters()))
     return total
 
 

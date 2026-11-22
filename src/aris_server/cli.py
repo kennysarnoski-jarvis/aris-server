@@ -51,11 +51,11 @@ def main(argv=None):
     s.add_argument("--no-guards", dest="guards", action="store_false",
                    help="turn off the loop guards: no reminder when the model repeats one tool call, no steering when "
                         "a response loops")
-    s.add_argument("--mtp", help="MTP head (safetensors of mtp.* tensors) for speculative decoding; overrides the "
-                                 "model's mtp")
-    s.add_argument("--mtp-depth", type=int, choices=range(0, 5), metavar="0-4",
-                   help="tokens the MTP head drafts per round (0 turns drafting off)")
-    s.add_argument("--no-mtp", dest="use_mtp", action="store_false", help="decode without the MTP head")
+    s.add_argument("--mtp", help="draft head for speculative decoding (Qwen3.8-27B's mtp.* tensors, or Inkling 2's "
+                                 "mtp.safetensors); overrides the model's mtp")
+    s.add_argument("--mtp-depth", type=int, choices=range(0, 8), metavar="0-7",
+                   help="tokens the draft head drafts per round (0 turns drafting off)")
+    s.add_argument("--no-mtp", dest="use_mtp", action="store_false", help="decode without the draft head")
     sub.add_parser("models", help="list configured and built-in models")
     p = sub.add_parser("pull", help="download the weights a model would load on this Mac, ahead of serving it")
     p.add_argument("model", help="configured or built-in model name, or Hugging Face repo id")
@@ -122,7 +122,7 @@ def main(argv=None):
     if not a.use_mtp:
         spec = dataclasses.replace(spec, mtp=None)
     if spec.mtp and not Path(spec.mtp).is_file():
-        print(f"no MTP head at {spec.mtp}", file=sys.stderr)
+        print(f"no draft head at {spec.mtp}", file=sys.stderr)
         return 2
     try:
         # Before loading, and for a Hugging Face repo before downloading: a model this Mac can't hold would swap it to

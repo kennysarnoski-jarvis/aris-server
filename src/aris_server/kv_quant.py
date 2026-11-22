@@ -273,12 +273,20 @@ def quantize_kv(model, bits: int, group_size: int = KV_GROUP_SIZE) -> bool:
     if bits not in KV_BITS_CHOICES:
         raise ValueError(f"kv_bits must be one of {KV_BITS_CHOICES}, not {bits!r}")
     make_cache = model.make_cache
-    if not any(type(c) is KVCache for c in make_cache()):
+    # A draft head's slots come after the model's own; a DSpark drafter reads its contexts in its own attention.
+    served = getattr(model, "_mtp_served", None)
+    limit = model._mtp_trunk_layers if served is not None and not served.kv_quantizable else None
+
+    def quantizable(i, c):
+        return type(c) is KVCache and (limit is None or i < limit)
+
+    if not any(quantizable(i, c) for i, c in enumerate(make_cache())):
         return False
     install_attention()
 
     def make_quantized_cache():
-        return [QuantizedKVCache(group_size=group_size, bits=bits) if type(c) is KVCache else c for c in make_cache()]
+        return [QuantizedKVCache(group_size=group_size, bits=bits) if quantizable(i, c) else c
+                for i, c in enumerate(make_cache())]
 
     model.make_cache = make_quantized_cache
     return True

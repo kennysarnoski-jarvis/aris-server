@@ -98,7 +98,7 @@ def verify_costs(model, drafter, prompt, widths=range(1, 9), repeats=5):
             mx.eval(spec.verify(mx.array([1] * w, mx.int32)), spec._pending)
             times.append(time.perf_counter() - t0)
             spec.commit(w, 1)
-            mx.eval(dspark.cache_arrays(spec.cache), spec.draft_cache.arrays())
+            mx.eval(dspark.cache_arrays(spec.cache), dspark.draft_arrays(spec.draft_cache))
         costs[w] = sorted(times)[len(times) // 2]
     drafts = {}
     for count in (1, 2, 3, drafter.width - 1):

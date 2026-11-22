@@ -116,6 +116,31 @@ With the 8-bit KV cache, Arete-27B's 8-bit weights leave about 124k tokens of co
 more than the model's whole context on a 64 GB one. A 32 GB Mac can't hold them and gets the 4-bit
 weights, with about 63k.
 
+### Draft heads
+
+Some models ship a small head that guesses the next few tokens. The model checks the guesses in one pass, which costs
+about as much as writing one token, and keeps each one it agrees with, so the output is still the model's own. Aris
+Server runs two kinds: the MTP head of Qwen3.8-27B (which Arete-27B and Aris 3.8-27B are trained from) and Inkling 2's
+own draft head. Point `mtp` at the head's weights:
+
+```toml
+[models."arete:27b"]
+path = "~/models/arete-27b-mlx-8bit"
+mtp = "~/models/qwen3.8-27b-mtp.safetensors"  # the mtp.* tensors of Qwen3.8-27B's checkpoint
+mtp_depth = 3
+
+[models."inkling-2-mini"]
+mtp = "~/models/inkling-2-mini-mtp/mtp.safetensors"  # from thinkingmachines/Inkling-2-Mini
+mtp_depth = 3
+```
+
+`mtp_depth` is how many tokens a round guesses, and `mtp_bits` quantizes the head (8 unless set; 0 keeps it as
+shipped). `--mtp`, `--mtp-depth` and `--no-mtp` do the same on the command line. A request speculates while it
+decodes alone; several at once decode as before. On a 48 GB M4 Pro, Claude Code finished a coding task on the 27B in
+150 s with its head and 241 s without, its replies streaming at about 16 tokens a second instead of 7. Inkling's head
+is a smaller win, because each extra token Inkling checks reads more of its experts: 1.1-1.3 times mlx-lm's own
+decoding on code and long contexts, and about even on prose.
+
 ## Run it as a service
 
 ```bash
