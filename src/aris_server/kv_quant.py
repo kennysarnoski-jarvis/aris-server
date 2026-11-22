@@ -266,17 +266,22 @@ def install_attention() -> None:
             module.scaled_dot_product_attention = scaled_dot_product_attention
 
 
-def quantize_kv(model, bits: int, group_size: int = KV_GROUP_SIZE) -> None:
-    """Give a loaded model quantized caches for its full-attention layers; recurrent layers keep theirs."""
+def quantize_kv(model, bits: int, group_size: int = KV_GROUP_SIZE) -> bool:
+    """Give a loaded model quantized caches for its full-attention layers; recurrent layers keep theirs. False, and
+    the model is left as it was, when none of its layer caches is a plain KVCache: Inkling keeps its inside CacheLists
+    and reads them in its own attention kernels."""
     if bits not in KV_BITS_CHOICES:
         raise ValueError(f"kv_bits must be one of {KV_BITS_CHOICES}, not {bits!r}")
-    install_attention()
     make_cache = model.make_cache
+    if not any(type(c) is KVCache for c in make_cache()):
+        return False
+    install_attention()
 
     def make_quantized_cache():
         return [QuantizedKVCache(group_size=group_size, bits=bits) if type(c) is KVCache else c for c in make_cache()]
 
     model.make_cache = make_quantized_cache
+    return True
 
 
 # mlx-lm's single-sequence quantized cache is what a finished turn is kept as, and what a waiting sequence starts

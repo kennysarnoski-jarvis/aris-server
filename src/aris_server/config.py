@@ -35,6 +35,8 @@ class ModelSpec:
     # Template variable that carries effort (e.g. "reasoning_effort"), and how request efforts map to its values.
     effort_kwarg: str | None = None
     effort_map: dict[str, str] = field(default_factory=dict)
+    # Its value for a request that doesn't think, for a template with no enable_thinking switch (Inkling: "none").
+    effort_off: str | None = None
     # Thinking tokens allowed per effort before thinking is closed at the next paragraph break; 0 = unlimited.
     think_budget: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_THINK_BUDGET))
     template_kwargs: dict = field(default_factory=dict)
@@ -66,6 +68,18 @@ BUILTIN_MODELS = {
         "effort_kwarg": "reasoning_effort",
         "effort_map": {"low": "low", "medium": "medium", "high": "medium", "xhigh": "xhigh", "max": "xhigh"},
         "think_budget": {"low": 1024, "medium": 3072, "high": 4096, "xhigh": 12288, "max": 0},
+    },
+    # Inkling 2 Mini (Thinking Machines, Apache 2.0): 26B with 3.4B active and its middle layers looped three times,
+    # so it fits 32 GB Macs. Effort goes to its own effort levels (none to max, which its template turns into a
+    # number); sampling is its generation_config's. Its KV cache stays at full precision (models/inkling2).
+    "inkling-2-mini": {
+        "path": "mlx-community/Inkling-2-Mini-4bit",
+        "effort_kwarg": "reasoning_effort",
+        "effort_map": {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"},
+        "effort_off": "none",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 0,
     },
 }
 
@@ -108,6 +122,7 @@ def _spec(name: str, raw: dict, where: str) -> ModelSpec:
         kv_bits=raw.get("kv_bits"),
         effort_kwarg=raw.get("effort_kwarg"),
         effort_map=dict(raw.get("effort_map") or {}),
+        effort_off=raw.get("effort_off"),
         think_budget=budget,
         template_kwargs=dict(raw.get("template_kwargs") or {}),
         mtp=str(Path(raw["mtp"]).expanduser()) if raw.get("mtp") else None,

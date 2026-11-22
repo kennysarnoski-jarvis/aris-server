@@ -39,6 +39,23 @@ The 8-bit build takes 27 GB, so it needs a Mac with 48 GB of memory or more, whe
 125k tokens of context. Its [model card](https://huggingface.co/YourAris/Aris-3.8-27B-MLX-8bit) has
 the details and evals.
 
+## Inkling 2 Mini
+
+Inkling 2 Mini is built in as `inkling-2-mini`: [Thinking Machines'](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+mixture-of-experts model, 26.4B parameters with 3.4B active per token. `pull` downloads
+[mlx-community's 4-bit build](https://huggingface.co/mlx-community/Inkling-2-Mini-4bit) (17 GB):
+
+```bash
+aris-server pull inkling-2-mini
+aris-server serve --model inkling-2-mini
+```
+
+On a 48 GB M4 Pro it writes about 32 tokens a second and reads prompts at about 370, with room for about
+320k tokens of context. Its thinking and tool calls stream as Anthropic events, like any other model's. Aris
+Server serves its text; images aren't supported yet. mlx-lm doesn't run Inkling yet, so Aris Server carries
+the model code from mlx-lm's open [pull request](https://github.com/ml-explore/mlx-lm/pull/2086) until a
+release does.
+
 ## Why not Ollama?
 
 Aris Server does one job: serve a local model to coding agents properly.

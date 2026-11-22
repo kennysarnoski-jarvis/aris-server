@@ -206,6 +206,8 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000, guards: bool = T
     kwargs["enable_thinking"] = thinking
     if spec.effort_kwarg and thinking:
         kwargs[spec.effort_kwarg] = spec.effort_map.get(effort, effort)
+    elif spec.effort_kwarg and spec.effort_off:
+        kwargs[spec.effort_kwarg] = spec.effort_off
 
     budget = spec.budget_for(effort) if thinking else 0
     if thinking and thinking_cfg.get("budget_tokens"):

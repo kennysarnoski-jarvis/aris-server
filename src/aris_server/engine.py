@@ -21,12 +21,15 @@ from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START, GenerationBatch, PromptP
 from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,
+    CacheList,
     KVCache,
     LRUPromptCache,
     QuantizedKVCache,
     can_trim_prompt_cache,
 )
 
+from . import inkling
+from . import models as _models
 from .budget import BudgetTokens, ThinkBudget
 from .config import ModelSpec, home
 from .disk_cache import DiskCache
@@ -34,6 +37,25 @@ from .guards import LoopGuard, loop_exempt_ids
 from .kv_quant import BatchQuantizedKVCache, kv_bytes_per_token, quantize_kv
 from .mtp_serve import mtp_snapshot
 from .translate import Plan
+
+# Architectures served before mlx-lm releases them (models/), where mlx-lm's loader looks.
+_models.register()
+
+
+class _OwnToolCalls(logging.Filter):
+    """mlx-lm warns, on every request with tools, that a model whose tokenizer names no tool-call markers takes no
+    tools. It passes them to the chat template all the same, and Aris Server parses some models' tool calls itself
+    (Inkling's): for those the warning is false."""
+
+    active = False
+
+    def filter(self, record):
+        return not (self.active and record.getMessage().startswith(
+            "Received tools but model does not support tool calling"))
+
+
+_OWN_TOOL_CALLS = _OwnToolCalls()
+logging.getLogger().addFilter(_OWN_TOOL_CALLS)  # mlx-lm logs through the root logger
 
 
 @dataclass
@@ -242,13 +264,36 @@ def context_before_loading(path: str, adapter: str | None, kv_bits: int | None, 
         return None
     weights, config = sized
     text, heads, head_dim = _kv_shape(config)
-    if types := text.get("layer_types"):
-        layers = sum(t == "full_attention" for t in types)  # hybrid models: only these layers keep a KV cache
-    elif interval := text.get("full_attention_interval"):
-        layers = text["num_hidden_layers"] // interval
-    else:
-        layers = text["num_hidden_layers"]
+    layers = full_attention_layers(text)
     return context_that_fits(limit, weights, kv_bytes_per_token(layers, heads, head_dim, kv_bits), CONTEXT_OVERHEAD)
+
+
+def full_attention_layers(text: dict) -> int:
+    """How many KV caches grow with the context: one per full-attention layer (a hybrid model's linear-attention
+    layers and sliding-window layers keep a fixed size), and one per pass through a looped model's core."""
+    n = text["num_hidden_layers"]
+    if types := text.get("layer_types"):
+        full = [i for i, t in enumerate(types) if t == "full_attention"]
+    elif interval := text.get("full_attention_interval"):
+        return n // interval
+    elif (local := text.get("local_layer_ids")) is not None:
+        full = [i for i in range(n) if i not in set(local)]
+    else:
+        full = list(range(n))
+    loop = text.get("loop_config") or {}
+    if loop.get("num_passes"):
+        core = range(loop["core_start"], loop["core_end"])
+        return sum(loop["num_passes"] if i in core else 1 for i in full)
+    return len(full)
+
+
+def _flat_caches(caches):
+    """A model's layer caches with any CacheList (a layer keeping several caches) opened up."""
+    for c in caches:
+        if isinstance(c, CacheList):
+            yield from _flat_caches(c.caches)
+        else:
+            yield c
 
 
 def choose_weights(spec: ModelSpec, limit: int) -> ModelSpec:
@@ -838,14 +883,20 @@ class Engine:
             if not self.generator.generation_available():
                 raise RuntimeError(f"could not load the MTP head {spec.mtp}")
             time.sleep(0.1)
-        if spec.kv_bits:  # before any request makes a cache, and after the MTP head adds its cache slot
-            quantize_kv(self.provider.model, spec.kv_bits)
+        # Before any request makes a cache, and after the MTP head adds its cache slot.
+        if spec.kv_bits and not quantize_kv(self.provider.model, spec.kv_bits):
+            # Its attention keeps its caches inside its own layer caches (Inkling) and reads them itself.
+            logging.warning("%s keeps its KV cache at full precision: kv_bits = %d doesn't apply to it", spec.name,
+                            spec.kv_bits)
+            self.spec = spec = replace(spec, kv_bits=None)
         layers = self.provider.model.make_cache()
         if any(isinstance(c, ArraysCache) for c in layers) and all(
                 isinstance(c, ArraysCache) or type(c) in (KVCache, QuantizedKVCache) for c in layers):
             # Recurrent layers: a cache can't be cut back without checkpoints (see _resume for what resumes).
             cache.checkpoint_every = CHECKPOINT_TOKENS
             cache.turn_ends = frozenset(self.tokenizer.eos_token_ids or ())
+        self.inkling = inkling.is_inkling(self.tokenizer)
+        _OWN_TOOL_CALLS.active = self.inkling
         cache.decode = self.tokenizer.decode
         self.budget_tokens = BudgetTokens(self.tokenizer)
         self.loop_exempt = loop_exempt_ids(self.tokenizer)
@@ -868,14 +919,16 @@ class Engine:
                 logging.info("restored %.1f GB of prompt caches from disk", restored / (1 << 30))
         threading.Thread(target=self._watch, daemon=True).start()
         logging.info("loaded %s%s (thinking=%s, tools=%s, think-end id=%s, KV cache %s%s)", spec.path,
-                     f" + adapter {spec.adapter}" if spec.adapter else "", self.tokenizer.has_thinking,
-                     self.tokenizer.has_tool_calling, self.budget_tokens.end_id,
+                     f" + adapter {spec.adapter}" if spec.adapter else "",
+                     "Inkling messages" if self.inkling else self.tokenizer.has_thinking,
+                     "Inkling messages" if self.inkling else self.tokenizer.has_tool_calling, self.budget_tokens.end_id,
                      f"{spec.kv_bits}-bit" if spec.kv_bits else "full precision",
                      f", MTP head {spec.mtp} ({spec.mtp_bits or 16}-bit, {spec.mtp_depth} drafts)" if spec.mtp else "")
 
     def _kv_bytes_per_token(self) -> int | None:
         try:
-            layers = sum(isinstance(c, (KVCache, QuantizedKVCache)) for c in self.provider.model.make_cache())
+            layers = sum(isinstance(c, (KVCache, QuantizedKVCache))
+                         for c in _flat_caches(self.provider.model.make_cache()))
             path = Path(self.spec.path)
             if not (path / "config.json").is_file():
                 return None
@@ -981,15 +1034,17 @@ class Engine:
                                         role_mapping=None)
         ctx, responses = self.generator.generate(request, args, progress_callback=on_progress)
 
+        classify = _classify_inkling if self.inkling else _classify
+
         def pieces():
             try:
-                yield from _classify(ctx, responses, lambda: bool(guard) and guard[0].gave_up)
+                yield from classify(ctx, responses, lambda: bool(guard) and guard[0].gave_up)
             finally:
                 self.cache.reading = [p for p in self.cache.reading if p != ctx.prompt]
 
         return Run(prompt_tokens=len(ctx.prompt), cached_tokens=max(ctx.prompt_cache_count, 0),
-                   tool_parser=ctx.tool_parser, pieces=pieces(), stop=ctx.stop, budget=budget, guard=guard,
-                   mtp_start=mtp_snapshot(self.provider.model))
+                   tool_parser=inkling.parse_tool_calls if self.inkling else ctx.tool_parser, pieces=pieces(),
+                   stop=ctx.stop, budget=budget, guard=guard, mtp_start=mtp_snapshot(self.provider.model))
 
 
 def _classify(ctx, responses, gave_up: Callable[[], bool] = lambda: False):
@@ -1013,4 +1068,26 @@ def _classify(ctx, responses, gave_up: Callable[[], bool] = lambda: False):
                 return
         else:
             sm, segments = TextStateMachine.split(sm, gen.text)
+        yield [Piece(s, t) for s, t in segments], gen.finish_reason, n
+
+
+def _classify_inkling(ctx, responses, gave_up: Callable[[], bool] = lambda: False):
+    """_classify for Inkling's reply messages (inkling.py): thinking, text and JSON tool calls, markers removed."""
+    stream = inkling.ReplyStream()
+    n = 0
+    for gen in responses:
+        n += 1
+        if gen.finish_reason == "stop":
+            stream.discard()
+            segments = [(stream.state, "")]
+        elif gen.finish_reason == "length" or gave_up():
+            segments = stream.feed(gen.text) + stream.flush()
+            if not segments:
+                segments = [(stream.state, "")]
+            if gen.finish_reason != "length":
+                ctx.stop()
+                yield [Piece(s, t) for s, t in segments], "length", n
+                return
+        else:
+            segments = stream.feed(gen.text)
         yield [Piece(s, t) for s, t in segments], gen.finish_reason, n

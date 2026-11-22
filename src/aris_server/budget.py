@@ -2,6 +2,8 @@
 
 import mlx.core as mx
 
+from . import inkling
+
 
 class ThinkBudget:
     """Logits processor. Counts generated tokens while thinking. Past `budget`, outside a code fence, a paragraph
@@ -14,12 +16,25 @@ class ThinkBudget:
     re-reads everything from that point."""
 
     def __init__(self, budget: int, end_id: int, newline_id: int, paragraph_ids: frozenset[int],
-                 fence_counts: dict[int, int], overrun: int = 1024):
+                 fence_counts: dict[int, int], overrun: int = 1024, start_id: int | None = None):
         self.budget, self.end_id, self.newline_id, self.overrun = budget, end_id, newline_id, overrun
         self.paragraph_ids, self.fence_counts = paragraph_ids, fence_counts
         self.n = self.fences = 0
         self.done = self.forced = False
         self._paragraphs = None
+        # A model whose prompt opens thinking starts inside it. One that opens thinking with a token of its own
+        # (Inkling: <|content_thinking|>, closed by <|end_message|>) counts only inside: its text and tool calls
+        # end with the same token and never count.
+        self.start_id = start_id
+        self.inside = start_id is None
+
+    def _ended(self) -> None:
+        # One thinking message ended. Thinking that opens with its own token can open again later in the reply:
+        # the count carries over, so the whole reply stays within the budget.
+        if self.start_id is None:
+            self.done = True
+        else:
+            self.inside = False
 
     def _only(self, token_id, logits):
         mask = mx.arange(logits.shape[-1]) == token_id
@@ -30,8 +45,11 @@ class ThinkBudget:
         if self.done or tokens is None or len(tokens) == 0:
             return logits
         last = int(tokens[-1].item())
+        if not self.inside:
+            self.inside = last == self.start_id
+            return logits
         if last == self.end_id:
-            self.done = True
+            self._ended()
             return logits
         self.n += 1
         self.fences += self.fence_counts.get(last, 0)
@@ -41,7 +59,8 @@ class ThinkBudget:
         if self.fences % 2 and not hard:
             return logits
         if last == self.newline_id:
-            self.done = self.forced = True
+            self.forced = True
+            self._ended()
             return self._only(self.end_id, logits)
         if hard:
             return self._only(self.newline_id, logits)
@@ -62,8 +81,12 @@ class BudgetTokens:
     """Per-tokenizer lookups the processor needs, computed once per model."""
 
     def __init__(self, tokenizer):
-        end = tokenizer.think_end_tokens if hasattr(tokenizer, "think_end_tokens") else None
-        self.end_id = end[0] if end and len(end) == 1 else None
+        self.start_id = None
+        if (ids := inkling.think_ids(tokenizer)) is not None:
+            self.start_id, self.end_id = ids
+        else:
+            end = tokenizer.think_end_tokens if hasattr(tokenizer, "think_end_tokens") else None
+            self.end_id = end[0] if end and len(end) == 1 else None
         newline = tokenizer.encode("\n", add_special_tokens=False) if hasattr(tokenizer, "encode") else []
         self.newline_id = newline[0] if len(newline) == 1 else None
         self.paragraph_ids, self.fence_counts = set(), {}
@@ -79,4 +102,5 @@ class BudgetTokens:
     def make(self, budget: int) -> ThinkBudget | None:
         if budget <= 0 or self.end_id is None or self.newline_id is None:
             return None
-        return ThinkBudget(budget, self.end_id, self.newline_id, self.paragraph_ids, self.fence_counts)
+        return ThinkBudget(budget, self.end_id, self.newline_id, self.paragraph_ids, self.fence_counts,
+                           start_id=self.start_id)

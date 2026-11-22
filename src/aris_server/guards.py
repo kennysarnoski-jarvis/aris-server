@@ -12,6 +12,8 @@ import json
 
 import mlx.core as mx
 
+from .inkling import ENDING_TEXTS as INKLING_ENDINGS
+
 STUCK_REPEATS = 3  # the same call with the same result this many times in a row gets a reminder
 
 LOOP_SPAN = 400    # a loop is the last LOOP_SPAN generated tokens being one chunk repeated...
@@ -22,8 +24,8 @@ LOOP_BREAKS = 3    # times the guard steers a response off a loop before it ends
 LOOP_READ_EVERY = 32
 
 # Tokens the guard never blocks: they close what the model is doing (its thinking, a tool call, the turn), and
-# blocking one could trap the model inside it.
-ENDING_TEXTS = ("</think>", "</tool_call>", "<|im_end|>", "<|endoftext|>")
+# blocking one could trap the model inside it. Each counts only for a tokenizer that has it as one token.
+ENDING_TEXTS = ("</think>", "</tool_call>", "<|im_end|>", "<|endoftext|>", *INKLING_ENDINGS)
 
 
 def stuck_call_note(repeats: int) -> str:
