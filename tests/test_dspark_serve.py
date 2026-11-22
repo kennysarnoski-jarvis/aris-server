@@ -161,12 +161,14 @@ def test_the_drafter_is_attached_when_an_inkling_model_loads(tmp_path, monkeypat
     (tmp_path / "config.json").write_text(json.dumps({**LOOP_CONFIG, "mtp_config": MTP_CONFIG}))
     head = tmp_path / "mtp.safetensors"
     mx.save_safetensors(str(head), dict(tree_flatten(drafter.parameters())))
-    provider = SimpleNamespace(model=None, _mtp_spec=SimpleNamespace(mtp=str(head), mtp_bits=0, mtp_depth=4))
+    provider = SimpleNamespace(model=None, _mtp_spec=SimpleNamespace(mtp=str(head), mtp_bits=0, mtp_depth=4,
+                                                                    mtp_adaptive=True))
     monkeypatch.setattr(mtp_serve, "_original_load", lambda self, *a, **k: setattr(self, "model", model))
     n = len(model.make_cache())
     mtp_serve._load_with_mtp(provider, str(tmp_path))
     assert isinstance(provider.model._mtp_head, dspark.Drafter)
     assert provider.model._mtp_config.depth == 4
+    assert provider.model._mtp_config.control.max_depth == 4  # adaptive: up to 4 drafts a round
     assert len(provider.model.make_cache()) == n + len(MTP_CONFIG["local_layer_ids"]) + 2
     mtp_serve._load_with_mtp(provider, str(tmp_path))  # loading again doesn't stack a second head
     assert len(provider.model.make_cache()) == n + len(MTP_CONFIG["local_layer_ids"]) + 2
@@ -202,3 +204,21 @@ def test_the_drafter_reads_a_batch_survivors_contexts_as_its_own():
         for x, y in zip(dspark.context_rows(a), dspark.context_rows(b)):
             assert x.shape == y.shape and mx.allclose(x, y, atol=1e-5)
     assert drafter.propose(model, 7, 7, view).tolist() == drafter.propose(model, 7, 7, alone).tolist()
+
+
+@pytest.mark.parametrize("right", [0, 7])
+def test_adaptive_depth_keeps_the_output_and_learns_what_drafts_keep(right):
+    (want,), _, _ = generate(plain_model(), PROMPTS[:1], [60])
+    model = plain_model()
+    mtp_serve.attach_dspark(model, random_drafter(model), depth=5, adaptive=True)
+    model._mtp_config.drafter = oracle(want, PROMPTS[0], right)
+    (got,), (cache,), _ = generate(model, PROMPTS[:1], [60])
+    assert got == want
+    control = model._mtp_config.control
+    assert 0 in control.seconds and control.rounds > 10  # it measured plain steps and draft rounds
+    if right:  # up from the 0.7 it starts from, in the ~10 rounds 60 tokens take
+        assert control.rates()[0] > 0.75 and model._mtp_config.stats.accepted > 0
+    else:
+        assert control.rates()[0] < 0.3
+    target, drafter = offsets(model, cache)
+    assert target == len(PROMPTS[0]) + len(got) and set(drafter) == {target}

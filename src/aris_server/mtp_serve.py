@@ -15,6 +15,7 @@ the caches are cut back to the last returned token. With two or more sequences t
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,15 +26,16 @@ from mlx_lm.generate import GenerationBatch
 from mlx_lm.models.cache import ArraysCache
 
 from . import dspark, mtp
-from .speculative import Sampling, SpeculativeStats, choose
+from .speculative import DepthControl, Sampling, SpeculativeStats, choose
 
 log = logging.getLogger(__name__)
 
 
 @dataclass
 class MTPConfig:
-    depth: int = 2
+    depth: int = 2  # drafts a round, or with `control` the most a round drafts
     stats: SpeculativeStats = field(default_factory=SpeculativeStats)
+    control: DepthControl | None = None  # picks each round's depth; 0 decodes plainly
     drafter: object = None  # tests only: tokens so far -> drafts, instead of the head
     draft_override: object = None  # tests only: the head drafts as usual (rows, trims), then these replace its drafts
 
@@ -47,11 +49,12 @@ def _slots(model, cache):
     return cache[:n], cache[n:]
 
 
-def _attach(model, served, head, depth: int) -> None:
-    """Give `model` a head: its cache slots after the model's own, and calls that keep them in step."""
+def _attach(model, served, head, depth: int, adaptive: bool) -> None:
+    """Give `model` a head: its cache slots after the model's own, and calls that keep them in step. `adaptive`
+    lets a DepthControl pick each round's depth, up to `depth`."""
     model._mtp_head = head
     model._mtp_served = served
-    model._mtp_config = MTPConfig(depth=depth)
+    model._mtp_config = MTPConfig(depth=depth, control=DepthControl(depth) if adaptive and depth else None)
     model._mtp_trunk_layers = len(model.make_cache())
     make_cache = model.make_cache
 
@@ -128,9 +131,9 @@ class _ServedMTP:
         pending[0] = hidden[:, kept - 1:kept]
 
 
-def attach_mtp(model, head: mtp.MTPHead, *, depth: int = 2) -> None:
+def attach_mtp(model, head: mtp.MTPHead, *, depth: int = 2, adaptive: bool = False) -> None:
     """Give `model` an MTP head: two more cache slots, and calls that keep the head's cache in step."""
-    _attach(model, _ServedMTP(head), head, depth)
+    _attach(model, _ServedMTP(head), head, depth, adaptive)
 
 
 def add_head_rows(model, inputs, hidden, head_cache, pending, *, previous=None) -> None:
@@ -189,9 +192,9 @@ class _ServedDSpark:
         self.drafter.observe([t[:, :kept] for t in taps], own)
 
 
-def attach_dspark(model, drafter: dspark.Drafter, *, depth: int = 3) -> None:
+def attach_dspark(model, drafter: dspark.Drafter, *, depth: int = 3, adaptive: bool = False) -> None:
     """Give an Inkling 2 `model` its draft head: its contexts as more cache slots, and calls that keep them in step."""
-    _attach(model, _ServedDSpark(drafter), drafter, depth)
+    _attach(model, _ServedDSpark(drafter), drafter, depth, adaptive)
 
 
 # --- Sampling parameters ride on the sampler ---------------------------------------------------------------------
@@ -244,7 +247,15 @@ def _speculative_next(batch):
     token = int(batch._next_tokens[0].item())
     token_logprobs = batch._next_logprobs[0]
     remaining = batch.max_tokens[0] - batch._num_tokens[0]
-    depth = max(0, min(config.depth, remaining - 1))
+    round_started = time.perf_counter()
+    if config.control is not None:
+        depth = config.control.choose(remaining - 1)
+        if depth == 0:  # drafting doesn't pay here: mlx-lm's own step, which overlaps the next one with this
+            responses = _original_next(batch)
+            config.control.observe(0, 0, time.perf_counter() - round_started)
+            return responses
+    else:
+        depth = max(0, min(config.depth, remaining - 1))
 
     drafts, draft_state = served.draft(model, own, token, depth, [*batch.tokens[0], token], config)
 
@@ -284,6 +295,8 @@ def _speculative_next(batch):
     served.commit(model, target, own, verify_tokens, kept, draft_state, verified)
 
     accepted_now = len(fed) - 1
+    if config.control is not None:
+        config.control.observe(len(drafts), accepted_now, time.perf_counter() - round_started)
     stats.rounds += 1
     stats.drafted += len(drafts)
     stats.accepted += accepted_now
@@ -343,14 +356,15 @@ def _load_with_mtp(self, *args, **kwargs):
             model_path = str(args[0] if args else kwargs["model_path"])
             folder = Path(model_path) if Path(model_path).exists() else mlx_utils._download(model_path)
             drafter = dspark.load_drafter(folder, self.model, weights=spec.mtp, bits=spec.mtp_bits or None)
-            attach_dspark(self.model, drafter, depth=spec.mtp_depth)
+            attach_dspark(self.model, drafter, depth=spec.mtp_depth, adaptive=spec.mtp_adaptive)
             kind = "DSpark draft head"
         else:
             head = mtp.load_mtp_head(spec.mtp, mtp.text_model(self.model).args, bits=spec.mtp_bits or None)
-            attach_mtp(self.model, head, depth=spec.mtp_depth)
+            attach_mtp(self.model, head, depth=spec.mtp_depth, adaptive=spec.mtp_adaptive)
             kind = "MTP head"
-        log.info("%s %s attached (%s, %d drafts per round)", kind, spec.mtp,
-                 f"{spec.mtp_bits}-bit" if spec.mtp_bits else "unquantized", spec.mtp_depth)
+        log.info("%s %s attached (%s, %s %d drafts per round)", kind, spec.mtp,
+                 f"{spec.mtp_bits}-bit" if spec.mtp_bits else "unquantized",
+                 "as many as pay, up to" if spec.mtp_adaptive else "", spec.mtp_depth)
     return result
 
 

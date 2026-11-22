@@ -43,7 +43,8 @@ def test_the_head_is_attached_when_the_model_loads(tmp_path, monkeypatch):
         path = tmp_path / "mtp.safetensors"
         mx.save_safetensors(str(path), {"mtp." + k: v for k, v in tree_flatten(head.parameters())},
                             metadata={"mtp_format": "mlx"})
-        provider = SimpleNamespace(model=None, _mtp_spec=SimpleNamespace(mtp=str(path), mtp_bits=0, mtp_depth=3))
+        provider = SimpleNamespace(model=None, _mtp_spec=SimpleNamespace(mtp=str(path), mtp_bits=0, mtp_depth=3,
+                                                                    mtp_adaptive=False))
 
         def fake_load(self, *a, **k):
             self.model = model

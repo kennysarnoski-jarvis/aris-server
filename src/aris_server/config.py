@@ -49,10 +49,12 @@ class ModelSpec:
     top_k: int = 20
     # A draft head for speculative decoding: Qwen3.8-27B's MTP head (a safetensors file of its `mtp.*` tensors) or
     # Inkling 2's (its mtp.safetensors). It drafts `mtp_depth` tokens ahead and one pass of the model checks them.
-    # `mtp_bits` quantizes its linear layers (0 keeps them).
+    # `mtp_bits` quantizes its linear layers (0 keeps them). With `mtp_adaptive`, each round drafts as many tokens as
+    # pay there, up to `mtp_depth`, and decodes plainly where drafting doesn't (speculative.DepthControl).
     mtp: str | None = None
     mtp_depth: int = 2
     mtp_bits: int = 8
+    mtp_adaptive: bool = True
 
     def budget_for(self, effort: str) -> int:
         return int(self.think_budget.get(effort, DEFAULT_THINK_BUDGET.get(effort, 0)))
@@ -113,6 +115,8 @@ def _spec(name: str, raw: dict, where: str) -> ModelSpec:
         raise ValueError(f"{where}: mtp_depth must be a whole number from 0 to {MAX_MTP_DEPTH}")
     if raw.get("mtp_bits", 8) not in (0, 4, 8):
         raise ValueError(f"{where}: mtp_bits must be 0 (unquantized), 4 or 8")
+    if not isinstance(raw.get("mtp_adaptive", True), bool):
+        raise ValueError(f"{where}: mtp_adaptive must be true or false")
     return ModelSpec(
         name=name,
         path=paths[0],
@@ -127,8 +131,8 @@ def _spec(name: str, raw: dict, where: str) -> ModelSpec:
         think_budget=budget,
         template_kwargs=dict(raw.get("template_kwargs") or {}),
         mtp=str(Path(raw["mtp"]).expanduser()) if raw.get("mtp") else None,
-        **{k: raw[k] for k in ("temperature", "top_p", "top_k", "followup_budget", "mtp_depth", "mtp_bits")
-           if k in raw},
+        **{k: raw[k] for k in ("temperature", "top_p", "top_k", "followup_budget", "mtp_depth", "mtp_bits",
+                               "mtp_adaptive") if k in raw},
     )
 
 

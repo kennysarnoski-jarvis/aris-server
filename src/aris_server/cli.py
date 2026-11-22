@@ -56,6 +56,8 @@ def main(argv=None):
     s.add_argument("--mtp-depth", type=int, choices=range(0, 8), metavar="0-7",
                    help="tokens the draft head drafts per round (0 turns drafting off)")
     s.add_argument("--no-mtp", dest="use_mtp", action="store_false", help="decode without the draft head")
+    s.add_argument("--mtp-fixed", action="store_true",
+                   help="draft --mtp-depth tokens every round, instead of as many as pay (up to it)")
     sub.add_parser("models", help="list configured and built-in models")
     p = sub.add_parser("pull", help="download the weights a model would load on this Mac, ahead of serving it")
     p.add_argument("model", help="configured or built-in model name, or Hugging Face repo id")
@@ -119,6 +121,8 @@ def main(argv=None):
         spec = dataclasses.replace(spec, mtp=str(Path(a.mtp).expanduser().resolve()))
     if a.mtp_depth is not None:
         spec = dataclasses.replace(spec, mtp_depth=a.mtp_depth)
+    if a.mtp_fixed:
+        spec = dataclasses.replace(spec, mtp_adaptive=False)
     if not a.use_mtp:
         spec = dataclasses.replace(spec, mtp=None)
     if spec.mtp and not Path(spec.mtp).is_file():

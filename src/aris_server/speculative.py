@@ -14,6 +14,7 @@ from one-token decode math, so greedy output can drift from plain decoding at ne
 from __future__ import annotations
 
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Protocol, Sequence
 
@@ -90,6 +91,95 @@ class SpeculativeStats:
         return (self.accepted + self.rounds) / self.rounds if self.rounds else 0.0
 
 
+class DepthControl:
+    """Each round's draft depth: the one expected to give the most tokens a second, so drafting runs where it pays.
+
+    How often each draft position is accepted changes with the text (an edit that copies, prose that doesn't), so it
+    is learned as generation runs, and what a round of each depth costs is measured as rounds of it run. Depth 0
+    decodes plainly. Every `explore` rounds it tries a depth next to its pick, alternately deeper and shallower, so it
+    notices when the text gets easier or harder. The first two rounds measure the starting depth and a plain step."""
+
+    def __init__(self, max_depth: int, *, start: int | None = None, explore: int = 16, decay: float = 0.95,
+                 prior: float = 0.7):
+        self.max_depth = max_depth
+        self.start = max_depth if start is None else min(start, max_depth)
+        self.explore, self.decay = explore, decay
+        self.accept = [prior] * max_depth  # P(draft i+1 is accepted | every draft before it was)
+        self.seen = [0] * max_depth  # rounds that tested each position
+        self.seconds: dict[int, float] = {}  # depth -> recent seconds a round
+        self.rounds = 0
+        self.picks: Counter = Counter()  # how often each depth was chosen
+
+    def rates(self) -> list[float]:
+        """Each position's acceptance. One not yet tested takes the deepest tested position's: acceptance usually
+        falls with depth, so that's optimistic, and the next rounds that reach it find out."""
+        out = []
+        for i, p in enumerate(self.accept):
+            out.append(p if self.seen[i] or not out else out[-1])
+        return out
+
+    def tokens(self, depth: int) -> float:
+        """Tokens a round of this depth is expected to add: the target's own, then each draft while all before held."""
+        expected = run = 1.0
+        for p in self.rates()[:depth]:
+            run *= p
+            expected += run
+        return expected
+
+    def cost(self, depth: int) -> float:
+        """Seconds a round of this depth takes: measured, or along the line through the nearest measured depths."""
+        if depth in self.seconds:
+            return self.seconds[depth]
+        known = sorted(self.seconds)
+        lower = [d for d in known if d < depth]
+        upper = [d for d in known if d > depth]
+        if lower and upper:
+            a, b = lower[-1], upper[0]
+        elif len(known) >= 2:
+            a, b = (known[-2], known[-1]) if lower else (known[0], known[1])
+        else:
+            return self.seconds[known[0]] * (1 + depth) / (1 + known[0])  # one measurement: cost grows with width
+        slope = (self.seconds[b] - self.seconds[a]) / (b - a)
+        return max(self.seconds[a] + slope * (depth - a), 1e-9)
+
+    def best(self, room: int) -> int:
+        limit = max(0, min(self.max_depth, room))
+        if not self.seconds:
+            return limit
+        return max(range(limit + 1), key=lambda d: (self.tokens(d) / self.cost(d), -d))
+
+    def choose(self, room: int) -> int:
+        """The depth for the next round, given `room`: how many drafts the token budget can still use."""
+        depth = self._choose(room)
+        self.picks[depth] += 1
+        return depth
+
+    def _choose(self, room: int) -> int:
+        limit = max(0, min(self.max_depth, room))
+        if self.rounds == 0:
+            return min(self.start, limit)
+        if self.rounds == 1 and 0 not in self.seconds:
+            return 0
+        pick = self.best(room)
+        if self.rounds % self.explore == 0:
+            step = 1 if (self.rounds // self.explore) % 2 else -1
+            if pick == 0:
+                step = 1
+            return min(max(pick + step, 0), limit)
+        return pick
+
+    def observe(self, depth: int, accepted: int, seconds: float) -> None:
+        """A round of `depth` drafts kept `accepted` of them and took `seconds`."""
+        self.rounds += 1
+        rates = self.rates()
+        for i in range(min(depth, accepted + 1)):  # after the first rejection, later positions weren't tested
+            start = self.accept[i] if self.seen[i] else rates[i]
+            self.accept[i] = self.decay * start + (1 - self.decay) * (1.0 if i < accepted else 0.0)
+            self.seen[i] += 1
+        old = self.seconds.get(depth)
+        self.seconds[depth] = seconds if old is None else 0.8 * old + 0.2 * seconds
+
+
 class Speculator(Protocol):
     """What one model brings to the loop. The target reads every token the loop sends it, in order; `commit` then
     keeps only what the loop chose."""
@@ -115,8 +205,9 @@ DraftHook = Callable[[int], Sequence[int]]
 def speculate(spec: Speculator, prompt: Sequence[int], *, max_tokens: int, depth: int,
               sampling: Sampling | None = None, processors: Sequence[Processor] = (), seed: int = 0,
               stop_tokens: Sequence[int] = (), prefill_step: int = 2048, drafter: DraftHook | None = None,
-              stats: SpeculativeStats | None = None) -> list[int]:
-    """Generate up to `max_tokens` tokens after `prompt` (batch size 1), drafting up to `depth` tokens a round."""
+              stats: SpeculativeStats | None = None, control: DepthControl | None = None) -> list[int]:
+    """Generate up to `max_tokens` tokens after `prompt` (batch size 1), drafting up to `depth` tokens a round, or as
+    many as `control` picks each round."""
     sampling = sampling or Sampling()
     stats = stats if stats is not None else SpeculativeStats()
     stop = set(stop_tokens)
@@ -137,7 +228,9 @@ def speculate(spec: Speculator, prompt: Sequence[int], *, max_tokens: int, depth
 
     while len(out) < max_tokens and token not in stop:
         # A round adds the accepted drafts and one token of the target's own, so drafting past the budget is waste.
-        want = min(depth, max_tokens - len(out) - 1)
+        room = max_tokens - len(out) - 1
+        want = control.choose(room) if control is not None else min(depth, room)
+        round_started = time.perf_counter()
         guesses = drafter(len(out)) if drafter is not None else spec.draft(token, want)
         if isinstance(guesses, mx.array):
             guesses = guesses[:want].astype(mx.int32)
@@ -175,6 +268,8 @@ def speculate(spec: Speculator, prompt: Sequence[int], *, max_tokens: int, depth
                 break
         # The target keeps the newest token and each accepted draft it read; the last chosen token is read next round.
         spec.commit(len(drafts) + 1, len(new))
+        if control is not None:
+            control.observe(len(drafts), accepted_now, time.perf_counter() - round_started)
 
         stats.rounds += 1
         stats.drafted += len(drafts)
