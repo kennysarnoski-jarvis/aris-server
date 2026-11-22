@@ -25,6 +25,7 @@ from mlx_lm.models.cache import (
     KVCache,
     LRUPromptCache,
     QuantizedKVCache,
+    RotatingKVCache,
     can_trim_prompt_cache,
 )
 
@@ -104,7 +105,7 @@ def _kept_alone(extract):
         copy would only hold its cache twice at the end of every turn."""
         caches = extract(self, idx)
         if len(self.uids) > 1:
-            for c in caches:
+            for c in _flat_caches(caches):
                 if isinstance(c, ArraysCache):
                     c.cache = [a if a is None else mx.contiguous(a) for a in c.cache]
             mx.eval([x for c in caches for _, x in tree_flatten(c.state) if isinstance(x, mx.array)])
@@ -296,6 +297,55 @@ def _flat_caches(caches):
             yield c
 
 
+_NOT_KEPT = "not kept"  # a layer cache whose state at a prompt's end can't be kept (see _end_state)
+
+
+def _end_state(c):
+    """What a layer's cache must keep from the end of a prompt to be put back there after it read on (see
+    _rebuild_diverged): nothing for attention, which cuts back to any token; a recurrent layer's arrays, which hold
+    only its latest state; a sliding window's last rows, which decode overwrites in its ring (168 MB for Inkling 2
+    Mini's 40 window visits); and each part of a CacheList."""
+    if isinstance(c, CacheList):
+        return [_end_state(x) for x in c.caches]
+    if isinstance(c, ArraysCache):
+        return list(c.cache)
+    if isinstance(c, RotatingKVCache):
+        if c.keep or c.keys is None:
+            return _NOT_KEPT
+        n = min(c.offset, c.max_size)
+        # Copied out, so neither later writes into the live ring nor a batch it is a view of reach it.
+        keys = mx.contiguous(c._temporal_order(c.keys)[..., -n:, :])
+        values = mx.contiguous(c._temporal_order(c.values)[..., -n:, :])
+        mx.eval(keys, values)
+        return keys, values, c.offset
+    return None
+
+
+def _can_put_back(c, state, n: int) -> bool:
+    """Whether _put_back can return this layer's cache to token n from its state there."""
+    if isinstance(c, CacheList):
+        return isinstance(state, list) and len(state) == len(c.caches) and all(
+            _can_put_back(x, s, n) for x, s in zip(c.caches, state))
+    if isinstance(c, ArraysCache):
+        return isinstance(state, list)
+    if isinstance(c, RotatingKVCache):
+        return isinstance(state, tuple) and state[2] == n
+    return state is None and hasattr(c, "trim") and getattr(c, "offset", -1) >= n
+
+
+def _put_back(c, state, n: int) -> None:
+    if isinstance(c, CacheList):
+        for x, s in zip(c.caches, state):
+            _put_back(x, s, n)
+    elif isinstance(c, ArraysCache):
+        c.cache = list(state)
+    elif isinstance(c, RotatingKVCache):
+        c.keys, c.values, c.offset = state
+        c._idx = c.keys.shape[2]  # in temporal order, as a multi-token read leaves it
+    else:
+        c.trim(c.offset - n)
+
+
 def choose_weights(spec: ModelSpec, limit: int) -> ModelSpec:
     """Of a model's weights, best first, the first that leaves `min_context` tokens of context on this Mac (or the
     model's whole context, if that is less); failing that, the one that leaves the most."""
@@ -474,8 +524,7 @@ class MovingPromptCache(LRUPromptCache):
             len(tokens) < len(p) and p[:len(tokens)] == list(tokens) for p in self.reading)
         if mid_request and len(tokens) >= self.light_min_tokens:
             # ~150 MB each for a 27B model: keep only what a request in flight or a conversation's latest turn needs.
-            self._prompt_state[tuple(tokens)] = [list(c.cache) if isinstance(c, ArraysCache) else None
-                                                 for c in prompt_cache]
+            self._prompt_state[tuple(tokens)] = [_end_state(c) for c in prompt_cache]
             while len(self._prompt_state) > MAX_KEPT_STATES:
                 self._prompt_state.pop(next(iter(self._prompt_state)))
         elif cache_type != "system":
@@ -557,8 +606,8 @@ class MovingPromptCache(LRUPromptCache):
             except Exception:  # noqa: BLE001  no longer cached: taken, evicted or dropped
                 self._turn_state.pop(entry_key, None)
                 continue
-            if not all(state is not None or hasattr(layer, "trim")
-                       for layer, state in zip(entry.prompt_cache, states)):
+            if len(states) != len(entry.prompt_cache) or not all(
+                    _can_put_back(layer, state, n) for layer, state in zip(entry.prompt_cache, states)):
                 continue  # a cache type that can't be cut back: the disk path covers it
             self._trie.taking = True
             try:
@@ -570,10 +619,7 @@ class MovingPromptCache(LRUPromptCache):
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
             self._turn_state.pop(entry_key, None)
             for layer, state in zip(entry.prompt_cache, states):
-                if state is not None:
-                    layer.cache = list(state)
-                else:
-                    layer.trim(layer.offset - n)
+                _put_back(layer, state, n)
             at = next((i for i, (a, b) in enumerate(zip(entry_key, key)) if a != b), n)
             logging.info("rebuilt a %d-token cache in memory from a %d-token turn whose history came back "
                          "tokenized differently at token %d%s", n, len(entry_key), at, self._show_divergence(
