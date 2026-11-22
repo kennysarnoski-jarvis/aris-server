@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from . import __version__
 from .config import ModelSpec, resolve
 from .engine import Engine
+from .mtp_serve import mtp_snapshot
 from .stream import MessageBuilder, new_id, progress_note, sse
 from .translate import RequestError, fit_context, parse_tools, plan
 
@@ -276,8 +277,14 @@ def _log(name, p, run, n, builder, reason, t0, engine=None):
     guarded = (f" stuck-call-reminder={p.stuck_repeats}" if p.stuck_repeats else "") + (
         f" loop-breaks={guard.breaks}{' LOOP-STOPPED' if guard.gave_up else ''}"
         if guard and (guard.breaks or guard.gave_up) else "")
-    logging.info("%s effort=%s prompt=%d cached=%d out=%d%s%s tools=%d stop=%s %.1fs (%.1f tok/s) %s", name,
-                 p.effort, run.prompt_tokens, run.cached_tokens, n, think, guarded, builder.tool_calls, reason, dt,
-                 n / dt if dt else 0, Engine.memory())
+    drafted = ""
+    if engine is not None and getattr(run, "mtp_start", None) is not None:
+        now = mtp_snapshot(engine.provider.model)
+        rounds, n_drafted, accepted = (b - a for a, b in zip(run.mtp_start, now))
+        if rounds:
+            drafted = f" mtp={accepted}/{n_drafted} ({(accepted + rounds) / rounds:.2f} tok/round)"
+    logging.info("%s effort=%s prompt=%d cached=%d out=%d%s%s%s tools=%d stop=%s %.1fs (%.1f tok/s) %s", name,
+                 p.effort, run.prompt_tokens, run.cached_tokens, n, think, guarded, drafted, builder.tool_calls,
+                 reason, dt, n / dt if dt else 0, Engine.memory())
     if engine is not None:
         engine.adapt_memory()

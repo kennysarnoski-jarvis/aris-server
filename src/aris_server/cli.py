@@ -51,6 +51,11 @@ def main(argv=None):
     s.add_argument("--no-guards", dest="guards", action="store_false",
                    help="turn off the loop guards: no reminder when the model repeats one tool call, no steering when "
                         "a response loops")
+    s.add_argument("--mtp", help="MTP head (safetensors of mtp.* tensors) for speculative decoding; overrides the "
+                                 "model's mtp")
+    s.add_argument("--mtp-depth", type=int, choices=range(0, 5), metavar="0-4",
+                   help="tokens the MTP head drafts per round (0 turns drafting off)")
+    s.add_argument("--no-mtp", dest="use_mtp", action="store_false", help="decode without the MTP head")
     sub.add_parser("models", help="list configured and built-in models")
     p = sub.add_parser("pull", help="download the weights a model would load on this Mac, ahead of serving it")
     p.add_argument("model", help="configured or built-in model name, or Hugging Face repo id")
@@ -109,6 +114,15 @@ def main(argv=None):
         spec = dataclasses.replace(spec, kv_bits=None if a.kv_bits == 16 else a.kv_bits)
     if spec.adapter and not (Path(spec.adapter) / "adapter_config.json").is_file():
         print(f"no adapter_config.json in {spec.adapter}", file=sys.stderr)
+        return 2
+    if a.mtp:
+        spec = dataclasses.replace(spec, mtp=str(Path(a.mtp).expanduser().resolve()))
+    if a.mtp_depth is not None:
+        spec = dataclasses.replace(spec, mtp_depth=a.mtp_depth)
+    if not a.use_mtp:
+        spec = dataclasses.replace(spec, mtp=None)
+    if spec.mtp and not Path(spec.mtp).is_file():
+        print(f"no MTP head at {spec.mtp}", file=sys.stderr)
         return 2
     try:
         # Before loading, and for a Hugging Face repo before downloading: a model this Mac can't hold would swap it to

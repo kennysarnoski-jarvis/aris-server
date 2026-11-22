@@ -24,9 +24,11 @@ MIN_TOKENS = 1024  # shorter prompts are quick to re-read
 LOCK = "lock"      # shared by each server using the folder, exclusive for one clearing it
 
 
-def model_id(model_path: str, adapter: str | None = None, kv_bits: int | None = None) -> str:
-    """Caches are only valid for the exact weights that made them (the base model and any adapter on it) and for the
-    precision of the KV cache they hold."""
+def model_id(model_path: str, adapter: str | None = None, kv_bits: int | None = None, mtp: str | None = None,
+             mtp_bits: int = 0) -> str:
+    """Caches are only valid for the exact weights that made them (the base model and any adapter on it), for the
+    precision of the KV cache they hold, and for the MTP head whose rows they carry (a cache made with a head has two
+    more slots than one made without)."""
     parts = []
     for folder in (model_path, adapter):
         if folder is None:
@@ -37,6 +39,10 @@ def model_id(model_path: str, adapter: str | None = None, kv_bits: int | None = 
             parts += [f"{p.name}:{p.stat().st_size}:{int(p.stat().st_mtime)}" for p in sorted(path.glob("*.safetensors"))]
     if kv_bits:
         parts.append(f"kv_bits={kv_bits}")
+    if mtp:
+        p = Path(mtp)
+        stamp = f"{p.stat().st_size}:{int(p.stat().st_mtime)}" if p.is_file() else "missing"
+        parts.append(f"mtp={p}:{stamp}:bits={mtp_bits}")
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
@@ -83,9 +89,9 @@ def _remove(data: Path):
 
 class DiskCache:
     def __init__(self, root: Path, model_path: str, max_bytes: int, adapter: str | None = None,
-                 kv_bits: int | None = None):
+                 kv_bits: int | None = None, mtp: str | None = None, mtp_bits: int = 0):
         self.root = root
-        self.dir = root / model_id(model_path, adapter, kv_bits)
+        self.dir = root / model_id(model_path, adapter, kv_bits, mtp, mtp_bits)
         self.max_bytes = max_bytes
         self._lock = self._hold()
         self.index: dict[Path, tuple[tuple[int, ...], str]] = {}

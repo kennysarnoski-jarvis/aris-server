@@ -32,6 +32,7 @@ from .config import ModelSpec, home
 from .disk_cache import DiskCache
 from .guards import LoopGuard, loop_exempt_ids
 from .kv_quant import BatchQuantizedKVCache, kv_bytes_per_token, quantize_kv
+from .mtp_serve import mtp_snapshot
 from .translate import Plan
 
 
@@ -770,6 +771,16 @@ def merge_prompt_tail(tokenized):
     return prompt, segments, types, initial_state, vision
 
 
+def model_bytes(model) -> int:
+    """Bytes of a loaded model's weights, with its MTP head if one is attached (kept beside the model's own
+    parameters, so they don't count it)."""
+    total = sum(v.nbytes for _, v in tree_flatten(model.parameters()))
+    head = getattr(model, "_mtp_head", None)
+    if head is not None:
+        total += sum(v.nbytes for _, v in tree_flatten(head.parameters()))
+    return total
+
+
 @dataclass
 class Piece:
     state: str          # "reasoning" | "normal" | "tool"
@@ -785,6 +796,7 @@ class Run:
     stop: Callable[[], None]
     budget: list         # [ThinkBudget] once generation has started, if a budget applies
     guard: list = field(default_factory=list)  # [LoopGuard] once generation has started, unless guards are off
+    mtp_start: tuple | None = None  # MTP (rounds, drafted, accepted) when the request began, with an MTP head
 
 
 class Engine:
@@ -802,6 +814,7 @@ class Engine:
             kv_group_size=64, quantized_kv_start=DEFAULT_QUANTIZED_KV_START, pipeline=False, allowed_origins=["*"],
         )
         self.provider = mls.ModelProvider(ns)
+        self.provider._mtp_spec = spec if spec.mtp else None  # mtp_serve attaches the head on the loading thread
         cache = MovingPromptCache(prompt_cache_size, prompt_cache_bytes or (1 << 63))
         # The generator thread loads the model, so all MLX work stays on one thread and stream.
         self.generator = mls.ResponseGenerator(self.provider, cache)
@@ -820,7 +833,12 @@ class Engine:
                 raise RuntimeError(f"could not load {spec.path}")
             time.sleep(0.2)
         self.tokenizer = self.provider.tokenizer
-        if spec.kv_bits:  # before any request makes a cache
+        # mlx-lm sets the tokenizer as it finishes loading; the MTP head is attached right after, on that thread.
+        while spec.mtp and getattr(self.provider.model, "_mtp_head", None) is None:
+            if not self.generator.generation_available():
+                raise RuntimeError(f"could not load the MTP head {spec.mtp}")
+            time.sleep(0.1)
+        if spec.kv_bits:  # before any request makes a cache, and after the MTP head adds its cache slot
             quantize_kv(self.provider.model, spec.kv_bits)
         layers = self.provider.model.make_cache()
         if any(isinstance(c, ArraysCache) for c in layers) and all(
@@ -840,7 +858,8 @@ class Engine:
             raise
         self._fit_memory(cache, ns, prompt_cache_bytes, reserve_gb)
         if disk_cache_gb > 0:
-            disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)), spec.adapter, spec.kv_bits)
+            disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)), spec.adapter, spec.kv_bits,
+                             spec.mtp, spec.mtp_bits)
             key = self.provider.model_key
             restored = disk.restore(lambda t, c, kind: LRUPromptCache.insert_cache(cache, key, t, c, cache_type=kind),
                                     cache.max_bytes)
@@ -848,10 +867,11 @@ class Engine:
             if restored:
                 logging.info("restored %.1f GB of prompt caches from disk", restored / (1 << 30))
         threading.Thread(target=self._watch, daemon=True).start()
-        logging.info("loaded %s%s (thinking=%s, tools=%s, think-end id=%s, KV cache %s)", spec.path,
+        logging.info("loaded %s%s (thinking=%s, tools=%s, think-end id=%s, KV cache %s%s)", spec.path,
                      f" + adapter {spec.adapter}" if spec.adapter else "", self.tokenizer.has_thinking,
                      self.tokenizer.has_tool_calling, self.budget_tokens.end_id,
-                     f"{spec.kv_bits}-bit" if spec.kv_bits else "full precision")
+                     f"{spec.kv_bits}-bit" if spec.kv_bits else "full precision",
+                     f", MTP head {spec.mtp} ({spec.mtp_bits or 16}-bit, {spec.mtp_depth} drafts)" if spec.mtp else "")
 
     def _kv_bytes_per_token(self) -> int | None:
         try:
@@ -867,7 +887,7 @@ class Engine:
     def _context_that_fits(self) -> int | None:
         """A context limit this machine can hold. Past it the server answers "prompt is too long" (Claude Code then
         compacts the conversation) instead of running out of memory mid-turn."""
-        weights = sum(v.nbytes for _, v in tree_flatten(self.provider.model.parameters()))
+        weights = model_bytes(self.provider.model)
         limit = mx.device_info()["max_recommended_working_set_size"]
         per_token = self._kv_bytes_per_token()
         if per_token is None:
@@ -884,7 +904,7 @@ class Engine:
         """Size the prompt cache and MLX's buffer pool to what the GPU can hold beside the weights: unbounded,
         saved prompt caches and freed buffers grow until Metal runs out of memory mid-generation."""
         gb = 1 << 30
-        weights = sum(v.nbytes for _, v in tree_flatten(self.provider.model.parameters()))
+        weights = model_bytes(self.provider.model)
         limit = mx.device_info()["max_recommended_working_set_size"]
         spare = limit - weights - int(reserve_gb * gb)
         # The cap covers saved caches plus the caches active sequences hold (mlx-lm trims the LRU to the cap minus the
@@ -968,7 +988,8 @@ class Engine:
                 self.cache.reading = [p for p in self.cache.reading if p != ctx.prompt]
 
         return Run(prompt_tokens=len(ctx.prompt), cached_tokens=max(ctx.prompt_cache_count, 0),
-                   tool_parser=ctx.tool_parser, pieces=pieces(), stop=ctx.stop, budget=budget, guard=guard)
+                   tool_parser=ctx.tool_parser, pieces=pieces(), stop=ctx.stop, budget=budget, guard=guard,
+                   mtp_start=mtp_snapshot(self.provider.model))
 
 
 def _classify(ctx, responses, gave_up: Callable[[], bool] = lambda: False):

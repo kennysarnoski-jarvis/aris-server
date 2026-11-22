@@ -7,6 +7,7 @@ from pathlib import Path
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 KV_BITS_CHOICES = (4, 8)
+MAX_MTP_DEPTH = 4  # drafts per round; acceptance compounds downward, and past 3 the extra drafts rarely survive
 DEFAULT_THINK_BUDGET = {"low": 1024, "medium": 4096, "high": 8192, "xhigh": 16384, "max": 0}
 
 
@@ -44,6 +45,11 @@ class ModelSpec:
     temperature: float = 0.6
     top_p: float = 0.95
     top_k: int = 20
+    # An MTP head (a safetensors file of `mtp.*` tensors, as Qwen3.8-27B ships) for speculative decoding: it drafts
+    # `mtp_depth` tokens ahead and one trunk pass checks them. `mtp_bits` quantizes its linear layers (0 keeps them).
+    mtp: str | None = None
+    mtp_depth: int = 2
+    mtp_bits: int = 8
 
     def budget_for(self, effort: str) -> int:
         return int(self.think_budget.get(effort, DEFAULT_THINK_BUDGET.get(effort, 0)))
@@ -88,6 +94,10 @@ def _spec(name: str, raw: dict, where: str) -> ModelSpec:
     budget.update(raw.get("think_budget") or {})
     if raw.get("kv_bits") not in (None, *KV_BITS_CHOICES):
         raise ValueError(f"{where}: kv_bits must be one of {KV_BITS_CHOICES}")
+    if not isinstance(raw.get("mtp_depth", 2), int) or not 0 <= raw.get("mtp_depth", 2) <= MAX_MTP_DEPTH:
+        raise ValueError(f"{where}: mtp_depth must be a whole number from 0 to {MAX_MTP_DEPTH}")
+    if raw.get("mtp_bits", 8) not in (0, 4, 8):
+        raise ValueError(f"{where}: mtp_bits must be 0 (unquantized), 4 or 8")
     return ModelSpec(
         name=name,
         path=paths[0],
@@ -100,7 +110,9 @@ def _spec(name: str, raw: dict, where: str) -> ModelSpec:
         effort_map=dict(raw.get("effort_map") or {}),
         think_budget=budget,
         template_kwargs=dict(raw.get("template_kwargs") or {}),
-        **{k: raw[k] for k in ("temperature", "top_p", "top_k", "followup_budget") if k in raw},
+        mtp=str(Path(raw["mtp"]).expanduser()) if raw.get("mtp") else None,
+        **{k: raw[k] for k in ("temperature", "top_p", "top_k", "followup_budget", "mtp_depth", "mtp_bits")
+           if k in raw},
     )
 
 
