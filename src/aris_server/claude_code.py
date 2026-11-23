@@ -15,6 +15,16 @@ import urllib.request
 # small window, and where it always does on a large one. Aris Code's Aris Local tells it the same.
 COMPACT_RESERVE = 33_000
 COMPACT_AT_SHARE = 0.8
+# What would send Claude Code somewhere other than the server (Anthropic's API, Bedrock, Vertex, Foundry) or hand it
+# another account's credentials. Aris Code's Aris Local leaves out the same.
+ROUTING_VARIABLES = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+                     "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID",
+                     "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                     "CLAUDE_CODE_USE_FOUNDRY")
+# The models Claude Code asks for: its own, its background work's (titles, summaries) and its subagents'. The server
+# runs one model and refuses a request that names another it knows, so each names the loaded one.
+MODEL_VARIABLES = ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                   "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL")
 
 
 def claude_code_window(window: int) -> int:
@@ -30,11 +40,11 @@ def served_model(base_url: str, api_key: str, timeout: float = 5.0) -> tuple[str
     return first["id"], first.get("context_window")
 
 
-def environment(base_url: str, api_key: str, window: int | None, env: dict[str, str]) -> dict[str, str]:
-    """Claude Code's environment, pointed at the server. A window the user set stays theirs. A key for Anthropic's API
-    is left out, so Claude Code doesn't send it to the server."""
-    env = {k: v for k, v in env.items() if k != "ANTHROPIC_API_KEY"}
-    env.update(ANTHROPIC_BASE_URL=base_url, ANTHROPIC_AUTH_TOKEN=api_key)
+def environment(base_url: str, api_key: str, model: str, window: int | None, env: dict[str, str]) -> dict[str, str]:
+    """Claude Code's environment, on the server and its loaded model whatever the shell routes it to, without a key
+    for Anthropic's API (or it would go to the server). A window the user set stays theirs."""
+    env = {k: v for k, v in env.items() if k not in ROUTING_VARIABLES}
+    env.update(ANTHROPIC_BASE_URL=base_url, ANTHROPIC_AUTH_TOKEN=api_key, **dict.fromkeys(MODEL_VARIABLES, model))
     if window and "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in env:
         env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(claude_code_window(window))
     return env
@@ -64,5 +74,5 @@ def launch(host: str, port: int, api_key: str | None, args: list[str]) -> int:
         return 2
     print(f"Claude Code on {name}" + (f", with {window:,} tokens of context on this Mac" if window else ""),
           file=sys.stderr)
-    os.execve(claude, [claude, *args], environment(base_url, key, window, dict(os.environ)))
+    os.execve(claude, [claude, *args], environment(base_url, key, name, window, dict(os.environ)))
     return 0  # only where execve is stubbed out, as in the tests

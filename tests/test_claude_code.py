@@ -20,19 +20,29 @@ def test_claude_code_compacts_at_80_percent_of_a_small_window_and_33k_short_of_a
     assert claude_code.claude_code_window(200_000) - claude_code.COMPACT_RESERVE == 167_000
 
 
+MODELS = dict.fromkeys(("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                        "CLAUDE_CODE_SUBAGENT_MODEL"), "aris-3.8-27b")
+
+
 def test_claude_code_is_pointed_at_the_server_and_keeps_a_window_the_user_set():
-    env = claude_code.environment("http://127.0.0.1:8484", "local", 100_352, {"PATH": "/bin"})
+    env = claude_code.environment("http://127.0.0.1:8484", "local", "aris-3.8-27b", 100_352, {"PATH": "/bin"})
     assert env == {"PATH": "/bin", "ANTHROPIC_BASE_URL": "http://127.0.0.1:8484", "ANTHROPIC_AUTH_TOKEN": "local",
-                   "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "113281"}
-    mine = claude_code.environment("http://h:1", "k", 100_352, {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "90000"})
+                   "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "113281", **MODELS}
+    mine = claude_code.environment("http://h:1", "k", "m", 100_352, {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "90000"})
     assert mine["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "90000"
-    unsized = claude_code.environment("http://h:1", "k", None, {})
+    unsized = claude_code.environment("http://h:1", "k", "m", None, {})
     assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in unsized
 
 
-def test_a_key_for_anthropics_api_is_not_sent_to_the_server():
-    env = claude_code.environment("http://127.0.0.1:8484", "local", None, {"ANTHROPIC_API_KEY": "sk-ant-real"})
-    assert "ANTHROPIC_API_KEY" not in env and env["ANTHROPIC_AUTH_TOKEN"] == "local"
+def test_claude_code_stays_on_the_server_whatever_the_shell_routes_it_to():
+    shell = {"ANTHROPIC_API_KEY": "sk-ant-real", "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_USE_VERTEX": "1",
+             "CLAUDE_CODE_USE_FOUNDRY": "1", "ANTHROPIC_VERTEX_PROJECT_ID": "p", "CLAUDE_CODE_OAUTH_TOKEN": "t",
+             "ANTHROPIC_CUSTOM_HEADERS": "x-team: a", "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+             "ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_DEFAULT_HAIKU_MODEL": "inkling-2-mini", "HOME": "/h"}
+    env = claude_code.environment("http://127.0.0.1:8484", "local", "aris-3.8-27b", None, shell)
+    assert env == {"HOME": "/h", "ANTHROPIC_BASE_URL": "http://127.0.0.1:8484", "ANTHROPIC_AUTH_TOKEN": "local",
+                   **MODELS}
 
 
 class _Models(BaseHTTPRequestHandler):
@@ -89,6 +99,7 @@ def test_claude_code_starts_on_the_loaded_model_with_its_own_arguments(server, c
     assert file == path and argv == [path, "-p", "fix the failing test", "--continue"]
     assert env["ANTHROPIC_BASE_URL"] == f"http://127.0.0.1:{port}" and env["ANTHROPIC_AUTH_TOKEN"] == "local"
     assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "113281" and "ANTHROPIC_API_KEY" not in env
+    assert env["ANTHROPIC_MODEL"] == env["CLAUDE_CODE_SUBAGENT_MODEL"] == "aris-3.8-27b"
     assert handler.keys == ["local"]
     assert "Claude Code on aris-3.8-27b, with 100,352 tokens of context on this Mac" in capsys.readouterr().err
 

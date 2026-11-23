@@ -31,7 +31,10 @@ aris-server claude
 ```
 
 `aris-server claude` starts Claude Code on the model the server has loaded, told the context window to compact by
-(below). Claude Code's own arguments go after it, as in `aris-server claude --continue`.
+(below). Its background work and subagents run on that model too, and a shell set up for Anthropic's API, Bedrock or
+Vertex doesn't send it there. Claude Code's own arguments go after it, as in `aris-server claude --continue`. Claude
+Code's own traffic, such as its update checks and telemetry, is Claude Code's setting:
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` turns it off.
 
 Any other model mlx-lm can load works too, by its Hugging Face name or a local folder:
 `aris-server serve --model mlx-community/Qwen3.5-9B-MLX-8bit`.
