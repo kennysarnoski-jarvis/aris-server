@@ -162,3 +162,51 @@ def test_a_head_that_cant_be_fetched_leaves_the_model_serving_without_it(monkeyp
     assert heads.ready(local) is local  # a local file is the caller's to check
     hub.cached_files = {(ARIS_HEAD, "mtp.safetensors")}
     assert heads.ready(spec).mtp == str(tmp_path / "mtp.safetensors")  # the cached copy, offline too
+
+
+def test_models_json_says_what_this_mac_would_load_and_what_is_downloaded(monkeypatch, tmp_path):
+    from aris_server.config import resolve
+    from aris_server.pull import describe
+
+    hub = FakeHub(monkeypatch, tmp_path, {Q8: arete_repo(26.6), Q4: arete_repo(15.1),
+                                         ARIS_HEAD: {"mtp.safetensors": 849_400_563}})
+    spec = resolve("aris-3.8-27b", {})
+    got = describe(spec, int(37.4 * GB), built_in=True)  # a 48 GB Mac: the 8-bit, beside its head
+    assert (got["name"], got["built_in"], got["path"], got["bytes"]) == ("aris-3.8-27b", True, Q8, int(26.6 * GB))
+    assert 32768 < got["context"] < describe(replace(spec, mtp=None), int(37.4 * GB), built_in=True)["context"]
+    assert (got["downloaded"], got["head"], got["head_bytes"], got["head_downloaded"]) == (
+        False, spec.mtp, 849_400_563, False)
+    loading_reads = [f for f in arete_repo(26.6) if f.endswith((".json", ".safetensors"))]
+    hub.cached_files = {(Q8, f) for f in loading_reads[:-1]}  # all but one file: not downloaded yet
+    assert describe(spec, int(37.4 * GB), built_in=True)["downloaded"] is False
+    hub.cached_files = {(Q8, f) for f in loading_reads} | {(ARIS_HEAD, "mtp.safetensors")}
+    got = describe(spec, int(37.4 * GB), built_in=True)
+    assert got["downloaded"] is True and got["head_downloaded"] is True
+    assert describe(spec, int(21.3 * GB), built_in=True)["path"] == Q4  # a 32 GB Mac picks the 4-bit
+
+
+def test_a_local_model_without_a_head_is_listed_as_on_disk(monkeypatch, tmp_path):
+    from aris_server.pull import describe
+
+    FakeHub(monkeypatch, tmp_path, {})
+    folder = tmp_path / "model"
+    folder.mkdir()
+    (folder / "config.json").write_text(json.dumps(arete_config()))
+    with open(folder / "model.safetensors", "wb") as f:
+        f.truncate(int(15.1 * GB))
+    got = describe(ModelSpec(name="mine", path=str(folder), kv_bits=8), int(37.4 * GB), built_in=False)
+    assert (got["downloaded"], got["bytes"], got["head"], got["head_downloaded"]) == (True, int(15.1 * GB), None, None)
+
+
+def test_the_models_command_prints_json_for_apps(monkeypatch, tmp_path, capsys):
+    import mlx.core as mx
+
+    from aris_server import cli
+
+    FakeHub(monkeypatch, tmp_path, {Q8: arete_repo(26.6), Q4: arete_repo(15.1)})
+    monkeypatch.setenv("ARIS_SERVER_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(mx, "device_info", lambda: {"max_recommended_working_set_size": int(37.4 * GB)})
+    assert cli.main(["models", "--json"]) == 0
+    listed = json.loads(capsys.readouterr().out)["models"]
+    assert [m["name"] for m in listed] == ["aris-3.8-27b", "inkling-2-mini"]
+    assert listed[0]["path"] == Q8 and listed[0]["downloaded"] is False and listed[1]["bytes"] is None  # unknown here

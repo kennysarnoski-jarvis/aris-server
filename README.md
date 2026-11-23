@@ -179,7 +179,8 @@ aris-server service uninstall
 ```
 
 `aris-server pull --json` reports each step of a download as a JSON line, for apps that set the
-server up for their users. `aris-server models` lists configured and built-in models.
+server up for their users. `aris-server models` lists configured and built-in models, and with `--json`, for each one,
+the weights this Mac would load, their size and context, and whether they and the model's draft head are downloaded.
 
 The service starts at login and restarts the server within seconds of any exit (it exits on purpose
 if the GPU runs out of memory). Saved prompt caches mean the conversation picks up where it left off;

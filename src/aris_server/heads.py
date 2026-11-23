@@ -27,6 +27,14 @@ def _cached(repo: str, name: str) -> str | None:
     return found if isinstance(found, str) else None
 
 
+def on_disk(ref: str | None) -> bool:
+    """Whether the head is here already: a local file that exists, or a repo's file in the Hub's cache."""
+    if not ref:
+        return False
+    where = hub_file(ref)
+    return _cached(*where) is not None if where else Path(ref).expanduser().is_file()
+
+
 def head_bytes(ref: str | None) -> int:
     """The head file's size, known before it loads or downloads: a local file's, or the Hub's listing of its repo (or
     the cached copy's, when the Hub can't be reached). 0 for no head, or when nothing can say."""

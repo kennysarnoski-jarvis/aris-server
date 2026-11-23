@@ -81,6 +81,42 @@ def _gb(n: int) -> str:
     return f"{n / 1e9:.1f} GB"
 
 
+def downloaded(path: str) -> bool:
+    """Whether the weights at `path` are on disk: a local folder, or every file loading reads from a Hugging Face repo
+    in the Hub's cache (judged from the cache alone when the Hub can't be reached)."""
+    import huggingface_hub
+
+    from .engine import hub_info
+
+    if Path(path).is_dir():
+        return True
+    if (info := hub_info(path)) is None:
+        try:
+            huggingface_hub.snapshot_download(path, local_files_only=True, allow_patterns=DEFAULT_ALLOW_PATTERNS)
+            return True
+        except Exception:  # noqa: BLE001  not in the cache
+            return False
+    files = [s.rfilename for s in info.siblings or [] if any(fnmatch.fnmatch(s.rfilename, p)
+                                                               for p in DEFAULT_ALLOW_PATTERNS)]
+    return bool(files) and all(isinstance(huggingface_hub.try_to_load_from_cache(path, f, revision=info.sha), str)
+                               for f in files)
+
+
+def describe(spec: ModelSpec, limit: int, *, built_in: bool) -> dict:
+    """What `aris-server models --json` says of a model, for apps that offer models to choose from: the weights this
+    Mac would load (as `pull` and `serve` choose them), their size, the context they leave beside the model's draft
+    head, and whether the weights and the head are downloaded already. Sizes are None when nothing can say."""
+    from .engine import choose_weights, context_before_loading, weights_and_config
+
+    chosen = choose_weights(spec, limit)
+    sized = weights_and_config(chosen.path, chosen.adapter)
+    return {"name": spec.name, "built_in": built_in, "path": chosen.path, "bytes": sized[0] if sized else None,
+            "context": context_before_loading(chosen.path, chosen.adapter, chosen.kv_bits, limit, chosen),
+            "downloaded": downloaded(chosen.path), "head": chosen.mtp,
+            "head_bytes": heads.head_bytes(chosen.mtp) if chosen.mtp else None,
+            "head_downloaded": heads.on_disk(chosen.mtp) if chosen.mtp else None}
+
+
 def pull(spec: ModelSpec, limit: int, as_json: bool = False, out=None) -> int:
     """Choose `spec`'s weights for a Mac whose GPU can use `limit` bytes, and download them. 0 when they are on disk,
     1 when they can't be found or downloaded, 2 when they don't fit this Mac."""

@@ -2,6 +2,7 @@
 
 import argparse
 import dataclasses
+import json
 import logging
 import signal
 import sys
@@ -60,7 +61,9 @@ def main(argv=None):
                    help="an MTP head's drafts go through a copy of the output layer at these bits (0: the model's)")
     s.add_argument("--mtp-fixed", action="store_true",
                    help="draft --mtp-depth tokens every round, instead of as many as pay (up to it)")
-    sub.add_parser("models", help="list configured and built-in models")
+    m = sub.add_parser("models", help="list configured and built-in models")
+    m.add_argument("--json", action="store_true", help="for apps: for each model, the weights this Mac would load, "
+                   "their size and context, and whether they and the draft head are downloaded")
     p = sub.add_parser("pull", help="download the weights a model would load on this Mac, ahead of serving it")
     p.add_argument("model", help="configured or built-in model name, or Hugging Face repo id")
     p.add_argument("--json", action="store_true", help="report each step as a JSON line on stdout, for apps")
@@ -77,6 +80,19 @@ def main(argv=None):
         return service.uninstall() if a.action == "uninstall" else service.status()
 
     models = load_models()
+    if a.cmd == "models" and a.json:
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")  # stdout is the JSON
+        _quiet_dependencies(logging.WARNING)
+        import mlx.core as mx
+
+        from .pull import describe
+
+        limit = mx.device_info()["max_recommended_working_set_size"]
+        listed = [describe(spec, limit, built_in=False) for spec in models.values()]
+        listed += [describe(spec, limit, built_in=True) for name, spec in builtin_models().items()
+                   if name not in models]
+        print(json.dumps({"models": listed}))
+        return 0
     if a.cmd == "models":
         if not models:
             print(f"no models configured in {home() / 'models.toml'}")
