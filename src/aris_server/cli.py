@@ -7,7 +7,7 @@ import signal
 import sys
 from pathlib import Path
 
-from . import __version__
+from . import __version__, heads
 from .config import builtin_models, home, load_models, resolve
 
 
@@ -52,7 +52,7 @@ def main(argv=None):
                    help="turn off the loop guards: no reminder when the model repeats one tool call, no steering when "
                         "a response loops")
     s.add_argument("--mtp", help="draft head for speculative decoding (Qwen3.8-27B's mtp.* tensors, or Inkling 2's "
-                                 "mtp.safetensors); overrides the model's mtp")
+                                 "mtp.safetensors), a file or owner/repo:file on the Hub; overrides the model's mtp")
     s.add_argument("--mtp-depth", type=int, choices=range(0, 8), metavar="0-7",
                    help="tokens the draft head drafts per round (0 turns drafting off)")
     s.add_argument("--no-mtp", dest="use_mtp", action="store_false", help="decode without the draft head")
@@ -120,7 +120,8 @@ def main(argv=None):
         print(f"no adapter_config.json in {spec.adapter}", file=sys.stderr)
         return 2
     if a.mtp:
-        spec = dataclasses.replace(spec, mtp=str(Path(a.mtp).expanduser().resolve()))
+        local = not heads.hub_file(a.mtp)
+        spec = dataclasses.replace(spec, mtp=str(Path(a.mtp).expanduser().resolve()) if local else a.mtp)
     if a.mtp_depth is not None:
         spec = dataclasses.replace(spec, mtp_depth=a.mtp_depth)
     if a.mtp_fixed:
@@ -129,6 +130,12 @@ def main(argv=None):
         spec = dataclasses.replace(spec, mtp_draft_bits=a.mtp_draft_bits)
     if not a.use_mtp:
         spec = dataclasses.replace(spec, mtp=None)
+    if spec.mtp and heads.hub_file(spec.mtp):
+        try:
+            spec = dataclasses.replace(spec, mtp=heads.local_head(spec.mtp))  # from the Hub's cache, or downloaded
+        except Exception as e:  # noqa: BLE001  offline with no cached copy, a repo or file that moved
+            print(f"could not get the draft head {spec.mtp}: {e}", file=sys.stderr)
+            return 2
     if spec.mtp and not Path(spec.mtp).is_file():
         print(f"no draft head at {spec.mtp}", file=sys.stderr)
         return 2
@@ -138,7 +145,7 @@ def main(argv=None):
         limit = mx.device_info()["max_recommended_working_set_size"]
         spec = choose_weights(spec, limit)
         if (sized := weights_and_config(spec.path, spec.adapter)) is not None:
-            check_memory(name, limit, sized[0])
+            check_memory(name, limit, sized[0] + heads.extra_bytes(spec, sized[1]))
         engine = Engine(spec, decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
                         disk_cache_gb=a.disk_cache_gb, guards=a.guards,
                         prompt_cache_bytes=int(a.prompt_cache_gb * (1 << 30)) if a.prompt_cache_gb else None)

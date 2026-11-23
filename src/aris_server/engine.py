@@ -29,6 +29,7 @@ from mlx_lm.models.cache import (
     can_trim_prompt_cache,
 )
 
+from . import heads as draft_heads
 from . import inkling
 from . import models as _models
 from .budget import BudgetTokens, ThinkBudget
@@ -257,13 +258,15 @@ def weights_and_config(path: str, adapter: str | None = None) -> tuple[int, dict
     return hub[0] + extra, hub[1]
 
 
-def context_before_loading(path: str, adapter: str | None, kv_bits: int | None, limit: int) -> int | None:
-    """Tokens of context the weights in `path` would leave on this Mac, known before they load (or download). None
-    for weights that can't be sized: see weights_and_config."""
+def context_before_loading(path: str, adapter: str | None, kv_bits: int | None, limit: int,
+                           spec: ModelSpec | None = None) -> int | None:
+    """Tokens of context the weights in `path` would leave on this Mac, known before they load (or download), beside
+    `spec`'s draft head when it has one. None for weights that can't be sized: see weights_and_config."""
     sized = weights_and_config(path, adapter)
     if sized is None:
         return None
     weights, config = sized
+    weights += draft_heads.extra_bytes(spec, config) if spec is not None else 0
     text, heads, head_dim = _kv_shape(config)
     layers = full_attention_layers(text)
     return context_that_fits(limit, weights, kv_bytes_per_token(layers, heads, head_dim, kv_bits), CONTEXT_OVERHEAD)
@@ -351,7 +354,7 @@ def choose_weights(spec: ModelSpec, limit: int) -> ModelSpec:
     model's whole context, if that is less); failing that, the one that leaves the most."""
     if not spec.choices:
         return spec
-    fits = {p: context_before_loading(p, spec.adapter, spec.kv_bits, limit) for p in spec.choices}
+    fits = {p: context_before_loading(p, spec.adapter, spec.kv_bits, limit, spec) for p in spec.choices}
     want = min(spec.min_context, spec.context or spec.min_context)
     sized = [p for p in spec.choices if fits[p] is not None]
     # Among weights that leave the same (no context at all, say), the later ones are the smaller.

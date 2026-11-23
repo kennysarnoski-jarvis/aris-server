@@ -121,7 +121,8 @@ weights, with about 63k.
 Some models ship a small head that guesses the next few tokens. The model checks the guesses in one pass, which costs
 about as much as writing one token, and keeps each one it agrees with, so the output is still the model's own. Aris
 Server runs two kinds: the MTP head of Qwen3.8-27B (which Arete-27B and Aris 3.8-27B are trained from) and Inkling 2's
-own draft head. Point `mtp` at the head's weights:
+own draft head. Point `mtp` at the head's weights: a file, or a file in a Hugging Face repo written `owner/repo:file`,
+which downloads into the Hub's cache like the model's weights (`aris-server pull` fetches it with them):
 
 ```toml
 [models."arete:27b"]
@@ -130,8 +131,8 @@ mtp = "~/models/qwen3.8-27b-mtp.safetensors"  # the mtp.* tensors of Qwen3.8-27B
 mtp_depth = 3
 
 [models."inkling-2-mini"]
-mtp = "~/models/inkling-2-mini-mtp/mtp.safetensors"  # from thinkingmachines/Inkling-2-Mini
-mtp_depth = 3
+mtp = "thinkingmachines/Inkling-2-Mini:mtp.safetensors"  # Inkling 2's own, from its official repo
+mtp_depth = 7
 ```
 
 `mtp_depth` is the most tokens a round guesses. Each round guesses as many as pay there, learned as the reply goes,

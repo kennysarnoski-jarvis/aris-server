@@ -16,6 +16,14 @@ def arete_config():
                             "num_key_value_heads": 4, "head_dim": 256, "hidden_size": 5120}}
 
 
+class _Silent:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def update(self, n=1):
+        pass
+
+
 class FakeHub:
     """The parts of huggingface_hub the server uses, for repos given as {repo: {file: size}}. `cached` maps a repo to
     a local snapshot folder, as the cache would have it after a download."""
@@ -54,6 +62,7 @@ class FakeHub:
                 raise ConnectionError(hub.fail)
             wanted = {f: s for f, s in hub.repos[repo].items()
                       if not allow_patterns or any(fnmatch.fnmatch(f, p) for p in allow_patterns)}
+            tqdm_class = tqdm_class or _Silent  # huggingface_hub draws its own bars when given none
             # Progress as huggingface_hub reports it: one summed bar for bytes received over the network, one for
             # bytes written to disk, and one counting files, which isn't about bytes.
             net = tqdm_class(desc="Downloading bytes", total=0, initial=0, unit="B", unit_scale=True)

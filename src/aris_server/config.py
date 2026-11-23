@@ -5,6 +5,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import heads
+
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 KV_BITS_CHOICES = (4, 8)
 MAX_MTP_DEPTH = 7  # drafts a round: an Inkling 2 draft block holds 7; past 3, Qwen's chained MTP drafts rarely hold
@@ -48,7 +50,8 @@ class ModelSpec:
     top_p: float = 0.95
     top_k: int = 20
     # A draft head for speculative decoding: Qwen3.8-27B's MTP head (a safetensors file of its `mtp.*` tensors) or
-    # Inkling 2's (its mtp.safetensors). It drafts `mtp_depth` tokens ahead and one pass of the model checks them.
+    # Inkling 2's (its mtp.safetensors), as a local file or a Hugging Face repo's ("owner/repo:file", see heads.py).
+    # It drafts `mtp_depth` tokens ahead and one pass of the model checks them.
     # `mtp_bits` quantizes its linear layers (0 keeps them). With `mtp_adaptive`, each round drafts as many tokens as
     # pay there, up to `mtp_depth`, and decodes plainly where drafting doesn't (speculative.DepthControl).
     mtp: str | None = None
@@ -135,10 +138,15 @@ def _spec(name: str, raw: dict, where: str) -> ModelSpec:
         effort_off=raw.get("effort_off"),
         think_budget=budget,
         template_kwargs=dict(raw.get("template_kwargs") or {}),
-        mtp=str(Path(raw["mtp"]).expanduser()) if raw.get("mtp") else None,
+        mtp=_head_ref(raw["mtp"]) if raw.get("mtp") else None,
         **{k: raw[k] for k in ("temperature", "top_p", "top_k", "followup_budget", "mtp_depth", "mtp_bits",
                                "mtp_adaptive", "mtp_draft_bits") if k in raw},
     )
+
+
+def _head_ref(p: str) -> str:
+    """A draft head's local file with its home expanded, or a Hugging Face repo's file ("owner/repo:file") as given."""
+    return p if heads.hub_file(p) else str(Path(p).expanduser())
 
 
 def _weights_path(p: str) -> str:
