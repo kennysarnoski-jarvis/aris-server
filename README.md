@@ -7,12 +7,12 @@ speaks the Anthropic Messages API.
 
 | Model | Name | Mac | Decoding with its draft head, 48 GB M4 Pro |
 |---|---|---|---|
-| [Aris 3.8-27B](#aris-38-27b) | `aris-3.8-27b` | 48 GB for the 8-bit build, 32 GB for the 4-bit | 17-27 tokens a second |
+| [Aris 3.8-27B](#aris-38-27b) | `aris-3.8-27b` | 48 GB for the 8-bit build, 32 GB for the 4-bit | 17-27 tokens a second at 8 bits, 23-30 at 4 |
 | [Inkling 2 Mini](#inkling-2-mini) | `inkling-2-mini` | 36 GB | 33-44 tokens a second |
 
 Each comes with its own [draft head](#draft-heads), which guesses the next few tokens for the model to check
-in one pass: Aris 3.8-27B decodes 1.9 to 3.3 times as fast with it, and Inkling 2 Mini 1.1 to 1.4 times on
-code, edits and long contexts (and about the same on prose).
+in one pass: Aris 3.8-27B decodes 1.9 to 3.3 times as fast with it at 8 bits and 1.6 to 2.1 times at 4, and
+Inkling 2 Mini 1.1 to 1.4 times on code, edits and long contexts (and about the same on prose).
 
 **In [Aris Code](https://youraris.com):** Aris Local sets up Aris Server and the model for you.
 
@@ -63,7 +63,8 @@ aris-server serve --model aris-3.8-27b
 ```
 
 The 8-bit build takes 27 GB, so it needs a Mac with 48 GB of memory or more, where it has about 100k tokens of
-context beside its draft head (about 125k without it, with `--no-mtp`). Its
+context beside its draft head (about 125k without it, with `--no-mtp`). On a 32 GB Mac, `pull` picks the 4-bit build
+(15 GB), with about 50k tokens beside its head (63k without). Its
 [model card](https://huggingface.co/YourAris/Aris-3.8-27B-MLX-8bit) has the details and evals. Its draft head is
 [Qwen3.8-27B's own](https://huggingface.co/YourAris/Qwen3.8-27B-MTP-Head), and `pull` fetches it with the weights.
 
@@ -176,7 +177,8 @@ command line. A request speculates while it decodes alone; several at once decod
 be fetched (offline, with no copy in the cache), the model serves without it, with a warning.
 
 Through the server on a 48 GB M4 Pro, Aris 3.8-27B at 8 bits decodes 1.95 to 3.27 times as fast with its head, 17 to 27
-tokens a second instead of 8 to 9, and Claude Code finished a coding task in 150 s with it and 241 s without. Inkling's
+tokens a second instead of 8 to 9, and Claude Code finished a coding task in 150 s with it and 241 s without. At 4 bits
+it decodes 1.62 to 2.09 times as fast, 23 to 30 tokens a second instead of 14 to 16. Inkling's
 head is a smaller win, because each extra token Inkling checks reads more of its experts: 1.1 to 1.4 times on code,
 edits and long contexts, and about the same on prose. Each head costs context: the 8-bit 27B has about 100k tokens
 beside its head and the 4-bit copy, against 125k without them.
