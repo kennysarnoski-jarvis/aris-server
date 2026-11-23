@@ -8,7 +8,7 @@ speaks the Anthropic Messages API.
 | Model | Name | Mac | Decoding with its draft head, 48 GB M4 Pro |
 |---|---|---|---|
 | [Aris 3.8-27B](#aris-38-27b) | `aris-3.8-27b` | 48 GB for the 8-bit build, 32 GB for the 4-bit | 17-27 tokens a second |
-| [Inkling 2 Mini](#inkling-2-mini) | `inkling-2-mini` | 32 GB | 34-44 tokens a second |
+| [Inkling 2 Mini](#inkling-2-mini) | `inkling-2-mini` | 32 GB | 33-44 tokens a second |
 
 Each comes with its own [draft head](#draft-heads), which guesses the next few tokens for the model to check
 in one pass: Aris 3.8-27B decodes 1.9 to 3.3 times as fast with it, and Inkling 2 Mini 1.1 to 1.4 times on
@@ -75,7 +75,7 @@ aris-server pull inkling-2-mini
 aris-server serve --model inkling-2-mini
 ```
 
-On a 48 GB M4 Pro it writes about 32 tokens a second on its own and 34 to 44 with its draft head, which
+On a 48 GB M4 Pro it writes about 32 tokens a second on its own and 33 to 44 with its draft head, which
 `pull` fetches from Thinking Machines' repo, and reads prompts at about 370, with room for about 320k tokens of
 context. Its thinking and tool calls stream as Anthropic events, like any other model's. Aris
 Server serves its text; images aren't supported yet. mlx-lm doesn't run Inkling yet, so Aris Server carries
