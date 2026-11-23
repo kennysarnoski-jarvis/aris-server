@@ -24,22 +24,27 @@ aris-server pull aris-3.8-27b      # the build this Mac can hold, and its draft 
 aris-server serve --model aris-3.8-27b
 ```
 
-Then point Claude Code at it:
+Then, in another terminal, start Claude Code in your project:
 
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude
+aris-server claude
 ```
+
+`aris-server claude` starts Claude Code on the model the server has loaded, told the context window to compact by
+(below). Claude Code's own arguments go after it, as in `aris-server claude --continue`.
 
 Any other model mlx-lm can load works too, by its Hugging Face name or a local folder:
 `aris-server serve --model mlx-community/Qwen3.5-9B-MLX-8bit`.
 
-Claude Code assumes a 200k-token window and compacts its conversation about 33k tokens short of the
-window it's given. A local model's window is whatever fits beside its weights, so tell Claude Code
-what it is: the server logs it at startup, and `/v1/models` lists it as `context_window`. With
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS` set to it, the conversation compacts before the server's limit:
+Claude Code assumes a 200k-token window and compacts its conversation 33k tokens short of the window it's told. A local
+model's window is whatever fits beside its weights (the server logs it at startup, and `/v1/models` lists it as
+`context_window`), and told that window as it is, Claude Code would compact a small one about every turn. So
+`aris-server claude` tells it, in `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, a window at which it compacts at 80% of the
+server's (or 33k short of it, as usual, on a window above 165k). To start Claude Code yourself, tell it the same: for
+the 8-bit 27B's 100,352 tokens on a 48 GB Mac, that's 113,281.
 
 ```bash
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=124928 ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=113281 ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude
 ```
 
 ## Aris 3.8-27B
@@ -177,6 +182,8 @@ aris-server service install -- --model aris-3.8-27b
 aris-server service status
 aris-server service uninstall
 ```
+
+With the service running, `aris-server claude` starts Claude Code on it, in any project.
 
 `aris-server pull --json` reports each step of a download as a JSON line, for apps that set the
 server up for their users. `aris-server models` lists configured and built-in models, and with `--json`, for each one,

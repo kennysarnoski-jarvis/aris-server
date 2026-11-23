@@ -70,7 +70,19 @@ def main(argv=None):
     svc = sub.add_parser("service", help="run as a login service that restarts itself (macOS launchd)")
     svc.add_argument("action", choices=["install", "uninstall", "status"])
     svc.add_argument("serve_args", nargs=argparse.REMAINDER, help="arguments for serve, after --")
-    a = ap.parse_args(argv)
+    c = sub.add_parser("claude", allow_abbrev=False,
+                       help="start Claude Code on the model the server has loaded (Claude Code's arguments go after)")
+    c.add_argument("--host", default="127.0.0.1")
+    c.add_argument("--port", type=int, default=8484)
+    c.add_argument("--api-key", help="the server's --api-key, if it was given one")
+    a, extra = ap.parse_known_args(argv)  # what isn't the claude command's own goes to Claude Code
+
+    if a.cmd == "claude":
+        from .claude_code import launch
+
+        return launch(a.host, a.port, a.api_key, extra[1:] if extra[:1] == ["--"] else extra)
+    if extra:
+        ap.error(f"unrecognized arguments: {' '.join(extra)}")
 
     if a.cmd == "service":
         from . import service
@@ -164,7 +176,10 @@ def main(argv=None):
         logging.error("%s", e)
         return 2
     server = Server((a.host, a.port), engine, models, a.api_key, guards=a.guards)
-    logging.info("Aris Server %s serving %s on http://%s:%d", __version__, name, a.host, a.port)
+    claude = "aris-server claude" + (f" --host {a.host}" if a.host != "127.0.0.1" else "") + \
+        (f" --port {a.port}" if a.port != 8484 else "") + (" --api-key <key>" if a.api_key else "")
+    logging.info("Aris Server %s serving %s on http://%s:%d. For Claude Code on it, run `%s` in your project.",
+                 __version__, name, a.host, a.port, claude)
 
     def stop(*_):  # a service manager stops with SIGTERM: finish the current step (and any cache write) first
         raise KeyboardInterrupt
