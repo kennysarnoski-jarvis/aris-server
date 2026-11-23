@@ -66,15 +66,29 @@ def uninstall() -> int:
     return 0
 
 
+def service_fields(text: str) -> dict[str, str]:
+    """The service's own state, pid, runs and last exit code from `launchctl print`: the top level of its block only.
+    Blocks nested in it carry lines of their own (each resource and jetsam coalition has a `state = active`), and
+    reading those reported a running service as "active"."""
+    fields, depth = {}, 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.endswith("{"):
+            depth += 1
+        elif stripped == "}":
+            depth -= 1
+        elif depth == 1:
+            key, _, value = stripped.partition(" = ")
+            if key in ("state", "pid", "runs", "last exit code"):
+                fields.setdefault(key, value)
+    return fields
+
+
 def status() -> int:
     done = subprocess.run(["launchctl", "print", f"{_domain()}/{LABEL}"], capture_output=True, text=True)
     if done.returncode != 0:
         print("not installed")
         return 1
-    fields = {}
-    for line in done.stdout.splitlines():
-        key, _, value = line.strip().partition(" = ")
-        if key in ("state", "pid", "runs", "last exit code"):
-            fields[key] = value
+    fields = service_fields(done.stdout)
     print(", ".join(f"{k}: {v}" for k, v in fields.items()) or done.stdout[:400])
     return 0
