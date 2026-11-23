@@ -110,6 +110,45 @@ def test_a_turn_its_next_request_took_leaves_the_eviction_order():
     assert kept == [False, True, True]
 
 
+def test_a_budget_lowered_while_a_turn_is_kept_stays_lowered(monkeypatch):
+    # After a request whose memory came close to the GPU's limit, the server lowers the budget from that request's
+    # thread, while the generation thread keeps the turn that just finished with the budget moved aside. Putting it
+    # back undid the lowering: 12.1 GB logged on a 48 GB Mac, 13.9 GB still in force two hours later.
+    import threading
+    from types import SimpleNamespace
+
+    from mlx_lm.models.cache import LRUPromptCache
+
+    from aris_server import engine
+
+    gb = 1 << 30
+    cache = MovingPromptCache(max_size=10, max_bytes=14 * gb)
+    cli_args = SimpleNamespace(prompt_cache_bytes=14 * gb)
+    server = SimpleNamespace(cache=cache, provider=SimpleNamespace(cli_args=cli_args))
+    monkeypatch.setattr(engine.mx, "get_peak_memory", lambda: int(35.1 * gb))
+    monkeypatch.setattr(engine.mx, "reset_peak_memory", lambda: None)
+    monkeypatch.setattr(engine.mx, "device_info", lambda: {"max_recommended_working_set_size": int(37.4 * gb)})
+    inside, go_on = threading.Event(), threading.Event()
+    keep = LRUPromptCache.insert_cache
+
+    def slowly(self, *args, **kwargs):  # an eviction written to disk can take seconds
+        inside.set()
+        go_on.wait(5)
+        return keep(self, *args, **kwargs)
+
+    monkeypatch.setattr(LRUPromptCache, "insert_cache", slowly)
+    keeping = threading.Thread(target=cache.insert_cache, args=("m", TURN1, [Layer(50)]))
+    keeping.start()
+    assert inside.wait(5)
+    lowering = threading.Thread(target=engine.Engine.adapt_memory, args=(server,))
+    lowering.start()
+    lowering.join(0.2)                                                          # while the budget is moved aside
+    go_on.set()
+    keeping.join(5)
+    lowering.join(5)
+    assert cache.max_bytes == server.provider.cli_args.prompt_cache_bytes < 14 * gb
+
+
 def test_the_context_that_fits_leaves_room_for_the_peak_reading_a_prompt_reaches():
     from aris_server.engine import CONTEXT_OVERHEAD, context_that_fits
 

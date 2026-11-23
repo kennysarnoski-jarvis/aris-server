@@ -578,6 +578,7 @@ class MovingPromptCache(LRUPromptCache):
         self.reading: list[list[int]] = []  # prompts of the requests in flight
         self._trie = _EvictionTrie(self._trie, self._evicted)
         self._lru = _RecencyOrder()
+        self._budget_lock = threading.Lock()  # see lower_budget
         # A checkpoint's tokens -> each layer's state after reading them, least recently run along first.
         self._checkpoints: dict[tuple, _Checkpoint] = {}
         self._fetches = 0  # requests fetched so far: a checkpoint's recency
@@ -610,6 +611,22 @@ class MovingPromptCache(LRUPromptCache):
                 self._save(key, self._trie.get(model, key).prompt_cache, kind)
 
     def insert_cache(self, model, tokens, prompt_cache, *, cache_type="assistant"):
+        with self._budget_lock:
+            self._insert(model, tokens, prompt_cache, cache_type)
+
+    def lower_budget(self, shrink: Callable[[int], int]) -> int | None:
+        """Lower the budget to shrink(budget) if that is lower, from any thread: the new budget, or None. Keeping a turn
+        moves the budget aside for a moment on the generation thread (see _insert), and putting it back undid a
+        lowering made from a request's thread in between: 12.1 GB logged on a 48 GB Mac, 13.9 GB in force two hours
+        later."""
+        with self._budget_lock:
+            cap = shrink(self.max_bytes)
+            if cap >= self.max_bytes:
+                return None
+            self.max_bytes = cap
+            return cap
+
+    def _insert(self, model, tokens, prompt_cache, cache_type):
         if cache_type == "checkpoint":  # a cut the request's fetch planned: only the recurrent state is kept
             self._keep_checkpoint(tokens, prompt_cache)
             return
@@ -1167,9 +1184,9 @@ class Engine:
         gb = 1 << 30
         peak, limit = mx.get_peak_memory(), mx.device_info()["max_recommended_working_set_size"]
         mx.reset_peak_memory()
-        cap = shrink_cap(self.cache.max_bytes, peak, limit, int(headroom_gb * gb))
-        if cap < self.cache.max_bytes:
-            self.cache.max_bytes = self.provider.cli_args.prompt_cache_bytes = cap
+        cap = self.cache.lower_budget(lambda cap: shrink_cap(cap, peak, limit, int(headroom_gb * gb)))
+        if cap is not None:
+            self.provider.cli_args.prompt_cache_bytes = cap
             logging.warning("memory peaked at %.1f of %.1f GB; prompt cache lowered to %.1f GB", peak / gb, limit / gb,
                             cap / gb)
 
