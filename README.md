@@ -8,7 +8,7 @@ speaks the Anthropic Messages API.
 | Model | Name | Mac | Decoding with its draft head, 48 GB M4 Pro |
 |---|---|---|---|
 | [Aris 3.8-27B](#aris-38-27b) | `aris-3.8-27b` | 48 GB for the 8-bit build, 32 GB for the 4-bit | 17-27 tokens a second |
-| [Inkling 2 Mini](#inkling-2-mini) | `inkling-2-mini` | 32 GB | 33-44 tokens a second |
+| [Inkling 2 Mini](#inkling-2-mini) | `inkling-2-mini` | 36 GB | 33-44 tokens a second |
 
 Each comes with its own [draft head](#draft-heads), which guesses the next few tokens for the model to check
 in one pass: Aris 3.8-27B decodes 1.9 to 3.3 times as fast with it, and Inkling 2 Mini 1.1 to 1.4 times on
@@ -71,7 +71,9 @@ context beside its draft head (about 125k without it, with `--no-mtp`). Its
 
 Inkling 2 Mini is built in as `inkling-2-mini`: [Thinking Machines'](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 mixture-of-experts model, 26.4B parameters with 3.4B active per token. `pull` downloads
-[mlx-community's 4-bit build](https://huggingface.co/mlx-community/Inkling-2-Mini-4bit) (17 GB):
+[mlx-community's 4-bit build](https://huggingface.co/mlx-community/Inkling-2-Mini-4bit) (17 GB), so it needs a Mac with
+36 GB of memory or more: on a 32 GB Mac, about 19k tokens of context would fit beside it and its draft head (30k
+without), too few for Claude Code, whose own prompt and tools take 9-15k.
 
 ```bash
 aris-server pull inkling-2-mini
