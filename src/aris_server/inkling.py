@@ -35,6 +35,16 @@ def is_inkling(tokenizer) -> bool:
     return all(_single_id(tokenizer, marker) is not None for marker in (HEADER, END, THINKING, TOOL_JSON))
 
 
+# The headers that open a user, model or tool message. The prompt before the first of them is its system region: the
+# tool declarations, the system prompt and the effort message.
+CONVERSATION_HEADERS = ("<|message_user|>", HEADER, "<|message_tool|>")
+
+
+def conversation_starts(tokenizer) -> frozenset[int]:
+    """The ids of the headers that open a user, model or tool message: where a prompt's system region has ended."""
+    return frozenset(i for i in (_single_id(tokenizer, h) for h in CONVERSATION_HEADERS) if i is not None)
+
+
 def think_ids(tokenizer) -> tuple[int, int] | None:
     """The ids that open and close a thinking message, for the think budget; None for other models."""
     if not is_inkling(tokenizer):

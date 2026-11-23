@@ -1,7 +1,8 @@
 """A request that leaves every cached conversation early (a client that rewrites part of its system prompt on each
 request, say) reuses what it still shares with them. A hybrid model's linear-attention layers carry a running state
-that can't be cut back to an earlier token, so that reuse comes from recurrent-state checkpoints taken while prompts
-are read, beside the attention cache cut back to the same token.
+that can't be cut back to an earlier token, and Inkling's sliding windows keep only their last rows, so that reuse
+comes from checkpoints of that state taken while prompts are read, beside the attention cache cut back to the same
+token.
 
 These tests drive a tiny model with Arete's architecture through mlx-lm's own batch generator, the way mlx-lm's server
 drives it (ResponseGenerator._generate, batched path), so the checkpoints are taken where a real prompt read takes
@@ -15,13 +16,20 @@ from mlx_lm.generate import BatchGenerator
 from mlx_lm.models import qwen3_5
 from mlx_lm.models.cache import ArraysCache
 
-from aris_server.engine import MovingPromptCache, _split_segments, merge_prompt_tail
+from mlx_lm.models.cache import CacheList, KVCache, QuantizedKVCache, RotatingKVCache
+
+from aris_server import dspark, inkling, mtp, mtp_serve
+from aris_server.engine import (MovingPromptCache, _Checkpoint, _checkpointable, _flat_caches, _split_segments,
+                                merge_prompt_tail)
 from aris_server.kv_quant import quantize_kv
+from aris_server.speculative import Sampling
+from test_dspark import random_drafter
+from test_inkling2_model import LOOP_CONFIG, create_model
 from tiny_models import tiny_hybrid_model
 
 END = 9       # the tiny vocabulary's end of a turn (<|im_end|>)
 NEWLINE = 10  # and its line break, for finding where a changed line starts
-STEP = 64     # checkpoint spacing, scaled down from Arete's 4096 with everything else
+STEP = 64     # the checkpoint grid, scaled down from 512 with everything else
 
 
 def decode(ids):
@@ -61,16 +69,16 @@ def cache_for(model, budget=1 << 30):
     cache = MovingPromptCache(max_size=10, max_bytes=budget)
     cache.decode = decode
     cache.light_min_tokens = cache.checkpoint_min_gain = 16
-    if any(isinstance(c, ArraysCache) for c in model.make_cache()):  # as the engine decides
-        cache.checkpoint_every, cache.turn_ends = STEP, frozenset({END})
+    if _checkpointable(model.make_cache()):  # as the engine decides
+        cache.checkpoint_every, cache.system_ends = STEP, frozenset({END})
     return cache
 
 
-def serve(cache, model, prompt, system_tokens=None, max_tokens=4):
+def serve(cache, model, prompt, system_tokens=None, max_tokens=4, sampler=None):
     """One request, the way mlx-lm's server serves it: its prompt split into segments (the system prompt, then the
     rest; a request ending in tool results is one segment), the nearest cache fetched, the prompt read with a copy of
     the cache saved at each segment's end, then the finished sequence's cache saved. Returns (cached tokens, generated
-    tokens, their logprobs)."""
+    tokens, their logprobs). The finished sequence's cache is left in serve.final."""
     if system_tokens:
         segments = [prompt[:system_tokens], prompt[system_tokens:-2], prompt[-2:]]
         types = ["system", "user", "assistant"]
@@ -90,7 +98,7 @@ def serve(cache, model, prompt, system_tokens=None, max_tokens=4):
         else:
             segments[0] = segments[0][n:]
             break
-    gen = BatchGenerator(model, max_tokens=max_tokens, prefill_step_size=32)
+    gen = BatchGenerator(model, max_tokens=max_tokens, prefill_step_size=32, sampler=sampler)
     gen.insert_segments(segments=[segments], max_tokens=[max_tokens], caches=[reused], all_tokens=[prompt[:n_cached]])
     del reused
     cache.trim_to(n_bytes=cache.max_bytes - gen.prompt_cache_nbytes)
@@ -106,6 +114,7 @@ def serve(cache, model, prompt, system_tokens=None, max_tokens=4):
             logprobs.append(r.logprobs)
             if r.finish_reason is not None:
                 cache.insert_cache("m", r.all_tokens[:], r.prompt_cache, cache_type="assistant")
+                serve.final = r.prompt_cache
                 gen.close()
                 cache.reading.remove(prompt)
                 return n_cached, tokens, logprobs
@@ -221,7 +230,7 @@ def test_checkpoints_hold_at_most_their_share_of_the_budget_and_count_against_it
 
     cache = cache_for(model, budget=8 * 2 * each + 7)              # room for two checkpoints
     _, out, _ = serve(cache, model, system() + USER, system_tokens=len(system()))
-    assert checkpoints(cache) == [192, 256]                        # the latest ones
+    assert checkpoints(cache) == [128, 256]                        # spread out, the last one kept
     assert cache._checkpoint_bytes() <= cache.max_bytes // 8
     cached, _, _ = serve(cache, model, system(changed(7, 40)) + USER + out + TOOL_RESULT)
     assert cached == 256
@@ -296,3 +305,185 @@ def test_segments_are_cut_where_checkpoints_go():
     _split_segments(segments, types, [4, 8, 12, 16, 4])           # 8 is already a boundary: no empty segment
     assert segments == [prompt[:4], prompt[4:8], prompt[8:12], prompt[12:16], prompt[16:19], prompt[19:]]
     assert types == ["checkpoint", "system", "checkpoint", "checkpoint", "assistant", "assistant"]
+
+
+def greedy(logprobs):
+    return mx.argmax(logprobs, axis=-1)
+
+
+greedy.mtp_sampling = Sampling(0.0)  # labelled as mlx-lm's server labels it, so draft heads speculate
+
+
+def inkling_model():
+    """Inkling's layout, tiny: each layer visit keeps a sliding window of 8 rows or full attention, and conv state."""
+    return create_model(config=LOOP_CONFIG)
+
+
+def mtp_model():
+    model = tiny_hybrid_model()
+    mx.random.seed(1)
+    head = mtp.MTPHead(mtp.text_model(model).args)
+    mx.eval(head.parameters())
+    mtp_serve.attach_mtp(model, head, depth=2)
+    return model
+
+
+def dspark_model():
+    model = inkling_model()
+    mtp_serve.attach_dspark(model, random_drafter(model), depth=3)
+    return model
+
+
+def each_checkpoints_bytes(model) -> int:
+    probe = cache_for(model)
+    serve(probe, model, system() + USER, system_tokens=len(system()))
+    return probe._checkpoint_bytes() // len(probe._checkpoints)
+
+
+def rows(c):
+    """What a layer cache holds, in order: an attention cache's rows, a window's last rows, an ArraysCache's arrays."""
+    if isinstance(c, RotatingKVCache):
+        return dspark.context_rows(c)
+    if isinstance(c, KVCache):
+        return c.keys[..., :c.offset, :], c.values[..., :c.offset, :]
+    return [a for a in c.cache if a is not None]
+
+
+def assert_same_state(got, want):
+    for a, b in zip(_flat_caches(got), _flat_caches(want), strict=True):
+        assert type(a) is type(b) and getattr(a, "offset", None) == getattr(b, "offset", None)
+        for x, y in zip(rows(a), rows(b), strict=True):
+            assert x.shape == y.shape and mx.allclose(x, y, atol=1e-4).item()
+
+
+def test_which_models_take_checkpoints():
+    assert _checkpointable(tiny_hybrid_model().make_cache())   # recurrent layers
+    assert _checkpointable(kv8_hybrid_model().make_cache())    # and 8-bit attention, as Aris 3.8-27B is served
+    assert _checkpointable(mtp_model().make_cache())           # and an MTP head's cache and hidden state
+    assert _checkpointable(inkling_model().make_cache())       # sliding windows inside each visit's CacheList
+    assert _checkpointable(dspark_model().make_cache())        # and its draft head's own windows
+    assert not _checkpointable([KVCache(), QuantizedKVCache()])  # attention cuts back to any token
+    assert not _checkpointable([CacheList(RotatingKVCache(8, keep=4), ArraysCache(1))])  # a ring that keeps a prefix
+
+
+def test_inklings_system_region_ends_where_its_conversation_starts():
+    ids = {"<|message_user|>": [5], "<|message_model|>": [6], "<|message_tool|>": [7]}
+
+    class Tokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return ids.get(text, [1, 2])
+
+    assert inkling.conversation_starts(Tokenizer()) == {5, 6, 7}
+
+
+def test_inkling_rewriting_a_line_of_its_system_prompt_resumes_from_a_checkpoint_of_its_windows():
+    # Before, Inkling took no checkpoints: its windows can't be cut back, so this request read again from token 0.
+    model = inkling_model()
+    cache = cache_for(model)
+    _, out, _ = serve(cache, model, system() + USER, system_tokens=len(system()))
+    second = system(changed(7, 40)) + USER + out + TOOL_RESULT
+    cached, got, logprobs = serve(cache, model, second)
+    assert cached == (LEDGER_AT + 7) // STEP * STEP
+    resumed = serve.final
+    same_as_read_cold(model, second, got, logprobs)
+    assert_same_state(resumed, serve.final)
+    third = system(changed(2, 41)) + USER + out + TOOL_RESULT + USER
+    cached, got, logprobs = serve(cache, model, third)
+    assert cached == LEDGER_AT  # from the line it learned
+    same_as_read_cold(model, third, got, logprobs)
+
+
+def test_a_draft_heads_cache_resumes_with_the_model_it_drafts_for():
+    """The MTP head's cache and hidden state, and Inkling's draft head's windows and state, come back at the
+    checkpoint too: after resuming, each holds what it holds when the prompt is read from its first token, and it
+    drafts from there."""
+    for model in (mtp_model(), dspark_model()):
+        cache = cache_for(model)
+        _, out, _ = serve(cache, model, system() + USER, system_tokens=len(system()), sampler=greedy)
+        second = system(changed(7, 40)) + USER + out + TOOL_RESULT
+        rounds = model._mtp_config.stats.rounds
+        cached, got, _ = serve(cache, model, second, max_tokens=12, sampler=greedy)
+        resumed = serve.final
+        assert cached == (LEDGER_AT + 7) // STEP * STEP and model._mtp_config.stats.rounds > rounds
+        _, cold, _ = serve(cache_for(model), model, second, max_tokens=12, sampler=greedy)
+        assert got == cold
+        assert_same_state(resumed, serve.final)
+
+
+def test_a_tight_budget_keeps_checkpoints_evenly_spread_and_the_last_one():
+    model = kv8_hybrid_model()
+    each = each_checkpoints_bytes(model)
+    tools = lines(9, 50) + system()                 # 1000 more tokens of tools: 20 grid points before the turn ends
+    cache = cache_for(model, budget=8 * 4 * each + 7)  # room for four
+    serve(cache, model, tools + USER, system_tokens=len(tools))
+    at = checkpoints(cache)
+    last = (len(tools) - 1) // STEP * STEP
+    assert len(at) == 4 and at[-1] == last
+    assert max(b - a for a, b in zip([0] + at, at)) <= last // 2  # no part of it twice as far as even spacing
+
+
+def test_a_line_where_the_client_rewrites_its_prompt_outlasts_the_grid_beside_it():
+    model = kv8_hybrid_model()
+    each = each_checkpoints_bytes(model)
+    cache = cache_for(model, budget=8 * 3 * each + 7)  # room for three
+    _, out, _ = serve(cache, model, system() + USER, system_tokens=len(system()))
+    assert checkpoints(cache) == [128, 192, 256]
+    convo = USER + out + TOOL_RESULT
+    serve(cache, model, system(changed(7, 40)) + convo)
+    assert checkpoints(cache) == [128, 192, LEDGER_AT]  # 256, just before the line, covered least
+    cached, _, _ = serve(cache, model, system(changed(2, 41)) + convo + USER)
+    assert cached == LEDGER_AT
+
+
+def test_checkpoints_past_a_change_go_before_the_ones_the_new_prompt_runs_along():
+    model = kv8_hybrid_model()
+    each = each_checkpoints_bytes(model)
+    cache = cache_for(model, budget=8 * 5 * each + 7)  # room for five
+    _, out, _ = serve(cache, model, system() + USER, system_tokens=len(system()))
+    assert checkpoints(cache) == [64, 128, 192, 256]
+    tools = list(TOOLS)
+    tools[110] = 11 + (tools[110] - 10) % 53       # a tool's description edited, inside the line at 100
+    second = tools + system()[len(TOOLS):] + USER + out
+    cached, _, _ = serve(cache, model, second)
+    assert cached == 64
+    # The old prompt's checkpoints past the change went; the new one's grid and the line it changed came in.
+    assert checkpoints(cache) == [64, 100, 128, 192, 256]
+    assert all(tuple(second[:len(k)]) == k for k in cache._checkpoints)
+
+
+def with_checkpoints(*specs):
+    """A prompt cache holding stand-in checkpoints: (tokens, the fetch that last ran along them, learned)."""
+    cache = MovingPromptCache(max_size=10)
+    for key, touched, learned in specs:
+        cache._checkpoints[key] = _Checkpoint([mx.zeros(4)], 16, touched, learned)
+    return cache
+
+
+def drop_down_to(cache, n, newest):
+    gone = []
+    while len(cache._checkpoints) > n:
+        key = cache._victim(newest)
+        gone.append(key)
+        cache._checkpoints.pop(key)
+    return gone
+
+
+def test_checkpoints_no_request_runs_along_go_first_least_recent_first_each_prompts_evenly():
+    ended = tuple(range(2000, 2400))                    # a conversation last fetched before the other two
+    old = tuple(range(1000, 1400))                      # a system prompt as it was
+    new = old[:100] + (7,) + old[101:]                  # and as it is now, changed at token 100
+    cache = with_checkpoints(*[(ended[:n], 0, False) for n in (64, 128)],
+                             (old[:64], 2, False),      # the new prompt runs along it too
+                             *[(old[:n], 1, False) for n in (128, 192, 256)],
+                             *[(new[:n], 2, False) for n in (160, 224)])
+    gone = drop_down_to(cache, 3, newest=new[:224])
+    assert gone == [ended[:64], ended[:128], old[:192], old[:128], old[:256]]
+    assert set(cache._checkpoints) == {old[:64], new[:160], new[:224]}
+
+
+def test_a_line_where_a_request_left_the_cache_outlasts_grid_checkpoints_however_close():
+    prompt = tuple(range(400))
+    cache = with_checkpoints(*[(prompt[:n], 1, n == 100) for n in (64, 100, 128, 192, 256)])
+    gone = drop_down_to(cache, 1, newest=prompt[:256])
+    assert [len(k) for k in gone] == [128, 64, 192, 256]  # the grid by gap, its last one last; then the line
+    assert list(cache._checkpoints) == [prompt[:100]]

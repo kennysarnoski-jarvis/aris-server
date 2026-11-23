@@ -7,6 +7,7 @@ import functools
 import gc
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -389,37 +390,84 @@ mls.ResponseGenerator._generate = _generate_then_stop_hook
 DISK_MIN_GAIN = 1024  # fewer extra tokens than this are as quick to read as the cache file
 MAX_KEPT_STATES = 2  # prompt-end recurrent states kept per kind (requests in flight; finished turns)
 
-# A hybrid model's linear-attention layers carry a running state that can't be cut back to an earlier token, so a
-# request that leaves every cached entry part-way through reused none of what it still shared with them. A coding
-# agent's plugin that rewrote one line near the end of its system prompt after each check it ran sent a 57k-token
-# conversation back to its first token, 630 s on a 48 GB Mac, to change a line at token 11k. Recurrent-state
-# checkpoints, taken as prompts are read, let such a request resume from the last one before it leaves, with the
-# attention cache of an entry that shares that much cut back to the same token.
-CHECKPOINT_TOKENS = 4096   # spacing of the checkpoints taken over a prompt's first message (its system prompt and
-CHECKPOINT_SPAN = 32768    # tools, where a request's first change usually is), up to this far in
-CHECKPOINT_SHARE = 8       # checkpoints hold at most this fraction of the prompt cache's budget (157 MB each, Arete)
-MAX_CHECKPOINTS = 16
+# A hybrid model's linear-attention layers carry a running state that can't be cut back to an earlier token, and a
+# sliding window's ring holds only the last rows it read, so a request that leaves every cached entry part-way through
+# reused none of what it still shared with them. A coding agent's plugin that rewrote one line near the end of its
+# system prompt after each check it ran sent a 57k-token conversation back to its first token, 630 s on a 48 GB Mac,
+# to change a line at token 11k. Checkpoints of that state, taken as prompts are read, let such a request resume from
+# the last one before it leaves, with the attention cache of an entry that shares that much cut back to the same token.
+CHECKPOINT_GRID = 512      # taken this far apart over a prompt's system region (its system prompt and tools, where a
+                           # request's first change usually is), then thinned evenly to their share of the budget.
+                           # mlx-lm reads a prompt 512 tokens at a time, so cuts on this grid add at most one read.
+CHECKPOINT_SPAN = 32768    # the grid's reach
+CHECKPOINT_SHARE = 8       # checkpoints hold at most this fraction of the prompt cache's budget (157 MB each for
+                           # Arete-27B, 168 MB for Inkling 2 Mini)
+MAX_CHECKPOINTS = 64
 LINE_BACKOFF = 512         # how far back from where a request left the cache to look for the start of its line
 
 
+def _state_arrays(state):
+    """The arrays in a layer state as _end_state keeps it."""
+    if isinstance(state, mx.array):
+        yield state
+    elif isinstance(state, (list, tuple)):
+        for s in state:
+            yield from _state_arrays(s)
+
+
+def _all_kept(state) -> bool:
+    if state is _NOT_KEPT:
+        return False
+    return not isinstance(state, list) or all(_all_kept(s) for s in state)
+
+
+def _checkpointable(layers) -> bool:
+    """Whether a model's caches hold state that can't be cut back to an earlier token (recurrent layers' arrays, a
+    sliding window's ring), all of it state a checkpoint can keep, beside attention that cuts back to any token: such a
+    model's prompt cache takes checkpoints."""
+    flat = list(_flat_caches(layers))
+    return any(isinstance(c, (ArraysCache, RotatingKVCache)) for c in flat) and all(
+        isinstance(c, ArraysCache) or type(c) in (KVCache, QuantizedKVCache)
+        or (isinstance(c, RotatingKVCache) and not c.keep) for c in flat)
+
+
+def _resume_layer(layer, state, n: int):
+    if isinstance(layer, CacheList):
+        if not isinstance(state, list) or len(state) != len(layer.caches):
+            return None
+        parts = [_resume_layer(c, s, n) for c, s in zip(layer.caches, state)]
+        return None if any(p is None for p in parts) else CacheList(*parts)
+    resumed = copy.copy(layer)
+    if isinstance(layer, ArraysCache) and isinstance(state, list):
+        resumed.cache, resumed.left_padding, resumed.lengths = list(state), None, None
+    elif isinstance(layer, RotatingKVCache) and isinstance(state, tuple) and state[2] == n:
+        resumed.keys, resumed.values, resumed.offset = state
+        resumed._idx = resumed.keys.shape[2]  # in temporal order, as a multi-token read leaves it
+    elif state is None and type(layer) in (KVCache, QuantizedKVCache) and layer.offset >= n:
+        resumed.keys, resumed.values = tree_map(lambda x: x[..., :n, :], (layer.keys, layer.values))
+        resumed.offset = n
+    else:
+        return None
+    return resumed
+
+
 def _resume(layers, states, n: int):
-    """A cache at token n: an entry's attention layers cut back to n, and a checkpoint's recurrent state at n. The cut
-    layers are views of the entry's arrays, which stays as it was: mlx-lm copies a cache into its batch before reading
-    on. None when a layer is neither."""
+    """A cache at token n: an entry's attention layers cut back to n, and a checkpoint's state at n for the rest (a
+    recurrent layer's arrays, a sliding window's last rows; each part of a CacheList). The cut layers are views of the
+    entry's arrays, which stays as it was, and the checkpoint stays too: mlx-lm copies a cache into its batch before
+    reading on. None when a layer is neither."""
     if len(layers) != len(states):
         return None
-    out = []
-    for layer, state in zip(layers, states):
-        resumed = copy.copy(layer)
-        if state is not None and isinstance(layer, ArraysCache):
-            resumed.cache, resumed.left_padding, resumed.lengths = list(state), None, None
-        elif state is None and type(layer) in (KVCache, QuantizedKVCache) and layer.offset >= n:
-            resumed.keys, resumed.values = tree_map(lambda x: x[..., :n, :], (layer.keys, layer.values))
-            resumed.offset = n
-        else:
-            return None
-        out.append(resumed)
-    return out
+    out = [_resume_layer(layer, state, n) for layer, state in zip(layers, states)]
+    return None if any(c is None for c in out) else out
+
+
+@dataclass
+class _Checkpoint:
+    states: list         # each layer's state at the checkpoint, as _end_state keeps it
+    nbytes: int
+    touched: int         # the latest fetch whose prompt runs along it (or the fetch it was taken under)
+    learned: bool = False  # taken where a request left the cache, rather than on the grid
 
 
 def _split_segments(segments: list, types: list, at) -> None:
@@ -472,12 +520,15 @@ class MovingPromptCache(LRUPromptCache):
     kv_bytes_per_token = None  # set by the engine: the cache one token of context adds to a sequence
     _pending_bytes = 0  # the cache the request just handed its own is about to build (see trim_to)
     _read_peak = 0  # what reading the latest prompt needs at its peak, while its system-prompt copy may arrive
-    # Recurrent-state checkpoints (see CHECKPOINT_TOKENS): their spacing over the start of a prompt, set by the engine
-    # for a model with recurrent layers (None: none are taken; an attention-only cache is cut back as it is).
+    # Checkpoints (see CHECKPOINT_GRID): their spacing over a prompt's system region, set by the engine for a model
+    # with state that can't be cut back (None: none are taken; an attention-only cache is cut back as it is).
     checkpoint_every = None
     checkpoint_span = CHECKPOINT_SPAN
     checkpoint_min_gain = DISK_MIN_GAIN  # where a request left the cache: a checkpoint there must add this many tokens
-    turn_ends: frozenset = frozenset()  # the tokenizer's end-of-turn tokens: where a prompt's first message ends
+    # Tokens at which a prompt's system region has ended: Qwen's end of turn, which closes its system turn (system
+    # prompt and tools); Inkling's user, model and tool headers, which open the conversation after its tool
+    # declarations, system prompt and effort message.
+    system_ends: frozenset = frozenset()
     tokenized = None  # set by the engine as it tokenizes a request: its segments, which fetching it cuts at checkpoints
     _leaving = ((), 0)  # the cached entry the request being fetched runs along furthest, and how far
     _resuming = None  # a checkpoint's cache for the request being fetched, until something covers more
@@ -486,9 +537,10 @@ class MovingPromptCache(LRUPromptCache):
         super().__init__(*args, **kwargs)
         self.reading: list[list[int]] = []  # prompts of the requests in flight
         self._trie = _EvictionTrie(self._trie, self._evicted)
-        # A checkpoint's tokens -> the recurrent layers' state after reading them (None for each attention layer),
-        # least recently used first.
-        self._checkpoints: dict[tuple, list] = {}
+        # A checkpoint's tokens -> each layer's state after reading them, least recently run along first.
+        self._checkpoints: dict[tuple, _Checkpoint] = {}
+        self._fetches = 0  # requests fetched so far: a checkpoint's recency
+        self._learn: dict[tuple, None] = {}  # checkpoints planned where a request left the cache, until taken
         self._pieces: dict[int, str] = {}  # each token's text, for finding where lines start
         # Prompt-end recurrent state of requests in flight, then of the turns they finished as. A finished turn
         # whose history comes back tokenized differently is rebuilt to its prompt's end from these: its attention
@@ -632,14 +684,13 @@ class MovingPromptCache(LRUPromptCache):
 
     def fetch_nearest_cache(self, model, tokens):
         self._resuming = None
+        self._fetches += 1
+        self._touch(tokens)
         cache, rest = self._fetch_nearest(model, tokens)
         resuming, self._resuming = self._resuming, None
         if resuming is not None and resuming[0] is cache:  # a checkpoint was the best there was
-            resumed, key, *shown = resuming
-            if key in self._checkpoints:
-                self._checkpoints[key] = self._checkpoints.pop(key)  # recently used
             logging.info("memory cache: resumed at token %d from a checkpoint and a %d-token %s, which the request "
-                         "leaves at token %d%s", *shown)
+                         "leaves at token %d%s", *resuming[2:])
         if self.kv_bytes_per_token:
             # Reading the prompt's unread tokens, plus a growth block (the cache grows in blocks, and the reply grows it
             # too), peaks above the cache they build, by the same rate the context limit allows for.
@@ -667,26 +718,60 @@ class MovingPromptCache(LRUPromptCache):
                          len(self), self.nbytes / gb, self.max_bytes / gb)
 
     def _checkpoint_bytes(self) -> int:
-        return sum(a.nbytes for states in self._checkpoints.values() for s in states if s for a in s if a is not None)
+        return sum(c.nbytes for c in self._checkpoints.values())
 
-    def _fit_checkpoints(self):
-        """Least recently used checkpoints go once they hold more than their share of the budget."""
+    def _touch(self, tokens):
+        """The checkpoints this request's prompt runs along are recently used, in the order they come in it."""
+        key = tuple(tokens)
+        for k in sorted((k for k in self._checkpoints if len(k) < len(key) and key[:len(k)] == k), key=len):
+            c = self._checkpoints.pop(k)
+            c.touched = self._fetches
+            self._checkpoints[k] = c
+
+    def _victim(self, newest) -> tuple:
+        """The checkpoint to drop when they hold more than their share. Those along the prompt the newest was taken
+        from stay while there are others; of the others, those the least recent request ran along go first (an older
+        version of a system prompt, a conversation that ended). Within either, see _thinnest."""
+        if newest not in self._checkpoints:
+            newest = next(reversed(self._checkpoints))
+        along, others = [], []
+        for k in self._checkpoints:
+            (along if newest[:len(k)] == k else others).append(k)
+        if not others:
+            return self._thinnest(along)
+        oldest = min(self._checkpoints[k].touched for k in others)
+        return self._thinnest([k for k in others if self._checkpoints[k].touched == oldest])
+
+    def _thinnest(self, keys: list) -> tuple:
+        """Of checkpoints along one prompt, the one to drop: one taken on the grid before one taken where a request
+        left the cache (that line is where its client rewrites its prompt), and of those, the one whose loss leaves
+        the smallest gap, so the rest stay evenly spread. The last of each kind, which covers everything after it,
+        goes last."""
+        keys = sorted(keys, key=len)
+        at = [0] + [len(k) for k in keys] + [math.inf]
+        return min((self._checkpoints[k].learned, at[i + 2] - at[i], len(k), k) for i, k in enumerate(keys))[3]
+
+    def _fit_checkpoints(self, newest=()):
+        """Checkpoints go, one _victim at a time, while they hold more than their share of the budget."""
         while self._checkpoints and (len(self._checkpoints) > MAX_CHECKPOINTS
                                      or self._checkpoint_bytes() > self.max_bytes // CHECKPOINT_SHARE):
-            self._checkpoints.pop(next(iter(self._checkpoints)))
+            self._checkpoints.pop(self._victim(newest))
 
     def _keep_checkpoint(self, tokens, prompt_cache):
-        states = [list(c.cache) if isinstance(c, ArraysCache) else None for c in prompt_cache]
-        if all(s is None for s in states):
-            return
+        states = [_end_state(c) for c in prompt_cache]
+        nbytes = sum(a.nbytes for a in _state_arrays(states))
+        if not nbytes or not _all_kept(states):
+            return  # attention only, which cuts back to any token; or state a checkpoint can't keep
         # Kept on its own: in a shared batch, a lazy slice of the batch's rows would keep every row alive.
-        mx.eval([a for s in states if s for a in s if a is not None])
+        mx.eval(list(_state_arrays(states)))
         key = tuple(tokens)
-        self._checkpoints.pop(key, None)
-        self._checkpoints[key] = states
-        self._fit_checkpoints()
-        logging.debug("memory cache: a recurrent-state checkpoint at token %d (%d kept, %.0f MB)", len(key),
-                      len(self._checkpoints), self._checkpoint_bytes() / 1e6)
+        old = self._checkpoints.pop(key, None)
+        learned = key in self._learn or (old is not None and old.learned)
+        self._learn.pop(key, None)
+        self._checkpoints[key] = _Checkpoint(states, nbytes, self._fetches, learned)
+        self._fit_checkpoints(key)
+        logging.debug("memory cache: a checkpoint at token %d (%d kept, %.0f MB)", len(key), len(self._checkpoints),
+                      self._checkpoint_bytes() / 1e6)
 
     def _memory_reach(self, result, tokens) -> int:
         """The tokens _fetch_from_memory reuses, from the trie's search result for them."""
@@ -713,7 +798,7 @@ class MovingPromptCache(LRUPromptCache):
             return None
         entry = self._trie.get(result.model, result.longer)
         n = len(key)
-        resumed = _resume(entry.prompt_cache, self._checkpoints[key], n)
+        resumed = _resume(entry.prompt_cache, self._checkpoints[key].states, n)
         if resumed is None:
             return None
         # Counted as used (and logged) only if nothing else covers more: see fetch_nearest_cache.
@@ -741,7 +826,7 @@ class MovingPromptCache(LRUPromptCache):
 
     def _plan_checkpoints(self, tokens, have: int):
         """Cut the request's segments where checkpoints are to be taken as it is read: every checkpoint_every tokens
-        of its first message (the system prompt and tools, where a request's first change usually is; not further,
+        of its system region (its system prompt and tools, where a request's first change usually is; not further,
         where they would hold a conversation's state as of one version of its system prompt, made again each time
         that changes), and at the start of the line where it left the cached entries, if that was well past what it
         reuses: a client that rewrites a line once tends to rewrite it again. Never at its last token: that one is read
@@ -751,13 +836,16 @@ class MovingPromptCache(LRUPromptCache):
             return
         every, end = self.checkpoint_every, len(tokens) - 1
         first = min(self.checkpoint_span, end - 1)
-        if self.turn_ends:
-            first = min(first, next((i for i, t in enumerate(tokens[:first]) if t in self.turn_ends), first))
+        if self.system_ends:
+            first = min(first, next((i for i, t in enumerate(tokens[:first]) if t in self.system_ends), first))
         at = set(range((have // every + 1) * every, first + 1, every))
         leaving, leaves = self._leaving
         if leaves - have >= self.checkpoint_min_gain:
             line = self._line_start(tokens, leaves, have)
             at.add(line)
+            if have < line < end:
+                self._learn = {k: None for k in list(self._learn)[-7:]}  # a few requests' worth, if never taken
+                self._learn[tuple(tokens[:line])] = None
             logging.info("memory cache: the request leaves a cached %d-token entry at token %d and reuses %d; a "
                          "checkpoint at token %d covers that line next time%s", len(leaving), leaves, have, line,
                          self._show_divergence(leaving, tokens, leaves, ("cached", "request")))
@@ -940,13 +1028,12 @@ class Engine:
             logging.warning("%s keeps its KV cache at full precision: kv_bits = %d doesn't apply to it", spec.name,
                             spec.kv_bits)
             self.spec = spec = replace(spec, kv_bits=None)
-        layers = self.provider.model.make_cache()
-        if any(isinstance(c, ArraysCache) for c in layers) and all(
-                isinstance(c, ArraysCache) or type(c) in (KVCache, QuantizedKVCache) for c in layers):
-            # Recurrent layers: a cache can't be cut back without checkpoints (see _resume for what resumes).
-            cache.checkpoint_every = CHECKPOINT_TOKENS
-            cache.turn_ends = frozenset(self.tokenizer.eos_token_ids or ())
         self.inkling = inkling.is_inkling(self.tokenizer)
+        if _checkpointable(self.provider.model.make_cache()):
+            # Recurrent layers, or sliding windows: a cache can't be cut back without checkpoints (see _resume).
+            cache.checkpoint_every = CHECKPOINT_GRID
+            cache.system_ends = inkling.conversation_starts(self.tokenizer) if self.inkling \
+                else frozenset(self.tokenizer.eos_token_ids or ())
         _OWN_TOOL_CALLS.active = self.inkling
         cache.decode = self.tokenizer.decode
         self.budget_tokens = BudgetTokens(self.tokenizer)
