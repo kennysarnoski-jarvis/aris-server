@@ -1,4 +1,5 @@
-"""`aris-server claude`: Claude Code on the model a running Aris Server has loaded, told the window to compact by."""
+"""`aris-server claude`: Claude Code on the model a running Aris Server has loaded, told the window to compact by and
+without the tools a local coding session has no use for."""
 
 from __future__ import annotations
 
@@ -25,11 +26,23 @@ ROUTING_VARIABLES = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BAS
 # runs one model and refuses a request that names another it knows, so each names the loaded one.
 MODEL_VARIABLES = ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
                    "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL")
+# Claude Code's tools for orchestrating other agents, scheduling and review, which a local coding session has no use
+# for, and WebSearch, which runs on Anthropic's side. The ones Claude Code lists on every request took 3,446 tokens of
+# each prompt on 2.1.319: a cold first reply 31 s later on the 8-bit 27B, and that much less room before compacting.
+# Aris Code's Aris Local leaves out the same ones.
+LEFT_OUT_TOOLS = ("WebSearch", "Workflow", "ScheduleWakeup", "ReportFindings", "ListAgents", "SendMessage",
+                  "CronCreate", "CronDelete", "CronList", "EnterWorktree", "ExitWorktree")
 
 
 def claude_code_window(window: int) -> int:
     """The window to tell Claude Code (CLAUDE_CODE_MAX_CONTEXT_TOKENS) for a server that holds `window` tokens."""
     return max(int(window * COMPACT_AT_SHARE), window - COMPACT_RESERVE) + COMPACT_RESERVE
+
+
+def arguments(args: list[str]) -> list[str]:
+    """Claude Code's arguments: the left-out tools, then the user's own. The option takes a list, and given as a
+    separate word it would take a prompt that followed as more tool names; attached with `=` it takes just its value."""
+    return [f"--disallowedTools={','.join(LEFT_OUT_TOOLS)}", *args]
 
 
 def served_model(base_url: str, api_key: str, timeout: float = 5.0) -> tuple[str, int | None]:
@@ -74,5 +87,5 @@ def launch(host: str, port: int, api_key: str | None, args: list[str]) -> int:
         return 2
     print(f"Claude Code on {name}" + (f", with {window:,} tokens of context on this Mac" if window else ""),
           file=sys.stderr)
-    os.execve(claude, [claude, *args], environment(base_url, key, name, window, dict(os.environ)))
+    os.execve(claude, [claude, *arguments(args)], environment(base_url, key, name, window, dict(os.environ)))
     return 0  # only where execve is stubbed out, as in the tests

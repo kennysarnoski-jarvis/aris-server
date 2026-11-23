@@ -32,9 +32,11 @@ aris-server claude
 
 `aris-server claude` starts Claude Code on the model the server has loaded, told the context window to compact by
 (below). Its background work and subagents run on that model too, and a shell set up for Anthropic's API, Bedrock or
-Vertex doesn't send it there. Claude Code's own arguments go after it, as in `aris-server claude --continue`. Claude
-Code's own traffic, such as its update checks and telemetry, is Claude Code's setting:
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` turns it off.
+Vertex doesn't send it there. It leaves out the tools a local coding session has no use for: Claude Code's tools for
+orchestrating other agents, scheduling and review, and WebSearch, which runs on Anthropic's side. That takes 3.4k
+tokens out of every prompt, so a fresh session's first reply comes about 30 s sooner on the 8-bit 27B. Claude Code's own
+arguments go after it, as in `aris-server claude --continue`. Claude Code's own traffic, such as its update checks and
+telemetry, is Claude Code's setting: `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` turns it off.
 
 Any other model mlx-lm can load works too, by its Hugging Face name or a local folder:
 `aris-server serve --model mlx-community/Qwen3.5-9B-MLX-8bit`.
@@ -43,11 +45,12 @@ Claude Code assumes a 200k-token window and compacts its conversation 33k tokens
 model's window is whatever fits beside its weights (the server logs it at startup, and `/v1/models` lists it as
 `context_window`), and told that window as it is, Claude Code would compact a small one about every turn. So
 `aris-server claude` tells it, in `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, a window at which it compacts at 80% of the
-server's (or 33k short of it, as usual, on a window above 165k). To start Claude Code yourself, tell it the same: for
-the 8-bit 27B's 100,352 tokens on a 48 GB Mac, that's 113,281.
+server's (or 33k short of it, as usual, on a window above 165k). To start Claude Code yourself, tell it the same and
+leave out the same tools: for the 8-bit 27B's 100,352 tokens on a 48 GB Mac, the window is 113,281.
 
 ```bash
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=113281 ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=113281 ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude \
+  --disallowedTools=WebSearch,Workflow,ScheduleWakeup,ReportFindings,ListAgents,SendMessage,CronCreate,CronDelete,CronList,EnterWorktree,ExitWorktree
 ```
 
 ## Aris 3.8-27B

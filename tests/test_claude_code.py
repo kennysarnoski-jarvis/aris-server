@@ -23,6 +23,16 @@ def test_claude_code_compacts_at_80_percent_of_a_small_window_and_33k_short_of_a
 MODELS = dict.fromkeys(("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
                         "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                         "CLAUDE_CODE_SUBAGENT_MODEL"), "aris-3.8-27b")
+LEFT_OUT = ("--disallowedTools=WebSearch,Workflow,ScheduleWakeup,ReportFindings,ListAgents,SendMessage,CronCreate,"
+            "CronDelete,CronList,EnterWorktree,ExitWorktree")
+
+
+def test_claude_code_starts_without_the_tools_a_local_session_has_no_use_for():
+    # The same ones Aris Code's Aris Local leaves out, in one word attached with "=": given as a separate word, the
+    # option takes a list and would take the prompt after it as more tool names.
+    assert claude_code.arguments(["-p", "fix it"]) == [LEFT_OUT, "-p", "fix it"]
+    assert claude_code.arguments(["fix it"]) == [LEFT_OUT, "fix it"]
+    assert claude_code.arguments([]) == [LEFT_OUT]
 
 
 def test_claude_code_is_pointed_at_the_server_and_keeps_a_window_the_user_set():
@@ -96,7 +106,7 @@ def test_claude_code_starts_on_the_loaded_model_with_its_own_arguments(server, c
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-real")
     assert cli.main(["claude", "--port", str(port), "-p", "fix the failing test", "--continue"]) == 0
     [(file, argv, env)] = started
-    assert file == path and argv == [path, "-p", "fix the failing test", "--continue"]
+    assert file == path and argv == [path, LEFT_OUT, "-p", "fix the failing test", "--continue"]
     assert env["ANTHROPIC_BASE_URL"] == f"http://127.0.0.1:{port}" and env["ANTHROPIC_AUTH_TOKEN"] == "local"
     assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "113281" and "ANTHROPIC_API_KEY" not in env
     assert env["ANTHROPIC_MODEL"] == env["CLAUDE_CODE_SUBAGENT_MODEL"] == "aris-3.8-27b"
@@ -108,7 +118,7 @@ def test_arguments_after_a_double_dash_go_to_claude_code_whatever_they_are(serve
     port, _ = server()
     path, started = claude
     assert cli.main(["claude", "--port", str(port), "--", "--port", "1"]) == 0
-    assert started[0][1] == [path, "--port", "1"]
+    assert started[0][1] == [path, LEFT_OUT, "--port", "1"]
 
 
 def test_the_servers_key_is_passed_on(server, claude):
