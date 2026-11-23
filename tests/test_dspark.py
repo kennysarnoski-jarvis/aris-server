@@ -292,8 +292,9 @@ def test_a_quantized_drafter_still_gives_the_targets_output(model, bits):
     assert drafter._fold_weight is None and drafter._fold_q is not None
 
 
+@pytest.mark.parametrize("padding", [0, 4])  # a batch survivor's left padding: keys before its first token
 @pytest.mark.parametrize("rows", [2, 3, 5, 8])
-def test_a_few_rows_of_full_attention_match_the_reference(rows):
+def test_a_few_rows_of_full_attention_match_the_reference(rows, padding):
     from aris_server.models.inkling2.layers import _attention_reference, _rows_attention
 
     S, H, Hkv, D, R = 21, 4, 2, 16, 8
@@ -302,7 +303,7 @@ def test_a_few_rows_of_full_attention_match_the_reference(rows):
     q = mx.random.normal((1, H, rows, D), key=k1)
     k, v = mx.random.normal((1, Hkv, S, D), key=k2), mx.random.normal((1, Hkv, S, D), key=k3)
     bias, sinks = mx.random.normal((1, rows, H, R), key=k4), mx.random.normal((1, rows, H), key=k5)
-    end = S  # the rows are the last `rows` keys, as after a cache update
+    end = S - padding  # the rows are the last `rows` keys, as after a cache update
     qpos, kpos = mx.arange(end - rows, end), mx.arange(S) + (end - S)
     expected = _attention_reference(q, k, v, bias, sinks, scale=D ** -0.5, window=0, query_positions=qpos,
                                     key_positions=kpos)

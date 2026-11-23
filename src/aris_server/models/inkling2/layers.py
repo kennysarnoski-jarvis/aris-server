@@ -237,6 +237,9 @@ def _attention_reference(
 # them as for a prompt chunk: 2.4 ms per full-attention visit at 13k keys on an M4 Pro, 3.7 ms at 22k, where fused
 # attention takes 1.0-2.1 ms and 1.5-3.0 ms (2 to 8 rows). Inkling 2 Mini has 8 such visits a token.
 VERIFY_ROWS = 8
+# Sliding-window visits (40 a token) stay on the kernel. Alone, fused attention took 0.59-0.94x of its time there for 2
+# to 4 rows, but served with it, Inkling 2 Mini decoded 1-11% slower at adaptive depth on all five bench prompts (M4
+# Pro, 2026-11-22).
 
 
 def _rows_attention(
