@@ -162,6 +162,11 @@ def test_a_model_that_cannot_fit_stops_the_server_with_the_reason_instead_of_run
     check_memory("arete:27b-4bit", int(21.3 * gb), int(15.1 * gb), fits=8192)
     assert "only about 8192 tokens of context fit" in caplog.text
     caplog.clear()
+    # Inkling 2 Mini beside its head on a 32 GB Mac: it serves, but Claude Code would compact about every turn.
+    check_memory("inkling-2-mini", int(21.3 * gb), int(16.7 * gb), fits=19456)
+    assert "only about 19456 tokens of context fit" in caplog.text and "--no-mtp" in caplog.text
+    caplog.clear()
+    check_memory("arete:27b-4bit", int(21.3 * gb), int(15.9 * gb), fits=49152)
     check_memory("arete:27b", int(37.4 * gb), int(26.6 * gb), fits=62464)
     assert not caplog.text
 

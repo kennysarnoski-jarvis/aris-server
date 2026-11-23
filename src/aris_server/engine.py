@@ -161,8 +161,9 @@ def context_that_fits(limit: int, weights: int, kv_bytes_per_token: int, overhea
     return max(0, int(room // (PEAK_PER_KV_BYTE * kv_bytes_per_token))) // 1024 * 1024
 
 
-# Claude Code's own system prompt and tools take 9-15k tokens.
-MIN_USEFUL_CONTEXT = 16384
+# Claude Code's own system prompt and tools take 9-15k tokens, and it compacts at 80% of a small window (as
+# `aris-server claude` and Aris Code tell it to), so below about 32k it has no room left to work in.
+MIN_USEFUL_CONTEXT = 32768
 
 
 class NotEnoughMemory(RuntimeError):
@@ -196,8 +197,8 @@ def check_memory(name: str, limit: int, weights: int, fits: int | None = None) -
             "Use a smaller quantization of the model: 4-bit weights take about half the memory of 8-bit.")
     if fits is not None and fits < MIN_USEFUL_CONTEXT:
         logging.warning("only about %d tokens of context fit beside %s's weights, and Claude Code needs at least %d: "
-                        "kv_bits = 8 or a smaller quantization of the model leaves more room", fits, name,
-                        MIN_USEFUL_CONTEXT)
+                        "a smaller quantization of the model, kv_bits = 8, or --no-mtp (no draft head) leaves more "
+                        "room, where the model has them", fits, name, MIN_USEFUL_CONTEXT)
 
 
 def _kv_shape(config: dict) -> tuple[dict, int, int]:
