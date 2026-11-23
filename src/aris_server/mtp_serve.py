@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 from mlx_lm import server as mls
 from mlx_lm import utils as mlx_utils
 from mlx_lm.generate import GenerationBatch
@@ -84,8 +85,16 @@ class _ServedMTP:
     n_slots = 2
     kv_quantizable = True  # its attention is mlx-lm's, which reads a quantized cache
 
-    def __init__(self, head: mtp.MTPHead):
+    def __init__(self, head: mtp.MTPHead, draft_logits=None):
         self.head = head
+        self.draft_logits = draft_logits  # a cheaper copy of the output layer for drafts (draft_lm_head), or None
+
+    @property
+    def extra_bytes(self) -> int:
+        """What it keeps beside the model and the head: the draft output layer's copy."""
+        if self.draft_logits is None:
+            return 0
+        return sum(v.nbytes for _, v in tree_flatten(self.draft_logits.parameters()))
 
     def make_slots(self) -> list:
         return [self.head.make_cache(), ArraysCache(size=1)]
@@ -105,9 +114,10 @@ class _ServedMTP:
         if not depth:
             return [], False
         h = self.head(mtp.embed(model, mx.array([[token]])), pending[0], head_cache)
+        logits = self.draft_logits if self.draft_logits is not None else (lambda x: mtp.lm_logits(model, x))
         drafts = []
         for i in range(depth):
-            drafts.append(int(mx.argmax(mtp.lm_logits(model, h)[0, -1]).item()))
+            drafts.append(int(mx.argmax(logits(h)[0, -1]).item()))
             if i + 1 < depth:
                 h = self.head(mtp.embed(model, mx.array([[drafts[-1]]])), h, head_cache)
         if depth > 1:
@@ -131,9 +141,11 @@ class _ServedMTP:
         pending[0] = hidden[:, kept - 1:kept]
 
 
-def attach_mtp(model, head: mtp.MTPHead, *, depth: int = 2, adaptive: bool = False) -> None:
-    """Give `model` an MTP head: two more cache slots, and calls that keep the head's cache in step."""
-    _attach(model, _ServedMTP(head), head, depth, adaptive)
+def attach_mtp(model, head: mtp.MTPHead, *, depth: int = 2, adaptive: bool = False, draft_bits: int = 0) -> None:
+    """Give `model` an MTP head: two more cache slots, and calls that keep the head's cache in step. `draft_bits`
+    gives its drafts a copy of the output layer at those bits."""
+    draft = mtp.draft_lm_head(model, draft_bits) if draft_bits else None
+    _attach(model, _ServedMTP(head, draft), head, depth, adaptive)
 
 
 def add_head_rows(model, inputs, hidden, head_cache, pending, *, previous=None) -> None:
@@ -155,6 +167,7 @@ class _ServedDSpark:
 
     name = "DSpark"
     kv_quantizable = False  # its attention reads its contexts as arrays
+    extra_bytes = 0  # its derived tables are in Drafter.nbytes
 
     def __init__(self, drafter: dspark.Drafter):
         self.drafter = drafter
@@ -358,13 +371,19 @@ def _load_with_mtp(self, *args, **kwargs):
             drafter = dspark.load_drafter(folder, self.model, weights=spec.mtp, bits=spec.mtp_bits or None)
             attach_dspark(self.model, drafter, depth=spec.mtp_depth, adaptive=spec.mtp_adaptive)
             kind = "DSpark draft head"
+            if spec.mtp_draft_bits:
+                log.warning("mtp_draft_bits is for MTP heads; Inkling's draft head scores with its own tables")
         else:
             head = mtp.load_mtp_head(spec.mtp, mtp.text_model(self.model).args, bits=spec.mtp_bits or None)
-            attach_mtp(self.model, head, depth=spec.mtp_depth, adaptive=spec.mtp_adaptive)
+            attach_mtp(self.model, head, depth=spec.mtp_depth, adaptive=spec.mtp_adaptive,
+                       draft_bits=spec.mtp_draft_bits)
             kind = "MTP head"
-        log.info("%s %s attached (%s, %s %d drafts per round)", kind, spec.mtp,
-                 f"{spec.mtp_bits}-bit" if spec.mtp_bits else "unquantized",
-                 "as many as pay, up to" if spec.mtp_adaptive else "", spec.mtp_depth)
+        drafts = f"as many drafts a round as pay, up to {spec.mtp_depth}" if spec.mtp_adaptive \
+            else f"{spec.mtp_depth} drafts a round"
+        through = f", drafting through a {spec.mtp_draft_bits}-bit output layer" \
+            if spec.mtp_draft_bits and not _is_inkling(self.model) else ""
+        log.info("%s %s attached (%s, %s%s)", kind, spec.mtp,
+                 f"{spec.mtp_bits}-bit" if spec.mtp_bits else "unquantized", drafts, through)
     return result
 
 

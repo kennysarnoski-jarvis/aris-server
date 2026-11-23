@@ -56,6 +56,8 @@ def main(argv=None):
     s.add_argument("--mtp-depth", type=int, choices=range(0, 8), metavar="0-7",
                    help="tokens the draft head drafts per round (0 turns drafting off)")
     s.add_argument("--no-mtp", dest="use_mtp", action="store_false", help="decode without the draft head")
+    s.add_argument("--mtp-draft-bits", type=int, choices=(0, 4, 8),
+                   help="an MTP head's drafts go through a copy of the output layer at these bits (0: the model's)")
     s.add_argument("--mtp-fixed", action="store_true",
                    help="draft --mtp-depth tokens every round, instead of as many as pay (up to it)")
     sub.add_parser("models", help="list configured and built-in models")
@@ -123,6 +125,8 @@ def main(argv=None):
         spec = dataclasses.replace(spec, mtp_depth=a.mtp_depth)
     if a.mtp_fixed:
         spec = dataclasses.replace(spec, mtp_adaptive=False)
+    if a.mtp_draft_bits is not None:
+        spec = dataclasses.replace(spec, mtp_draft_bits=a.mtp_draft_bits)
     if not a.use_mtp:
         spec = dataclasses.replace(spec, mtp=None)
     if spec.mtp and not Path(spec.mtp).is_file():

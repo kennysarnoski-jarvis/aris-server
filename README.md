@@ -136,12 +136,15 @@ mtp_depth = 3
 
 `mtp_depth` is the most tokens a round guesses. Each round guesses as many as pay there, learned as the reply goes,
 since text that copies takes far more guesses than prose; where guessing doesn't pay, the server decodes plainly.
-`mtp_adaptive = false` guesses `mtp_depth` every round instead. `mtp_bits` quantizes the head (8 unless set; 0 keeps
-it as shipped). `--mtp`, `--mtp-depth`, `--mtp-fixed` and `--no-mtp` do the same on the command line. A request
-speculates while it decodes alone; several at once decode as before. On a 48 GB M4 Pro, Claude Code finished a coding task on the 27B in
-150 s with its head and 241 s without, its replies streaming at about 16 tokens a second instead of 7. Inkling's head
-is a smaller win, because each extra token Inkling checks reads more of its experts: 1.1-1.3 times mlx-lm's own
-decoding on code and long contexts, and about even on prose.
+`mtp_adaptive = false` guesses `mtp_depth` every round instead. `mtp_bits` quantizes the head (8 unless set; 0 keeps it
+as shipped). `mtp_draft_bits = 4` gives an MTP head's guesses a 4-bit copy of the model's output layer, which each guess
+reads in full: faster guesses for about 0.7 GB more memory on the 8-bit 27B (0, the model's own layer, unless set;
+Inkling's head scores with its own tables and ignores it). `--mtp`, `--mtp-depth`, `--mtp-fixed`, `--mtp-draft-bits` and
+`--no-mtp` do the same on the command line. A request speculates while it decodes alone; several at once decode as
+before. On a 48 GB M4 Pro, Claude Code finished a coding task on the 27B in 150 s with its head and 241 s without, its
+replies streaming at about 16 tokens a second instead of 7. Inkling's head is a smaller win, because each extra token
+Inkling checks reads more of its experts: 1.1-1.3 times mlx-lm's own decoding on code and long contexts, and about even
+on prose.
 
 ## Run it as a service
 

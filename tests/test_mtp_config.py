@@ -20,7 +20,10 @@ def test_models_toml_mtp_settings_parse_and_validate(tmp_path):
     assert (spec.mtp, spec.mtp_depth, spec.mtp_bits) == (str(head), 3, 0)
     plain = _spec("m", {"path": "repo/x"}, "m")
     assert (plain.mtp, plain.mtp_depth, plain.mtp_bits) == (None, 2, 8)
-    for bad in ({"mtp_depth": 9}, {"mtp_depth": -1}, {"mtp_depth": 1.5}, {"mtp_bits": 6}):
+    assert plain.mtp_draft_bits == 0 and plain.mtp_adaptive
+    assert _spec("m", {"path": "repo/x", "mtp_draft_bits": 4}, "m").mtp_draft_bits == 4
+    for bad in ({"mtp_depth": 9}, {"mtp_depth": -1}, {"mtp_depth": 1.5}, {"mtp_bits": 6}, {"mtp_draft_bits": 6},
+                {"mtp_draft_bits": "4"}):
         with pytest.raises(ValueError):
             _spec("m", {"path": "repo/x", **bad}, "m")
 
@@ -44,7 +47,7 @@ def test_the_head_is_attached_when_the_model_loads(tmp_path, monkeypatch):
         mx.save_safetensors(str(path), {"mtp." + k: v for k, v in tree_flatten(head.parameters())},
                             metadata={"mtp_format": "mlx"})
         provider = SimpleNamespace(model=None, _mtp_spec=SimpleNamespace(mtp=str(path), mtp_bits=0, mtp_depth=3,
-                                                                    mtp_adaptive=False))
+                                                                    mtp_adaptive=False, mtp_draft_bits=0))
 
         def fake_load(self, *a, **k):
             self.model = model
@@ -69,6 +72,23 @@ def test_memory_sizing_counts_the_heads_weights():
         mx.eval(head.parameters())
         mtp_serve.attach_mtp(model, head)
         assert model_bytes(model) == before + sum(v.nbytes for _, v in tree_flatten(head.parameters()))
+
+
+def test_memory_sizing_counts_the_draft_output_layers_copy():
+    from aris_server.engine import model_bytes
+
+    with mx.stream(mx.cpu):
+        model = tiny_hybrid_model()
+        before = model_bytes(model)
+        head = mtp.MTPHead(mtp.text_model(model).args)
+        mx.eval(head.parameters())
+        mtp_serve.attach_mtp(model, head, draft_bits=4)
+        copy = model._mtp_served.draft_logits
+        args = mtp.text_model(model).args
+        assert copy.bits == 4 and copy.weight.shape == (args.vocab_size, args.hidden_size * 4 // 32)  # every row
+        extra = sum(v.nbytes for _, v in tree_flatten(copy.parameters()))
+        assert extra > 0
+        assert model_bytes(model) == before + sum(v.nbytes for _, v in tree_flatten(head.parameters())) + extra
 
 
 def test_a_model_without_mtp_settings_loads_untouched(monkeypatch):

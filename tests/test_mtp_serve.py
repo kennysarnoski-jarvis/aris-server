@@ -71,6 +71,24 @@ def oracle(reference, right=3):
     return draft
 
 
+def test_drafts_through_a_4_bit_output_layer_keep_the_output():
+    """A cheaper copy of the output layer only changes the guesses: the tokens are the model's own."""
+    want, _, _ = generate(tiny_hybrid_model(), PROMPTS[:1], [30])
+    model = tiny_hybrid_model()
+    mx.random.seed(1)
+    head = mtp.MTPHead(mtp.text_model(model).args)
+    mx.eval(head.parameters())
+    mtp_serve.attach_mtp(model, head, depth=3, draft_bits=4)
+    served = model._mtp_served
+    copy, calls = served.draft_logits, []
+    served.draft_logits = lambda hidden: calls.append(hidden.shape) or copy(hidden)
+    got, (cache,), _ = generate(model, PROMPTS[:1], [30])
+    assert got == want
+    assert calls and model._mtp_config.stats.rounds > 0  # the drafts went through the copy
+    trunk, head_offset = offsets(cache)
+    assert trunk == head_offset == len(PROMPTS[0]) + len(got[0])
+
+
 def test_a_lone_sequence_with_a_random_head_decodes_exactly_as_plain():
     want, _, _ = generate(tiny_hybrid_model(), PROMPTS[:1], [30])
     model = with_mtp(depth=2)

@@ -7,7 +7,7 @@ from pathlib import Path
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 KV_BITS_CHOICES = (4, 8)
-MAX_MTP_DEPTH = 7  # drafts per round: an Inkling 2 draft block holds 7; past 3, Qwen's chained MTP drafts rarely survive
+MAX_MTP_DEPTH = 7  # drafts a round: an Inkling 2 draft block holds 7; past 3, Qwen's chained MTP drafts rarely hold
 DEFAULT_THINK_BUDGET = {"low": 1024, "medium": 4096, "high": 8192, "xhigh": 16384, "max": 0}
 
 
@@ -55,6 +55,9 @@ class ModelSpec:
     mtp_depth: int = 2
     mtp_bits: int = 8
     mtp_adaptive: bool = True
+    # The output layer an MTP head's drafts go through: the model's own (0), or a copy at 4 or 8 bits, which reads
+    # less per draft (about 0.7 GB beside Aris 3.8-27B's 8-bit layer, at 4 bits). Only the guesses change.
+    mtp_draft_bits: int = 0
 
     def budget_for(self, effort: str) -> int:
         return int(self.think_budget.get(effort, DEFAULT_THINK_BUDGET.get(effort, 0)))
@@ -115,6 +118,8 @@ def _spec(name: str, raw: dict, where: str) -> ModelSpec:
         raise ValueError(f"{where}: mtp_depth must be a whole number from 0 to {MAX_MTP_DEPTH}")
     if raw.get("mtp_bits", 8) not in (0, 4, 8):
         raise ValueError(f"{where}: mtp_bits must be 0 (unquantized), 4 or 8")
+    if raw.get("mtp_draft_bits", 0) not in (0, 4, 8):
+        raise ValueError(f"{where}: mtp_draft_bits must be 0 (the model's own output layer), 4 or 8")
     if not isinstance(raw.get("mtp_adaptive", True), bool):
         raise ValueError(f"{where}: mtp_adaptive must be true or false")
     return ModelSpec(
@@ -132,7 +137,7 @@ def _spec(name: str, raw: dict, where: str) -> ModelSpec:
         template_kwargs=dict(raw.get("template_kwargs") or {}),
         mtp=str(Path(raw["mtp"]).expanduser()) if raw.get("mtp") else None,
         **{k: raw[k] for k in ("temperature", "top_p", "top_k", "followup_budget", "mtp_depth", "mtp_bits",
-                               "mtp_adaptive") if k in raw},
+                               "mtp_adaptive", "mtp_draft_bits") if k in raw},
     )
 
 

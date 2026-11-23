@@ -3,7 +3,6 @@ decoding, several per step when drafts are accepted, the drafter's contexts in s
 included, and exact finishes mid-round."""
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -162,7 +161,7 @@ def test_the_drafter_is_attached_when_an_inkling_model_loads(tmp_path, monkeypat
     head = tmp_path / "mtp.safetensors"
     mx.save_safetensors(str(head), dict(tree_flatten(drafter.parameters())))
     provider = SimpleNamespace(model=None, _mtp_spec=SimpleNamespace(mtp=str(head), mtp_bits=0, mtp_depth=4,
-                                                                    mtp_adaptive=True))
+                                                                    mtp_adaptive=True, mtp_draft_bits=0))
     monkeypatch.setattr(mtp_serve, "_original_load", lambda self, *a, **k: setattr(self, "model", model))
     n = len(model.make_cache())
     mtp_serve._load_with_mtp(provider, str(tmp_path))
