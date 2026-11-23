@@ -18,7 +18,7 @@ from mlx_lm.models.cache import ArraysCache
 
 from mlx_lm.models.cache import CacheList, KVCache, QuantizedKVCache, RotatingKVCache
 
-from aris_server import dspark, inkling, mtp, mtp_serve
+from aris_server import disk_cache, dspark, inkling, mtp, mtp_serve
 from aris_server.engine import (MovingPromptCache, _Checkpoint, _checkpointable, _flat_caches, _split_segments,
                                 merge_prompt_tail)
 from aris_server.kv_quant import quantize_kv
@@ -487,3 +487,26 @@ def test_a_line_where_a_request_left_the_cache_outlasts_grid_checkpoints_however
     gone = drop_down_to(cache, 1, newest=prompt[:256])
     assert [len(k) for k in gone] == [128, 64, 192, 256]  # the grid by gap, its last one last; then the line
     assert list(cache._checkpoints) == [prompt[:100]]
+
+
+def test_a_conversation_keeps_its_turns_in_memory_once_eight_sessions_fill_the_cache(tmp_path, monkeypatch):
+    # Overnight on the M4, from the eighth agent task on, every finished turn was written to disk and read back by the
+    # next turn: 371 GB in under three hours. Each session's system prompt is its own (it carries the working
+    # directory), and once eight of them filled the cache's entries, mlx-lm's order let the turn just finished go.
+    monkeypatch.setattr(disk_cache, "MIN_TOKENS", 16)  # these prompts are short; Claude Code's is over 10k tokens
+    model = kv8_hybrid_model()
+    cache = cache_for(model)
+    cache.max_size = 8
+    cache.disk = disk_cache.DiskCache(tmp_path, "tiny", max_bytes=1 << 30)
+    sessions = [system(text(100 + s, len(LEDGER) - 1) + [NEWLINE]) for s in range(9)]
+    for prompt in sessions[:8]:                                                 # eight earlier sessions, a turn each
+        serve(cache, model, prompt + USER, system_tokens=len(prompt))
+    live = sessions[8]
+    _, out, _ = serve(cache, model, live + USER, system_tokens=len(live))
+
+    def live_turns_on_disk():
+        return [t for t, _ in cache.disk.index.values() if len(t) > len(live) and list(t[:len(live)]) == live]
+
+    assert live_turns_on_disk() == []                                           # its turn waits in memory
+    cached, _, _ = serve(cache, model, live + USER + out + TOOL_RESULT)
+    assert cached > len(live + USER) and live_turns_on_disk() == []             # and the next turn takes it from there
