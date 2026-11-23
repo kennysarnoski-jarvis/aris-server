@@ -88,6 +88,28 @@ def test_a_finished_turn_larger_than_the_budget_stays_and_older_entries_go():
     assert cache.fetch_nearest_cache("m", [7] * 50 + [1])[0] is None            # the older one went instead
 
 
+def test_the_system_prompt_a_conversation_starts_from_outlasts_older_ones():
+    cache = MovingPromptCache(max_size=3)
+    prompts = [[100 + s] + SYSTEM[1:] for s in range(4)]
+    for prompt in prompts[:3]:
+        cache.insert_cache("m", prompt, [Layer(10)], cache_type="system")
+    cache.fetch_nearest_cache("m", prompts[0] + [5])                            # a new conversation starts from it
+    cache.insert_cache("m", prompts[3], [Layer(10)], cache_type="system")
+    kept = [cache._trie.search("m", p).exact is not None for p in prompts]
+    assert kept == [True, False, True, True]                                    # the least recently used went
+
+
+def test_a_turn_its_next_request_took_leaves_the_eviction_order():
+    cache = MovingPromptCache(max_size=2)
+    cache.insert_cache("m", TURN1, [Layer(50)], cache_type="assistant")
+    cache.insert_cache("m", SYSTEM, [Layer(10)], cache_type="system")
+    cache.fetch_nearest_cache("m", TURN1 + [7])                                 # taken: it is the request's now
+    cache.insert_cache("m", TURN1 + [7, 8], [Layer(60)], cache_type="assistant")  # that request, finished
+    cache.insert_cache("m", [5] * 50, [Layer(20)], cache_type="assistant")      # a third entry: one must go
+    kept = [cache._trie.search("m", p).exact is not None for p in (SYSTEM, TURN1 + [7, 8], [5] * 50)]
+    assert kept == [False, True, True]
+
+
 def test_the_context_that_fits_leaves_room_for_the_peak_reading_a_prompt_reaches():
     from aris_server.engine import CONTEXT_OVERHEAD, context_that_fits
 
@@ -273,8 +295,8 @@ def test_room_for_the_peak_reading_a_prompt_reaches_is_made_before_it_is_read(pr
     # GPU out of memory.
     cache = MovingPromptCache(max_size=10, max_bytes=100_000)
     cache.kv_bytes_per_token = 10
-    cache.insert_cache("m", SYSTEM, [Layer(1_000)], cache_type="system")
     cache.insert_cache("m", [7] * 50, [Layer(older_bytes)], cache_type="assistant")  # an older conversation
+    cache.insert_cache("m", SYSTEM, [Layer(1_000)], cache_type="system")
     prompt = [9] * prompt_tokens                                                     # nothing in memory matches
     assert cache.fetch_nearest_cache("m", prompt) == (None, prompt)
     cache.trim_to(n_bytes=cache.max_bytes)                  # mlx-lm's next call: nothing is active yet

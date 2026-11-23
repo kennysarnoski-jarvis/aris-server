@@ -61,6 +61,21 @@ def test_a_finished_turn_reaches_disk_only_when_memory_lets_it_go(tmp_path):
     assert taken.disk.index == {}
 
 
+def test_a_finished_turn_stays_in_memory_when_system_prompts_fill_the_cache(tmp_path):
+    # Each Claude Code session's system prompt is its own (it carries the working directory). Once eight of them
+    # filled the entries, the turn just finished was the one evicted, every turn: to disk, and back for the next.
+    cache = MovingPromptCache(max_size=8)
+    cache.disk = DiskCache(tmp_path, "model-a", max_bytes=1 << 30)
+    sessions = [[9000 + s] + SYSTEM[1:] for s in range(8)]
+    for s, prompt in enumerate(sessions):
+        cache.insert_cache("m", prompt, layers(1200, s), cache_type="system")
+    turn, kept = sessions[-1] + list(range(5000, 6000)), layers(2200, 9)
+    cache.insert_cache("m", turn, kept, cache_type="assistant")
+    assert sorted(len(t) for t, _ in cache.disk.index.values()) == [1200] * 8  # the system prompts, not the turn
+    assert cache._trie.search("m", sessions[0]).exact is None                  # the oldest went (it's on disk)
+    assert cache.fetch_nearest_cache("m", turn + [1]) == (kept, [1])           # the next turn takes it from memory
+
+
 def test_short_prompts_and_mid_turn_snapshots_stay_off_disk(tmp_path):
     cache = cache_with_disk(tmp_path)
     cache.insert_cache("m", list(range(100)), layers(100, 1), cache_type="assistant")
@@ -312,6 +327,7 @@ def test_a_damaged_cache_is_dropped_and_the_turn_reads_on_from_what_memory_has(t
     cache = cache_with_disk(tmp_path)
     cache.insert_cache("m", SYSTEM, layers(1200, 1), cache_type="system")
     cache.insert_cache("m", TURN2, layers(2700, 3), cache_type="assistant")
+    cache.fetch_nearest_cache("m", SYSTEM + [5])                                # another conversation starts from it
     cache.trim_to(n_bytes=cache._n_bytes_by_type["system"])                     # memory keeps only the system prompt
     (data,) = [p for p, (t, _) in cache.disk.index.items() if t == tuple(TURN2)]
     data.write_bytes(b"damaged")

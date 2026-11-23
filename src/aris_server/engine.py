@@ -11,6 +11,7 @@ import math
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional
@@ -507,6 +508,44 @@ class _EvictionTrie:
         return entry
 
 
+class _RecencyOrder(LRUPromptCache.CacheOrder):
+    """The order the prompt cache lets entries go in: the least recently used first, whatever its type. mlx-lm's own
+    order takes a finished turn before any system prompt while there are at least as many turns as user-prompt
+    snapshots, which this cache never keeps. Each Claude Code session's system prompt is its own (it carries the
+    working directory and git status), so once eight sessions' system prompts filled the cache's entries, the turn
+    that had just finished was the one to go, every turn: written to disk, and read back by the next turn. That wrote
+    367 GB in a night of agent tasks on a 48 GB Mac."""
+
+    def __init__(self):
+        super().__init__()
+        self._order: deque = deque()  # (model, tokens, type), least recently used first
+
+    def push(self, model, tokens, cache_type="assistant"):
+        super().push(model, tokens, cache_type)
+        self._order.append((model, tokens, cache_type))
+
+    def _at(self, model, tokens):
+        return next((i for i, (m, t, _) in enumerate(self._order) if m == model and t == tokens), None)
+
+    def remove(self, model, tokens):
+        super().remove(model, tokens)
+        i = self._at(model, tokens)
+        if i is not None:
+            del self._order[i]
+
+    def touch(self, model, tokens):
+        """An entry a request just started from goes last."""
+        i = self._at(model, tokens)
+        if i is not None:
+            self._order.append(self._order[i])
+            del self._order[i]
+
+    def pop(self):
+        model, tokens, cache_type = self._order.popleft()
+        self._lrus[cache_type].remove((model, tokens))
+        return model, tokens
+
+
 class MovingPromptCache(LRUPromptCache):
     """mlx-lm copies a saved cache for the request that continues it, so a long conversation sits in memory twice
     for the whole turn (2.4 GB extra at 37k tokens on a 27B model, enough to run a 48 GB Mac out of memory). A
@@ -538,6 +577,7 @@ class MovingPromptCache(LRUPromptCache):
         super().__init__(*args, **kwargs)
         self.reading: list[list[int]] = []  # prompts of the requests in flight
         self._trie = _EvictionTrie(self._trie, self._evicted)
+        self._lru = _RecencyOrder()
         # A checkpoint's tokens -> each layer's state after reading them, least recently run along first.
         self._checkpoints: dict[tuple, _Checkpoint] = {}
         self._fetches = 0  # requests fetched so far: a checkpoint's recency
@@ -924,6 +964,7 @@ class MovingPromptCache(LRUPromptCache):
         key = result.exact if result.exact is not None else result.shorter
         entry = self._trie.get(result.model, key)
         if entry.cache_type == "system":
+            self._lru.touch(result.model, key)  # copied, and stays for the next conversation that starts from it
             return super().fetch_nearest_cache(model, tokens)
         self._trie.taking = True
         try:
