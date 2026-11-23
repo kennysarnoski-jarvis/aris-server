@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import __version__
-from .config import ModelSpec, resolve
+from .config import BUILTIN_MODELS, ModelSpec, resolve
 from .engine import Engine
 from .mtp_serve import mtp_snapshot
 from .stream import MessageBuilder, new_id, progress_note, sse
@@ -130,9 +130,13 @@ class Handler(BaseHTTPRequestHandler):
             path.write_text(json.dumps(body, indent=1, ensure_ascii=False))
         engine = self.server.engine
         name = body.get("model") or engine.spec.name
-        if name != engine.spec.name and name in self.server.models:
+        # A model the server knows by name but isn't running is refused, never answered by the one it is running: a
+        # client that picked Inkling would otherwise get the 27B under Inkling's name. Names it doesn't know (a client's
+        # own, like Claude Code's small model) go to the loaded model.
+        if name != engine.spec.name and (name in self.server.models or name in BUILTIN_MODELS):
+            where = "configured" if name in self.server.models else "built in"
             return self._error(400, "invalid_request_error",
-                               f"model {name!r} is configured but not loaded (loaded: {engine.spec.name!r})")
+                               f"model {name!r} is {where} but not loaded (loaded: {engine.spec.name!r})")
         spec = engine.spec if name not in self.server.models else resolve(name, self.server.models)
         try:
             p = plan(body, spec, guards=self.server.guards)

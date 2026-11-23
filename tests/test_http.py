@@ -200,3 +200,23 @@ def test_a_dead_engine_drops_the_stream_so_the_client_retries_instead_of_giving_
     except ConnectionResetError:
         pass
     assert b"message_start" in got and b"generation thread died" not in got and b'"type": "error"' not in got
+
+
+def test_a_known_model_that_isnt_loaded_is_refused_not_answered_by_the_loaded_one(serve):
+    engine = FakeEngine([("normal", "hi"), ("normal", "")])
+    engine.endless = False
+    port = serve(engine)
+
+    def ask(model):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("POST", "/v1/messages", json.dumps({**BODY, "model": model}),
+                     {"content-type": "application/json"})
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read())
+
+    status, body = ask("inkling-2-mini")  # built in, but this server runs "fake"
+    assert status == 400 and body["error"] == {
+        "type": "invalid_request_error",
+        "message": "model 'inkling-2-mini' is built in but not loaded (loaded: 'fake')"}
+    status, body = ask("claude-haiku-4-5")  # a client's own name: the loaded model answers it
+    assert status == 200 and body["content"][0]["text"] == "hi"
