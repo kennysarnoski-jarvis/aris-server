@@ -82,15 +82,14 @@ Server serves its text; images aren't supported yet. mlx-lm doesn't run Inkling 
 the model code from mlx-lm's open [pull request](https://github.com/ml-explore/mlx-lm/pull/2086) until a
 release does.
 
-## Why not Ollama?
+## Built for coding agents
 
 Aris Server does one job: serve a local model to coding agents properly.
 
 - **Native `/v1/messages`.** Thinking, tool calls and text stream as real Anthropic events from
   the first byte, with pings while a long prompt is read or a long tool call is written, so clients
   never time out on silence, and a client that hangs up stops its generation.
-- **Effort that works.** Claude Code's effort setting reaches models that have trained effort
-  levels.
+- **Effort.** Claude Code's effort setting reaches models that have trained effort levels.
 - **A think budget.** Reasoning models that overthink get their thinking closed at the end of
   the current line once they pass the budget for the requested effort, so they answer instead of
   burning every token deliberating.
@@ -100,7 +99,9 @@ Aris Server does one job: serve a local model to coding agents properly.
   of running on to the token cap. `--no-guards` turns both off.
 - **Claude Code's tool search.** Deferred tools stay out of the prompt until the agent loads them.
 - **Fast on Apple Silicon.** Built on [MLX](https://github.com/ml-explore/mlx) and mlx-lm:
-  continuous batching and a prompt cache that keeps the system prompt warm across conversations.
+  continuous batching, a [draft head](#draft-heads) for each built-in model, and a prompt cache that keeps the system
+  prompt warm across conversations, with checkpoints so that a hybrid model doesn't read a whole conversation again
+  after an agent rewrites part of its system prompt.
 
 ## Models
 
