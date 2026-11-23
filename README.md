@@ -3,9 +3,25 @@
 Run open-weight models on your Mac and use them from Claude Code, Aris Code, or anything else that
 speaks the Anthropic Messages API.
 
+## Two models, built in
+
+| Model | Name | Mac | Decoding with its draft head, 48 GB M4 Pro |
+|---|---|---|---|
+| [Aris 3.8-27B](#aris-38-27b) | `aris-3.8-27b` | 48 GB for the 8-bit build, 32 GB for the 4-bit | 17-27 tokens a second |
+| [Inkling 2 Mini](#inkling-2-mini) | `inkling-2-mini` | 32 GB | 34-44 tokens a second |
+
+Each comes with its own [draft head](#draft-heads), which guesses the next few tokens for the model to check
+in one pass: Aris 3.8-27B decodes 1.9 to 3.3 times as fast with it, and Inkling 2 Mini 1.1 to 1.4 times on
+code, edits and long contexts (and about the same on prose).
+
+**In [Aris Code](https://youraris.com):** Aris Local sets up Aris Server and the model for you.
+
+**With Aris Server on its own:**
+
 ```bash
 uv tool install aris-server
-aris-server serve --model mlx-community/Qwen3.5-9B-MLX-8bit
+aris-server pull aris-3.8-27b      # the build this Mac can hold, and its draft head; or inkling-2-mini
+aris-server serve --model aris-3.8-27b
 ```
 
 Then point Claude Code at it:
@@ -13,6 +29,9 @@ Then point Claude Code at it:
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude
 ```
+
+Any other model mlx-lm can load works too, by its Hugging Face name or a local folder:
+`aris-server serve --model mlx-community/Qwen3.5-9B-MLX-8bit`.
 
 Claude Code assumes a 200k-token window and compacts its conversation about 33k tokens short of the
 window it's given. A local model's window is whatever fits beside its weights, so tell Claude Code
@@ -35,9 +54,10 @@ aris-server pull aris-3.8-27b
 aris-server serve --model aris-3.8-27b
 ```
 
-The 8-bit build takes 27 GB, so it needs a Mac with 48 GB of memory or more, where it has about
-125k tokens of context. Its [model card](https://huggingface.co/YourAris/Aris-3.8-27B-MLX-8bit) has
-the details and evals.
+The 8-bit build takes 27 GB, so it needs a Mac with 48 GB of memory or more, where it has about 100k tokens of
+context beside its draft head (about 125k without it, with `--no-mtp`). Its
+[model card](https://huggingface.co/YourAris/Aris-3.8-27B-MLX-8bit) has the details and evals. Its draft head is
+[Qwen3.8-27B's own](https://huggingface.co/YourAris/Qwen3.8-27B-MTP-Head), and `pull` fetches it with the weights.
 
 ## Inkling 2 Mini
 
@@ -50,8 +70,9 @@ aris-server pull inkling-2-mini
 aris-server serve --model inkling-2-mini
 ```
 
-On a 48 GB M4 Pro it writes about 32 tokens a second and reads prompts at about 370, with room for about
-320k tokens of context. Its thinking and tool calls stream as Anthropic events, like any other model's. Aris
+On a 48 GB M4 Pro it writes about 32 tokens a second on its own and 34 to 44 with its draft head, which
+`pull` fetches from Thinking Machines' repo, and reads prompts at about 370, with room for about 320k tokens of
+context. Its thinking and tool calls stream as Anthropic events, like any other model's. Aris
 Server serves its text; images aren't supported yet. mlx-lm doesn't run Inkling yet, so Aris Server carries
 the model code from mlx-lm's open [pull request](https://github.com/ml-explore/mlx-lm/pull/2086) until a
 release does.
@@ -121,31 +142,33 @@ weights, with about 63k.
 Some models ship a small head that guesses the next few tokens. The model checks the guesses in one pass, which costs
 about as much as writing one token, and keeps each one it agrees with, so the output is still the model's own. Aris
 Server runs two kinds: the MTP head of Qwen3.8-27B (which Arete-27B and Aris 3.8-27B are trained from) and Inkling 2's
-own draft head. Point `mtp` at the head's weights: a file, or a file in a Hugging Face repo written `owner/repo:file`,
-which downloads into the Hub's cache like the model's weights (`aris-server pull` fetches it with them):
+own draft head. Both built-in models come with theirs, and `pull` fetches it with the weights. For another model,
+point `mtp` at the head's weights: a file, or a file in a Hugging Face repo written `owner/repo:file`, which downloads
+into the Hub's cache like the model's weights:
 
 ```toml
 [models."arete:27b"]
 path = "~/models/arete-27b-mlx-8bit"
-mtp = "~/models/qwen3.8-27b-mtp.safetensors"  # the mtp.* tensors of Qwen3.8-27B's checkpoint
-mtp_depth = 3
-
-[models."inkling-2-mini"]
-mtp = "thinkingmachines/Inkling-2-Mini:mtp.safetensors"  # Inkling 2's own, from its official repo
-mtp_depth = 7
+mtp = "YourAris/Qwen3.8-27B-MTP-Head:mtp.safetensors"  # the mtp.* tensors of Qwen3.8-27B's checkpoint
+mtp_depth = 5
+mtp_draft_bits = 4
 ```
 
-`mtp_depth` is the most tokens a round guesses. Each round guesses as many as pay there, learned as the reply goes,
-since text that copies takes far more guesses than prose; where guessing doesn't pay, the server decodes plainly.
-`mtp_adaptive = false` guesses `mtp_depth` every round instead. `mtp_bits` quantizes the head (8 unless set; 0 keeps it
-as shipped). `mtp_draft_bits = 4` gives an MTP head's guesses a 4-bit copy of the model's output layer, which each guess
-reads in full: faster guesses for about 0.7 GB more memory on the 8-bit 27B (0, the model's own layer, unless set;
-Inkling's head scores with its own tables and ignores it). `--mtp`, `--mtp-depth`, `--mtp-fixed`, `--mtp-draft-bits` and
-`--no-mtp` do the same on the command line. A request speculates while it decodes alone; several at once decode as
-before. On a 48 GB M4 Pro, Claude Code finished a coding task on the 27B in 150 s with its head and 241 s without, its
-replies streaming at about 16 tokens a second instead of 7. Inkling's head is a smaller win, because each extra token
-Inkling checks reads more of its experts: 1.1-1.3 times mlx-lm's own decoding on code and long contexts, and about even
-on prose.
+`mtp_depth` is the most tokens a round guesses (5 for the built-in Aris 3.8-27B, 7 for Inkling 2 Mini). Each round
+guesses as many as pay there, learned as the reply goes, since text that copies takes far more guesses than prose; where
+guessing doesn't pay, the server decodes plainly. `mtp_adaptive = false` guesses `mtp_depth` every round instead.
+`mtp_bits` quantizes the head (8 unless set; 0 keeps it as shipped). `mtp_draft_bits = 4` gives an MTP head's guesses a
+4-bit copy of the model's output layer, which each guess reads in full: 3 to 6% faster decoding on the 8-bit 27B for
+0.72 GB of memory (0, the model's own layer, unless set; a 4-bit model drafts through its own layer, and Inkling's head
+scores with its own tables). `--mtp`, `--mtp-depth`, `--mtp-fixed`, `--mtp-draft-bits` and `--no-mtp` do the same on the
+command line. A request speculates while it decodes alone; several at once decode as before. If a head on the Hub can't
+be fetched (offline, with no copy in the cache), the model serves without it, with a warning.
+
+Through the server on a 48 GB M4 Pro, Aris 3.8-27B at 8 bits decodes 1.95 to 3.27 times as fast with its head, 17 to 27
+tokens a second instead of 8 to 9, and Claude Code finished a coding task in 150 s with it and 241 s without. Inkling's
+head is a smaller win, because each extra token Inkling checks reads more of its experts: 1.1 to 1.4 times on code,
+edits and long contexts, and about the same on prose. Each head costs context: the 8-bit 27B has about 100k tokens
+beside its head and the 4-bit copy, against 125k without them.
 
 ## Run it as a service
 

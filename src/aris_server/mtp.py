@@ -170,6 +170,13 @@ def lm_logits(model, hidden: mx.array) -> mx.array:
     return text.lm_head(hidden)
 
 
+def output_layer_bits(model) -> int:
+    """The bits of the model's output layer: its quantization's, or 16 for one at full precision."""
+    text = text_model(model)
+    layer = text.model.embed_tokens if text.args.tie_word_embeddings else text.lm_head
+    return int(getattr(layer, "bits", 16))
+
+
 def embed(model, tokens: mx.array) -> mx.array:
     return text_model(model).model.embed_tokens(tokens)
 

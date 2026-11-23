@@ -143,8 +143,10 @@ class _ServedMTP:
 
 def attach_mtp(model, head: mtp.MTPHead, *, depth: int = 2, adaptive: bool = False, draft_bits: int = 0) -> None:
     """Give `model` an MTP head: two more cache slots, and calls that keep the head's cache in step. `draft_bits`
-    gives its drafts a copy of the output layer at those bits."""
-    draft = mtp.draft_lm_head(model, draft_bits) if draft_bits else None
+    gives its drafts a copy of the output layer at those bits when that reads less than the layer itself (a 4-bit
+    model's own layer is as cheap already)."""
+    cheaper = bool(draft_bits) and mtp.output_layer_bits(model) > draft_bits
+    draft = mtp.draft_lm_head(model, draft_bits) if cheaper else None
     _attach(model, _ServedMTP(head, draft), head, depth, adaptive)
 
 
@@ -380,8 +382,8 @@ def _load_with_mtp(self, *args, **kwargs):
             kind = "MTP head"
         drafts = f"as many drafts a round as pay, up to {spec.mtp_depth}" if spec.mtp_adaptive \
             else f"{spec.mtp_depth} drafts a round"
-        through = f", drafting through a {spec.mtp_draft_bits}-bit output layer" \
-            if spec.mtp_draft_bits and not _is_inkling(self.model) else ""
+        copy = getattr(self.model._mtp_served, "draft_logits", None)
+        through = f", drafting through a {spec.mtp_draft_bits}-bit copy of the output layer" if copy is not None else ""
         log.info("%s %s attached (%s, %s%s)", kind, spec.mtp,
                  f"{spec.mtp_bits}-bit" if spec.mtp_bits else "unquantized", drafts, through)
     return result

@@ -77,6 +77,11 @@ BUILTIN_MODELS = {
         "effort_kwarg": "reasoning_effort",
         "effort_map": {"low": "low", "medium": "medium", "high": "medium", "xhigh": "xhigh", "max": "xhigh"},
         "think_budget": {"low": 1024, "medium": 3072, "high": 4096, "xhigh": 12288, "max": 0},
+        # Qwen3.8-27B's own MTP head (1.9-3.3x decode through the server on a 48 GB M4 Pro), drafting through a
+        # 4-bit copy of the output layer (3-6% more on the 8-bit build; the 4-bit build drafts through its own).
+        "mtp": "YourAris/Qwen3.8-27B-MTP-Head:mtp.safetensors",
+        "mtp_depth": 5,
+        "mtp_draft_bits": 4,
     },
     # Inkling 2 Mini (Thinking Machines, Apache 2.0): 26B with 3.4B active and its middle layers looped three times,
     # so it fits 32 GB Macs. Effort goes to its own effort levels (none to max, which its template turns into a
@@ -89,6 +94,10 @@ BUILTIN_MODELS = {
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": 0,
+        # Its own draft head, from Thinking Machines' repo: 1.1-1.4x on code, edits and long contexts through the
+        # server, and about even on prose, where adaptive depth mostly decodes plainly.
+        "mtp": "thinkingmachines/Inkling-2-Mini:mtp.safetensors",
+        "mtp_depth": 7,
     },
 }
 

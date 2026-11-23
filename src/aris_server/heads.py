@@ -4,7 +4,9 @@ weights do, and is found there after, offline too."""
 
 from __future__ import annotations
 
+import logging
 import re
+from dataclasses import replace
 from pathlib import Path
 
 _HUB_FILE = re.compile(r"^([\w.-]+/[\w.-]+):([^:]+)$")
@@ -43,17 +45,44 @@ def head_bytes(ref: str | None) -> int:
     return Path(cached).stat().st_size if cached else 0
 
 
+def output_bits(config: dict) -> int:
+    """The bits of a model's output layer, from its config: mlx-lm's quantization (or a per-layer override of it for
+    the output layer), or 16 for full precision."""
+    quant = config.get("quantization") or {}
+    if not quant:
+        return 16
+    text = config.get("text_config", config)
+    name = "embed_tokens" if text.get("tie_word_embeddings") else "lm_head"
+    override = next((v for k, v in quant.items() if isinstance(v, dict) and k.endswith(name)), None)
+    return int((override or quant).get("bits", 16))
+
+
 def extra_bytes(spec, config: dict) -> int:
     """What a model's draft head adds to its weights, before anything loads: the head's file, and for an MTP head
     with mtp_draft_bits, the copy of the output layer its drafts go through (a weight per vocabulary row and hidden
-    unit at those bits, and a 16-bit scale and bias per 64 of them). Inkling's head keeps no such copy."""
+    unit at those bits, and a 16-bit scale and bias per 64 of them) when the layer itself is wider. Inkling's head
+    keeps no such copy."""
     if not spec.mtp:
         return 0
     copy = 0
-    if spec.mtp_draft_bits and config.get("model_type") != "inkling2_loop":
+    mtp_head = config.get("model_type") != "inkling2_loop"
+    if spec.mtp_draft_bits and mtp_head and output_bits(config) > spec.mtp_draft_bits:
         text = config.get("text_config", config)
         copy = int(text.get("vocab_size", 0) * text.get("hidden_size", 0) * (spec.mtp_draft_bits / 8 + 4 / 64))
     return head_bytes(spec.mtp) + copy
+
+
+def ready(spec):
+    """`spec` with its draft head as a local file, fetched from the Hub's cache (or downloaded) when it names one there.
+    When that can't be done (offline with no cached copy, a repo that moved), `spec` without its head, and a warning:
+    the model still serves, only without drafting."""
+    if not hub_file(spec.mtp):
+        return spec
+    try:
+        return replace(spec, mtp=local_head(spec.mtp))
+    except Exception as e:  # noqa: BLE001  whatever the Hub or the network says, serving goes on
+        logging.warning("could not get the draft head %s (%s): serving without it", spec.mtp, e)
+        return replace(spec, mtp=None)
 
 
 def local_head(ref: str, tqdm_class=None) -> str:

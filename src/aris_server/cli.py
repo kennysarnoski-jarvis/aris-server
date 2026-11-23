@@ -130,12 +130,7 @@ def main(argv=None):
         spec = dataclasses.replace(spec, mtp_draft_bits=a.mtp_draft_bits)
     if not a.use_mtp:
         spec = dataclasses.replace(spec, mtp=None)
-    if spec.mtp and heads.hub_file(spec.mtp):
-        try:
-            spec = dataclasses.replace(spec, mtp=heads.local_head(spec.mtp))  # from the Hub's cache, or downloaded
-        except Exception as e:  # noqa: BLE001  offline with no cached copy, a repo or file that moved
-            print(f"could not get the draft head {spec.mtp}: {e}", file=sys.stderr)
-            return 2
+    spec = heads.ready(spec)  # a head on the Hub, from its cache or downloaded; without it when that fails
     if spec.mtp and not Path(spec.mtp).is_file():
         print(f"no draft head at {spec.mtp}", file=sys.stderr)
         return 2

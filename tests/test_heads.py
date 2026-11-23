@@ -47,7 +47,7 @@ def test_a_hub_head_downloads_once_then_comes_from_the_cache(monkeypatch, tmp_pa
 
 def test_a_heads_bytes_count_before_anything_loads(monkeypatch, tmp_path):
     FakeHub(monkeypatch, tmp_path, {HEAD: head_repo()})
-    spec = replace(aris_spec(), mtp=REF)
+    spec = replace(aris_spec(), mtp=REF, mtp_draft_bits=0)
     config = {"text_config": ARIS_TEXT}
     assert heads.head_bytes(REF) == heads.extra_bytes(spec, config) == int(0.85 * GB)
     # The 4-bit copy of the output layer its drafts go through: 0.72 GB beside Aris 3.8-27B, scales and biases in.
@@ -107,3 +107,58 @@ def test_pull_says_which_download_failed(monkeypatch, tmp_path, capsys):
     hub.fail = "connection reset"
     code, events = pull_events(ModelSpec(name="local", path=str(folder), kv_bits=8, mtp=REF), 37.4, capsys)
     assert code == 1 and events[-1]["event"] == "error" and REF in events[-1]["message"]
+
+
+ARIS_HEAD = "YourAris/Qwen3.8-27B-MTP-Head"
+INKLING_HEAD = "thinkingmachines/Inkling-2-Mini"
+
+
+def test_both_built_in_models_come_with_their_own_draft_heads():
+    from aris_server.config import resolve
+
+    aris, inkling = resolve("aris-3.8-27b", {}), resolve("inkling-2-mini", {})
+    assert heads.hub_file(aris.mtp) == (ARIS_HEAD, "mtp.safetensors")
+    assert heads.hub_file(inkling.mtp) == (INKLING_HEAD, "mtp.safetensors")
+    assert (inkling.mtp_depth, inkling.mtp_adaptive, inkling.mtp_bits) == (7, True, 8)
+
+
+def test_pulling_the_built_in_27b_fetches_its_head_with_its_weights(monkeypatch, tmp_path, capsys):
+    from aris_server.config import resolve
+
+    hub = FakeHub(monkeypatch, tmp_path, {Q8: arete_repo(26.6), Q4: arete_repo(15.1),
+                                         ARIS_HEAD: {"mtp.safetensors": 849_400_563, "README.md": 4_238}})
+    code, events = pull_events(resolve("aris-3.8-27b", {}), 37.4, capsys)  # a 48 GB Mac
+    assert code == 0 and hub.pulled == [Q8, ARIS_HEAD]
+    assert events[0]["head_bytes"] == 849_400_563 and events[-1]["head"].endswith("mtp.safetensors")
+
+
+def test_the_4_bit_copy_is_counted_only_where_it_reads_less_than_the_layer():
+    spec = replace(aris_spec(), mtp=REF, mtp_draft_bits=4)
+    eight = {"quantization": {"group_size": 64, "bits": 8}, "text_config": ARIS_TEXT}
+    four = {"quantization": {"group_size": 64, "bits": 4}, "text_config": ARIS_TEXT}
+    override = {"quantization": {"group_size": 64, "bits": 4, "lm_head": {"group_size": 64, "bits": 8}},
+                "text_config": ARIS_TEXT}
+    assert (heads.output_bits(eight), heads.output_bits(four), heads.output_bits(override)) == (8, 4, 8)
+    assert heads.output_bits({"text_config": ARIS_TEXT}) == 16  # full precision
+    copy = int(248_320 * 5120 * (4 / 8 + 4 / 64))
+    base = heads.head_bytes(REF)  # 0 here: no Hub to ask
+    assert heads.extra_bytes(spec, eight) == base + copy
+    assert heads.extra_bytes(spec, four) == base  # the 4-bit build drafts through its own layer
+    assert heads.extra_bytes(spec, override) == base + copy
+
+
+def test_a_head_that_cant_be_fetched_leaves_the_model_serving_without_it(monkeypatch, tmp_path, caplog):
+    import logging
+
+    from aris_server.config import resolve
+
+    hub = FakeHub(monkeypatch, tmp_path, {})  # no head repo: offline, or one that moved
+    hub.fail = "offline"
+    spec = resolve("aris-3.8-27b", {})
+    with caplog.at_level(logging.WARNING):
+        served = heads.ready(spec)
+    assert served.mtp is None and served.path == spec.path and "serving without it" in caplog.text
+    local = replace(spec, mtp="/models/head.safetensors")
+    assert heads.ready(local) is local  # a local file is the caller's to check
+    hub.cached_files = {(ARIS_HEAD, "mtp.safetensors")}
+    assert heads.ready(spec).mtp == str(tmp_path / "mtp.safetensors")  # the cached copy, offline too

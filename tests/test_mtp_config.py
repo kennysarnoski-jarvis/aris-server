@@ -119,3 +119,19 @@ def test_samplers_carry_the_distribution_they_draw_from():
 
 def test_xtc_requests_are_not_labelled_so_they_decode_without_mtp():
     assert not hasattr(mls._make_sampler(_args(xtc_probability=0.5, xtc_threshold=0.1), TOKENIZER), "mtp_sampling")
+
+
+def test_a_copy_of_the_output_layer_is_made_only_where_it_reads_less():
+    import mlx.nn as nn
+
+    with mx.stream(mx.cpu):
+        for bits, copied in ((8, True), (4, False)):
+            model = tiny_hybrid_model()
+            nn.quantize(model, group_size=64, bits=bits)  # the output layer too, as mlx-lm's conversion does
+            assert mtp.output_layer_bits(model) == bits
+            head = mtp.MTPHead(mtp.text_model(model).args)
+            mx.eval(head.parameters())
+            mtp_serve.attach_mtp(model, head, draft_bits=4)
+            assert (model._mtp_served.draft_logits is not None) == copied
+            assert (model._mtp_served.extra_bytes > 0) == copied
+        assert mtp.output_layer_bits(tiny_hybrid_model()) == 16  # full precision

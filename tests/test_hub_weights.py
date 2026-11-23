@@ -176,6 +176,9 @@ def test_aris_3_8_27b_is_built_in_with_the_settings_its_evals_ran_with(tmp_path)
     assert spec.choices == ("YourAris/Aris-3.8-27B-MLX-8bit", "YourAris/Aris-3.8-27B-MLX-4bit")
     assert (spec.kv_bits, spec.effort_kwarg, spec.effort_map["high"]) == (8, "reasoning_effort", "medium")
     assert spec.budget_for("high") == 4096 and spec.budget_for("max") == 0
+    # Qwen3.8-27B's own MTP head, as many drafts a round as pay (up to 5), through a 4-bit copy of the output layer.
+    assert (spec.mtp, spec.mtp_depth, spec.mtp_adaptive, spec.mtp_draft_bits) == (
+        "YourAris/Qwen3.8-27B-MTP-Head:mtp.safetensors", 5, True, 4)
 
     # A models.toml entry of the same name replaces it; built-in models aren't listed as configured ones.
     (tmp_path / "models.toml").write_text('[models."aris-3.8-27b"]\npath = "~/models/my-own-build"\n')
@@ -207,9 +210,12 @@ def pull_events(spec, limit, capsys):
 
 
 def aris_spec():
+    """The built-in Aris 3.8-27B's weights, without its draft head (tests/test_heads.py pulls the head too)."""
+    from dataclasses import replace
+
     from aris_server.config import resolve
 
-    return resolve("aris-3.8-27b", {})
+    return replace(resolve("aris-3.8-27b", {}), mtp=None)
 
 
 def test_pull_downloads_the_weights_this_mac_would_load_and_says_where(monkeypatch, tmp_path, capsys):
