@@ -1040,6 +1040,7 @@ class Run:
     budget: list         # [ThinkBudget] once generation has started, if a budget applies
     guard: list = field(default_factory=list)  # [LoopGuard] once generation has started, unless guards are off
     mtp_start: tuple | None = None  # MTP (rounds, drafted, accepted) when the request began, with an MTP head
+    exact_text: bool = False  # thinking and text go to the client untrimmed (stream.MessageBuilder's `exact`)
 
 
 class Engine:
@@ -1241,7 +1242,8 @@ class Engine:
 
         return Run(prompt_tokens=len(ctx.prompt), cached_tokens=max(ctx.prompt_cache_count, 0),
                    tool_parser=inkling.parse_tool_calls if self.inkling else ctx.tool_parser, pieces=pieces(),
-                   stop=ctx.stop, budget=budget, guard=guard, mtp_start=mtp_snapshot(self.provider.model))
+                   stop=ctx.stop, budget=budget, guard=guard, mtp_start=mtp_snapshot(self.provider.model),
+                   exact_text=self.inkling)
 
 
 def _classify(ctx, responses, gave_up: Callable[[], bool] = lambda: False):

@@ -12,7 +12,7 @@ from aris_server.budget import ThinkBudget
 from aris_server.engine import _classify_inkling, full_attention_layers
 from aris_server.kv_quant import quantize_kv
 from aris_server.stream import MessageBuilder
-from aris_server.translate import plan
+from aris_server.translate import convert_messages, plan
 
 REPLY = ("<|message_model|><|content_thinking|>The user wants the weather.\nCall the tool.<|end_message|>"
          "<|message_model|><|content_text|>Checking now.<|end_message|>"
@@ -78,6 +78,32 @@ def test_a_reply_becomes_anthropic_blocks():
     assert builder.blocks[0]["thinking"] == "The user wants the weather.\nCall the tool."
     assert [(b["name"], b["input"]) for b in builder.blocks[2:]] == [("get_weather", {"city": "Phoenix"}),
                                                                      ("get_time", {"tz": "MST"})]
+
+
+def test_an_inkling_turn_comes_back_in_the_history_as_it_was_generated():
+    # Inkling's template writes a past message's body back verbatim (<|content_thinking|>{reasoning}<|end_message|>),
+    # so what the client echoes has to be what was generated. Trimmed, a turn whose thinking ended on the newline a
+    # think budget closes it on no longer matched its own cache, and the next turn read the whole reply again.
+    thinking, text = "\nPlan: list the files.\n", "Listing them.\n"
+    reply = (f"<|message_model|><|content_thinking|>{thinking}<|end_message|>"
+             f"<|message_model|><|content_text|>{text}<|end_message|>"
+             '<|message_model|>Bash<|content_invoke_tool_json|>{"name":"Bash","args":{"command":"ls"}}<|end_message|>'
+             "<|content_model_end_sampling|>")
+    builder = MessageBuilder(tool_parser=inkling.parse_tool_calls, exact=True)
+    events = []
+    for state, piece in read([reply[i:i + 3] for i in range(0, len(reply), 3)]):
+        events += builder.feed(state, piece)
+    events += builder.finish("stop")[0]
+    streamed = {}  # what a client puts together from the deltas, which is what it echoes
+    for e in events:
+        if e["type"] == "content_block_delta" and e["delta"]["type"] in ("thinking_delta", "text_delta"):
+            key = "thinking" if e["delta"]["type"] == "thinking_delta" else "text"
+            streamed[e["index"]] = streamed.get(e["index"], "") + e["delta"][key]
+    assert streamed == {0: thinking, 1: text}
+    assert builder.blocks[0]["thinking"] == thinking and builder.blocks[1]["text"] == text
+    echoed = [{"role": "user", "content": "List the files."}, {"role": "assistant", "content": builder.blocks}]
+    turn = convert_messages(None, echoed)[-1]
+    assert turn["reasoning_content"] == thinking and turn["content"] == text
 
 
 def test_classify_ends_on_stop_and_shows_a_cut_reply():
@@ -198,3 +224,18 @@ def test_the_false_no_tools_warning_is_dropped_only_where_aris_server_parses_too
             assert message in caplog.text
     finally:
         engine._OWN_TOOL_CALLS.active = was
+
+
+@pytest.mark.parametrize("is_inkling", [True, False])
+def test_the_engine_asks_for_untrimmed_text_only_for_inkling(is_inkling):
+    from aris_server.engine import Engine
+
+    engine = Engine.__new__(Engine)  # run() with stand-ins for what it calls: no model needed
+    engine.guards, engine.inkling = False, is_inkling
+    engine.budget_tokens = SimpleNamespace(make=lambda budget: None)
+    ctx = SimpleNamespace(prompt=[1, 2], prompt_cache_count=0, tool_parser=None, stop=lambda: None)
+    engine.generator = SimpleNamespace(generate=lambda request, args, progress_callback=None: (ctx, iter(())))
+    engine.provider, engine.cache = SimpleNamespace(model=object()), SimpleNamespace(reading=[])
+    plan_ = SimpleNamespace(think_budget=0, temperature=1.0, top_p=1.0, top_k=0, stop=[], max_tokens=8,
+                            template_kwargs={}, messages=[], tools=None)
+    assert engine.run(plan_).exact_text is is_inkling

@@ -21,8 +21,13 @@ def new_id(prefix: str) -> str:
 class MessageBuilder:
     """Feed (state, text) pieces in order; get back Anthropic stream events. `blocks` holds the final content."""
 
-    def __init__(self, tool_parser=None, tools=None):
+    def __init__(self, tool_parser=None, tools=None, exact=False):
         self.tool_parser, self.tools = tool_parser, tools
+        # Thinking and text go to the client exactly as generated, not trimmed. Inkling's template writes a past
+        # message's body back verbatim, so a body trimmed here (thinking that ends on the newline a think budget
+        # closes it on, say) no longer matched the turn's cache, and the next turn read the whole reply again: 39 of
+        # 59 cache rebuilds in a night of agent tasks on Inkling 2 Mini.
+        self.exact = exact
         self.blocks: list[dict] = []
         self._open: str | None = None       # "thinking" | "text" while a block is open
         self._ws = ""                        # whitespace held back until real text arrives
@@ -69,6 +74,13 @@ class MessageBuilder:
         if state == "tool":
             return events + self._feed_tool(text)
         kind = "thinking" if state == "reasoning" else "text"
+        if self.exact:
+            if self._open != kind:
+                events += self._start({"type": kind, kind: ""})
+            self.blocks[-1][kind] += text
+            events.append({"type": "content_block_delta", "index": self.index,
+                           "delta": {"type": "thinking_delta" if kind == "thinking" else "text_delta", kind: text}})
+            return events
         text = self._ws + text
         if self._open != kind:
             text = text.lstrip()

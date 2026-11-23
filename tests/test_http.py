@@ -30,6 +30,7 @@ class FakeEngine:
 
     progress_steps = 0
     endless = True
+    exact_text = False
 
     def run(self, plan, on_progress=None):
         def pieces():
@@ -49,7 +50,7 @@ class FakeEngine:
                 yield [Piece("tool", "x")], None, n
 
         return Run(prompt_tokens=10, cached_tokens=0, tool_parser=parse_tool_call, pieces=pieces(),
-                   stop=self.stopped.set, budget=[])
+                   stop=self.stopped.set, budget=[], exact_text=self.exact_text)
 
 
 @pytest.fixture
@@ -220,3 +221,16 @@ def test_a_known_model_that_isnt_loaded_is_refused_not_answered_by_the_loaded_on
         "message": "model 'inkling-2-mini' is built in but not loaded (loaded: 'fake')"}
     status, body = ask("claude-haiku-4-5")  # a client's own name: the loaded model answers it
     assert status == 200 and body["content"][0]["text"] == "hi"
+
+
+@pytest.mark.parametrize("exact,want", [(True, ("Plan.\n", "Done.\n")), (False, ("Plan.", "Done."))])
+def test_inklings_messages_reach_the_client_as_they_were_generated(serve, exact, want):
+    # Inkling's template writes a past message's body back verbatim, so its engine runs ask for untrimmed text (see
+    # stream.MessageBuilder's `exact`); other models' replies are trimmed as before.
+    engine = FakeEngine([("reasoning", "Plan.\n"), ("normal", "Done.\n"), ("normal", "")])
+    engine.endless, engine.exact_text = False, exact
+    port = serve(engine)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("POST", "/v1/messages", json.dumps(BODY), {"content-type": "application/json"})
+    blocks = json.loads(conn.getresponse().read())["content"]
+    assert (blocks[0]["thinking"], blocks[1]["text"]) == want

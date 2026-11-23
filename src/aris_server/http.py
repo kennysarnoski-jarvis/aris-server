@@ -159,7 +159,7 @@ class Handler(BaseHTTPRequestHandler):
     def _complete(self, name, p):
         t0 = time.time()
         run = self.server.engine.run(p)
-        builder = MessageBuilder(run.tool_parser, parse_tools(p))
+        builder = MessageBuilder(run.tool_parser, parse_tools(p), exact=run.exact_text)
         finish, n, checked = None, 0, time.time()
         for pieces, finish, n in run.pieces:
             for piece in pieces:
@@ -208,7 +208,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             write([{"type": "ping"}])
             run = self.server.engine.run(p, on_progress=progress)
-            builder = MessageBuilder(run.tool_parser, parse_tools(p))
+            builder = MessageBuilder(run.tool_parser, parse_tools(p), exact=run.exact_text)
             holder.append(builder)
             start = _message(name, [], None, run, 0)
             write([{"type": "message_start", "message": start}])
