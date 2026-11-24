@@ -26,6 +26,7 @@ from mlx_lm.models.cache import (
     CacheList,
     KVCache,
     LRUPromptCache,
+    PromptTrieResult,
     QuantizedKVCache,
     RotatingKVCache,
     can_trim_prompt_cache,
@@ -508,6 +509,53 @@ class _EvictionTrie:
         if not self.taking:
             self._on_evict(tokens, entry)
         return entry
+
+    def search(self, model, tokens) -> PromptTrieResult:
+        """mlx-lm's search, same results, in time linear in the entries' length. Looking for the shortest entry past
+        where the prompt leaves the trie, mlx-lm's copies the path at every step down: quadratic. A prompt that leaves
+        a long conversation early, the one after a compaction leaving an 88k-token conversation after its 5k-token
+        system prompt, took 5.4 s on an M5 to search, and a request searches twice: the 12 and 19 s Claude Code waited
+        after each compaction on Aris 3.8-27B."""
+        trie = self._trie._trie
+        if model not in trie:
+            return PromptTrieResult(model, None, None, None, 0)
+        current = trie[model]
+        if not tokens and "__value__" in current:
+            return PromptTrieResult(model, [], None, None, 0)
+        last_index, index = -1, 0
+        while index < len(tokens) and tokens[index] in current:
+            current = current[tokens[index]]
+            if "__value__" in current:
+                last_index = index
+            index += 1
+        if last_index == len(tokens) - 1 >= 0:
+            return PromptTrieResult(model, tokens, None, None, 0)
+        shorter = tokens[:last_index + 1] if last_index > 0 else None
+        longer = list(tokens[:index]) + _shortest_below(current) if index > 0 else None
+        return PromptTrieResult(model, None, shorter, longer, index)
+
+
+def _shortest_below(node) -> list:
+    """The tokens from a trie node to the nearest entry below it: mlx-lm's depth-first search in its order (so a tie
+    goes the same way), keeping each step's token and the step before it in place of a copy of the path so far."""
+    steps: list[tuple[int, int]] = []  # (the step before, token)
+    best = None  # (depth, its last step)
+    stack = [(node, 0, -1)]
+    while stack:
+        current, depth, step = stack.pop()
+        if "__value__" in current:
+            if best is None or depth < best[0]:
+                best = (depth, step)
+        elif best is None or depth < best[0]:
+            for tok in current:
+                steps.append((step, tok))
+                stack.append((current[tok], depth + 1, len(steps) - 1))
+    path = []
+    step = best[1] if best is not None else -1
+    while step >= 0:
+        step, tok = steps[step]
+        path.append(tok)
+    return path[::-1]
 
 
 class _RecencyOrder(LRUPromptCache.CacheOrder):

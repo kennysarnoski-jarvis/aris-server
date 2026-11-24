@@ -340,3 +340,44 @@ def test_room_for_the_peak_reading_a_prompt_reaches_is_made_before_it_is_read(pr
     assert cache.fetch_nearest_cache("m", prompt) == (None, prompt)
     cache.trim_to(n_bytes=cache.max_bytes)                  # mlx-lm's next call: nothing is active yet
     assert cache.nbytes == left
+
+
+def test_the_trie_search_gives_mlx_lms_results():
+    import random
+
+    from mlx_lm.models.cache import PromptTrie
+
+    from aris_server.engine import _EvictionTrie
+
+    rng = random.Random(7)
+    for trial in range(300):
+        ours, theirs = PromptTrie(), PromptTrie()
+        wrapped = _EvictionTrie(ours, lambda *a: None)
+        # A small alphabet, so entries share prefixes and branch, and ties between equally short entries come up.
+        for _ in range(rng.randint(1, 6)):
+            key = [rng.randint(0, 3) for _ in range(rng.randint(1, 9))]
+            ours.add("m", key, key)
+            theirs.add("m", key, key)
+        for _ in range(20):
+            prompt = [rng.randint(0, 3) for _ in range(rng.randint(0, 11))]
+            assert wrapped.search("m", prompt) == theirs.search("m", prompt), (trial, prompt)
+        assert wrapped.search("other", [1, 2]) == theirs.search("other", [1, 2])
+
+
+def test_a_prompt_that_leaves_a_long_conversation_early_is_searched_in_linear_time():
+    import time
+
+    from mlx_lm.models.cache import PromptTrie
+
+    from aris_server.engine import _EvictionTrie
+
+    trie = _EvictionTrie(PromptTrie(), lambda *a: None)
+    system = list(range(5_000))
+    conversation = system + list(range(10**6, 10**6 + 80_000))
+    trie.add("m", conversation, "turn")
+    after_compaction = system + [7] * 1_000
+    t0 = time.perf_counter()
+    found = trie.search("m", after_compaction)
+    assert found.common_prefix == 5_000 and found.longer == conversation and found.shorter is None
+    # mlx-lm's own search takes about 5 s here (on an M5); a linear one, well under a second even on a slow machine.
+    assert time.perf_counter() - t0 < 1.0
