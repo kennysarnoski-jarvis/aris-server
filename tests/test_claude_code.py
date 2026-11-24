@@ -38,11 +38,21 @@ def test_claude_code_starts_without_the_tools_a_local_session_has_no_use_for():
 def test_claude_code_is_pointed_at_the_server_and_keeps_a_window_the_user_set():
     env = claude_code.environment("http://127.0.0.1:8484", "local", "aris-3.8-27b", 100_352, {"PATH": "/bin"})
     assert env == {"PATH": "/bin", "ANTHROPIC_BASE_URL": "http://127.0.0.1:8484", "ANTHROPIC_AUTH_TOKEN": "local",
-                   "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "113281", **MODELS}
+                   "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "113281", "API_TIMEOUT_MS": "3000000",
+                   "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1", **MODELS}
     mine = claude_code.environment("http://h:1", "k", "m", 100_352, {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "90000"})
     assert mine["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "90000"
     unsized = claude_code.environment("http://h:1", "k", "m", None, {})
     assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in unsized
+
+
+def test_claude_code_waits_for_a_local_model_unless_the_user_said_otherwise():
+    # Claude Code cuts a request off at 10 minutes, and a local model writing a whole file in one turn can take longer.
+    env = claude_code.environment("http://h:1", "k", "m", None, {})
+    assert env["API_TIMEOUT_MS"] == "3000000" and env["CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK"] == "1"
+    mine = claude_code.environment("http://h:1", "k", "m", None, {"API_TIMEOUT_MS": "900000",
+                                                                   "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "0"})
+    assert mine["API_TIMEOUT_MS"] == "900000" and mine["CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK"] == "0"
 
 
 def test_claude_code_stays_on_the_server_whatever_the_shell_routes_it_to():
@@ -52,7 +62,7 @@ def test_claude_code_stays_on_the_server_whatever_the_shell_routes_it_to():
              "ANTHROPIC_MODEL": "claude-opus-5-5", "ANTHROPIC_DEFAULT_HAIKU_MODEL": "inkling-2-mini", "HOME": "/h"}
     env = claude_code.environment("http://127.0.0.1:8484", "local", "aris-3.8-27b", None, shell)
     assert env == {"HOME": "/h", "ANTHROPIC_BASE_URL": "http://127.0.0.1:8484", "ANTHROPIC_AUTH_TOKEN": "local",
-                   **MODELS}
+                   **claude_code.PATIENCE, **MODELS}
 
 
 class _Models(BaseHTTPRequestHandler):

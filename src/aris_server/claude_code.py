@@ -16,6 +16,13 @@ import urllib.request
 # small window, and where it always does on a large one. Aris Code's Aris Local tells it the same.
 COMPACT_RESERVE = 33_000
 COMPACT_AT_SHARE = 0.8
+# Waiting for a local model. Claude Code gives a request 10 minutes and then cuts it off mid-stream, and a local model
+# can take longer than that over one turn: Inkling 2 Mini writing a whole file in one tool call at 20-odd tokens a second
+# was cut at 10:00 twice in a night of agent tasks, the file lost and the turn asked for again from the start. And after
+# a dropped stream Claude Code retries without streaming, which sends nothing back until the answer is done, so a long
+# turn outlasts that request's timeout on every retry; streaming retries stay alive. Aris Code's Aris Local sets the
+# same. A value the user set stays theirs.
+PATIENCE = {"API_TIMEOUT_MS": "3000000", "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1"}
 # What would send Claude Code somewhere other than the server (Anthropic's API, Bedrock, Vertex, Foundry) or hand it
 # another account's credentials. Aris Code's Aris Local leaves out the same.
 ROUTING_VARIABLES = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
@@ -55,11 +62,14 @@ def served_model(base_url: str, api_key: str, timeout: float = 5.0) -> tuple[str
 
 def environment(base_url: str, api_key: str, model: str, window: int | None, env: dict[str, str]) -> dict[str, str]:
     """Claude Code's environment, on the server and its loaded model whatever the shell routes it to, without a key
-    for Anthropic's API (or it would go to the server). A window the user set stays theirs."""
+    for Anthropic's API (or it would go to the server), and patient with a local model (PATIENCE). A window or a
+    timeout the user set stays theirs."""
     env = {k: v for k, v in env.items() if k not in ROUTING_VARIABLES}
     env.update(ANTHROPIC_BASE_URL=base_url, ANTHROPIC_AUTH_TOKEN=api_key, **dict.fromkeys(MODEL_VARIABLES, model))
     if window and "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in env:
         env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(claude_code_window(window))
+    for name, value in PATIENCE.items():
+        env.setdefault(name, value)
     return env
 
 

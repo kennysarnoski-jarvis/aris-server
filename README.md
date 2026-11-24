@@ -45,11 +45,16 @@ Claude Code assumes a 200k-token window and compacts its conversation 33k tokens
 model's window is whatever fits beside its weights (the server logs it at startup, and `/v1/models` lists it as
 `context_window`), and told that window as it is, Claude Code would compact a small one about every turn. So
 `aris-server claude` tells it, in `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, a window at which it compacts at 80% of the
-server's (or 33k short of it, as usual, on a window above 165k). To start Claude Code yourself, tell it the same and
-leave out the same tools: for the 8-bit 27B's 100,352 tokens on a 48 GB Mac, the window is 113,281.
+server's (or 33k short of it, as usual, on a window above 165k). It also gives each request 50 minutes
+(`API_TIMEOUT_MS=3000000`) where Claude Code gives 10, and keeps its retries streaming
+(`CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`), so a slow local turn is never cut off: Claude Code ends a response
+that sends no content for 10 minutes and asks for it again from the start. To start Claude Code
+yourself, tell it the same and leave out the same tools: for the 8-bit 27B's 100,352 tokens on a 48 GB Mac, the window is
+113,281.
 
 ```bash
-CLAUDE_CODE_MAX_CONTEXT_TOKENS=113281 ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude \
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=113281 API_TIMEOUT_MS=3000000 CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1 \
+  ANTHROPIC_BASE_URL=http://127.0.0.1:8484 ANTHROPIC_AUTH_TOKEN=local claude \
   --disallowedTools=WebSearch,Workflow,ScheduleWakeup,ReportFindings,ListAgents,SendMessage,CronCreate,CronDelete,CronList,EnterWorktree,ExitWorktree
 ```
 
