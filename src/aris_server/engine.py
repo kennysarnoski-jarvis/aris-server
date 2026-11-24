@@ -406,6 +406,7 @@ CHECKPOINT_SHARE = 8       # checkpoints hold at most this fraction of the promp
                            # Arete-27B, 168 MB for Inkling 2 Mini)
 MAX_CHECKPOINTS = 64
 LINE_BACKOFF = 512         # how far back from where a request left the cache to look for the start of its line
+HISTORY_LOOKBACK = 64      # how far back from a prompt's end to look for the start of the turn it asks for
 
 
 def _state_arrays(state):
@@ -472,17 +473,18 @@ class _Checkpoint:
     learned: bool = False  # taken where a request left the cache, rather than on the grid
 
 
-def _split_segments(segments: list, types: list, at) -> None:
+def _split_segments(segments: list, types: list, at, history: int | None = None) -> None:
     """Cut a prompt's segments (in place) at these token positions: mlx-lm hands the prompt cache a copy of the cache
-    at the end of every segment but the last, so each cut is where a "checkpoint" is taken."""
-    cuts = sorted(set(at))
+    at the end of every segment but the last, so each cut is where a "checkpoint" is taken. The cut at `history`,
+    where the prompt's history ends, hands it the state a rebuild resumes from instead (see _history_end)."""
+    cuts = sorted(set(at) | ({history} if history is not None else set()))
     out_segments, out_types, start = [], [], 0
     for segment, kind in zip(segments, types):
         end, done = start + len(segment), start
         for p in cuts:
             if done < p < end:
                 out_segments.append(segment[done - start:p - start])
-                out_types.append("checkpoint")
+                out_types.append("history" if p == history else "checkpoint")
                 done = p
         out_segments.append(segment[done - start:])
         out_types.append(kind)
@@ -569,6 +571,10 @@ class MovingPromptCache(LRUPromptCache):
     # prompt and tools); Inkling's user, model and tool headers, which open the conversation after its tool
     # declarations, system prompt and effort message.
     system_ends: frozenset = frozenset()
+    # The token that opens the turn a request asks for (the first of the chat template's generation prompt, set by the
+    # engine beside checkpoint_every): the last one near a prompt's end is where its history ends (see _history_end).
+    # Empty for a template that adds no generation prompt, whose prompts end where their history does.
+    turn_starts: frozenset = frozenset()
     tokenized = None  # set by the engine as it tokenizes a request: its segments, which fetching it cuts at checkpoints
     _leaving = ((), 0)  # the cached entry the request being fetched runs along furthest, and how far
     _resuming = None  # a checkpoint's cache for the request being fetched, until something covers more
@@ -584,12 +590,15 @@ class MovingPromptCache(LRUPromptCache):
         self._fetches = 0  # requests fetched so far: a checkpoint's recency
         self._learn: dict[tuple, None] = {}  # checkpoints planned where a request left the cache, until taken
         self._pieces: dict[int, str] = {}  # each token's text, for finding where lines start
-        # Prompt-end recurrent state of requests in flight, then of the turns they finished as. A finished turn
-        # whose history comes back tokenized differently is rebuilt to its prompt's end from these: its attention
-        # caches trimmed (they hold the prompt's tokens first) and its recurrent layers' state put back. The
+        # Recurrent state of requests in flight where their history ends (or at their prompt's end), then of the turns
+        # they finished as. A next request that parts from a finished turn there or later (its history re-rendered
+        # with other tokens than were generated, a compaction or a retry in its place) gets it rebuilt from these: its
+        # attention caches trimmed (they hold the prompt's tokens first) and its recurrent layers' state put back. The
         # recurrent state is small and fixed-size, so this costs megabytes where a full snapshot costs gigabytes.
         self._prompt_state: dict[tuple, list] = {}
         self._turn_state: dict[tuple, tuple[int, list]] = {}
+        # Recent requests cut where their history ends -> their prompt's length: that state stands in for their end's.
+        self._history_ends: dict[tuple, int] = {}
 
     def _save(self, tokens, prompt_cache, cache_type):
         if self.disk is None or self.disk.has(tokens):
@@ -636,10 +645,16 @@ class MovingPromptCache(LRUPromptCache):
         mid_request = cache_type != "system" and any(
             len(tokens) < len(p) and p[:len(tokens)] == list(tokens) for p in self.reading)
         if mid_request and len(tokens) >= self.light_min_tokens:
-            # ~150 MB each for a 27B model: keep only what a request in flight or a conversation's latest turn needs.
-            self._prompt_state[tuple(tokens)] = [_end_state(c) for c in prompt_cache]
-            while len(self._prompt_state) > MAX_KEPT_STATES:
-                self._prompt_state.pop(next(iter(self._prompt_state)))
+            key = tuple(tokens)
+            # One state per request: where its history ends when it was cut there (see _history_end), which serves
+            # every next request the one at its prompt's end serves, and a compaction or retry besides. mlx-lm's own
+            # snapshot of that request, a token before its prompt's end, is then left out.
+            if cache_type == "history" or not any(len(key) == n - 1 and key[:len(k)] == k
+                                                  for k, n in self._history_ends.items()):
+                # ~150 MB each for a 27B model: keep only what a request in flight or a conversation's latest turn needs.
+                self._prompt_state[key] = [_end_state(c) for c in prompt_cache]
+                while len(self._prompt_state) > MAX_KEPT_STATES:
+                    self._prompt_state.pop(next(iter(self._prompt_state)))
         elif cache_type != "system":
             key = tuple(tokens)
             at = max((k for k in self._prompt_state if len(k) < len(key) and key[:len(k)] == k), key=len, default=None)
@@ -708,8 +723,8 @@ class MovingPromptCache(LRUPromptCache):
             return ""
 
     def _rebuild_diverged(self, model, tokens, have: int):
-        """The finished turn of this conversation, rebuilt to its prompt's end, when the request diverges from it
-        after that point and the rebuild covers more than `have` tokens."""
+        """The finished turn of this conversation, rebuilt to where its state was kept (its history's end, or its
+        prompt's), when the request parts from it after that point and the rebuild covers more than `have` tokens."""
         key = list(tokens)
         for entry_key, (n, states) in list(self._turn_state.items()):
             if not (have < n < len(key)) or list(entry_key[:n]) != key[:n] or list(entry_key) == key[:len(entry_key)]:
@@ -734,9 +749,8 @@ class MovingPromptCache(LRUPromptCache):
             for layer, state in zip(entry.prompt_cache, states):
                 _put_back(layer, state, n)
             at = next((i for i, (a, b) in enumerate(zip(entry_key, key)) if a != b), n)
-            logging.info("rebuilt a %d-token cache in memory from a %d-token turn whose history came back "
-                         "tokenized differently at token %d%s", n, len(entry_key), at, self._show_divergence(
-                             entry_key, key, at))
+            logging.info("rebuilt a %d-token cache in memory from a %d-token turn the request parts from at token %d%s",
+                         n, len(entry_key), at, self._show_divergence(entry_key, key, at))
             return entry.prompt_cache, key[n:]
         return None
 
@@ -888,7 +902,7 @@ class MovingPromptCache(LRUPromptCache):
         where they would hold a conversation's state as of one version of its system prompt, made again each time
         that changes), and at the start of the line where it left the cached entries, if that was well past what it
         reuses: a client that rewrites a line once tends to rewrite it again. Never at its last token: that one is read
-        as generation starts."""
+        as generation starts. Also where its history ends, for the state a rebuild resumes from (see _history_end)."""
         tokenized, self.tokenized = self.tokenized, None
         if self.checkpoint_every is None or tokenized is None or tokenized[0] is not tokens:
             return
@@ -907,7 +921,25 @@ class MovingPromptCache(LRUPromptCache):
             logging.info("memory cache: the request leaves a cached %d-token entry at token %d and reuses %d; a "
                          "checkpoint at token %d covers that line next time%s", len(leaving), leaves, have, line,
                          self._show_divergence(leaving, tokens, leaves, ("cached", "request")))
-        _split_segments(tokenized[1], tokenized[2], [p for p in at if have < p < end])
+        history = self._history_end(tokens, have)
+        if history is not None:
+            self._history_ends = dict(list(self._history_ends.items())[-7:])
+            self._history_ends[tuple(tokens[:history])] = len(tokens)
+        _split_segments(tokenized[1], tokenized[2], [p for p in at if have < p < end], history)
+
+    def _history_end(self, tokens, have: int) -> int | None:
+        """Where the request's history ends: the start of the turn it asks for, the last turn header near its end. A
+        compaction asks for a summary in place of that turn, and a retry or an interrupted turn changes it too, so they
+        share the request's history up to here and no further. A hybrid model's state can't be cut back to where they
+        leave it, and kept only at the prompt's end (a few tokens past) it made Claude Code's compaction read its
+        conversation again from the system prompt: 73,537 tokens, 20 minutes, on Aris 3.8-27B. None without such a
+        header near the end, or with a history too short to be worth a state."""
+        if not self.turn_starts:
+            return None
+        for i in range(len(tokens) - 2, max(have, len(tokens) - 1 - HISTORY_LOOKBACK), -1):
+            if tokens[i] in self.turn_starts:
+                return i if i >= self.light_min_tokens else None
+        return None
 
     def _fetch_nearest(self, model, tokens):
         result = self._trie.search(model, tokens)
@@ -998,6 +1030,26 @@ class MovingPromptCache(LRUPromptCache):
 def shrink_cap(cap: int, peak: int, limit: int, headroom: int, floor: int = 1 << 30) -> int:
     over = peak - (limit - headroom)
     return max(floor, cap - over) if over > 0 else cap
+
+
+def turn_start_tokens(tokenizer) -> frozenset:
+    """The token that opens the turn a request asks the model for: the first one its chat template adds as the
+    generation prompt (Qwen's <|im_start|>). Empty when the template adds none, as Inkling's: its prompt ends where its
+    history does, so the state kept at the prompt's end already serves a compaction."""
+    messages = [{"role": "user", "content": "hi"}]
+
+    def ids(asking: bool) -> list:
+        # mlx-lm's tokenizer returns the tokens; a bare transformers 5 tokenizer returns a dict of them.
+        rendered = tokenizer.apply_chat_template(messages, add_generation_prompt=asking, tokenize=True)
+        return list(rendered["input_ids"] if hasattr(rendered, "keys") else rendered)
+
+    try:
+        bare, asking = ids(False), ids(True)
+    except Exception:  # noqa: BLE001  a template that needs more than this: no history cuts, as before
+        return frozenset()
+    if len(asking) > len(bare) and asking[:len(bare)] == bare and isinstance(asking[len(bare)], int):
+        return frozenset({asking[len(bare)]})
+    return frozenset()
 
 
 def merge_prompt_tail(tokenized):
@@ -1094,6 +1146,7 @@ class Engine:
             cache.checkpoint_every = CHECKPOINT_GRID
             cache.system_ends = inkling.conversation_starts(self.tokenizer) if self.inkling \
                 else frozenset(self.tokenizer.eos_token_ids or ())
+            cache.turn_starts = turn_start_tokens(self.tokenizer)
         _OWN_TOOL_CALLS.active = self.inkling
         cache.decode = self.tokenizer.decode
         self.budget_tokens = BudgetTokens(self.tokenizer)

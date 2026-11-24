@@ -20,7 +20,7 @@ from mlx_lm.models.cache import CacheList, KVCache, QuantizedKVCache, RotatingKV
 
 from aris_server import disk_cache, dspark, inkling, mtp, mtp_serve
 from aris_server.engine import (MovingPromptCache, _Checkpoint, _checkpointable, _flat_caches, _split_segments,
-                                merge_prompt_tail)
+                                merge_prompt_tail, turn_start_tokens)
 from aris_server.kv_quant import quantize_kv
 from aris_server.speculative import Sampling
 from test_dspark import random_drafter
@@ -65,12 +65,19 @@ def changed(position: int, value: int):
     return ledger
 
 
-def cache_for(model, budget=1 << 30):
+TURN = 8                    # the tiny vocabulary's turn header (<|im_start|>): a request ends with one and the role
+ASK = [TURN, 7, NEWLINE]    # it asks for ("assistant"), as a chat template's generation prompt does
+HISTORY = system() + USER + [END, NEWLINE] + TOOL_RESULT + [END, NEWLINE]  # a conversation, up to the turn asked for
+
+
+def cache_for(model, budget=1 << 30, turns=False):
     cache = MovingPromptCache(max_size=10, max_bytes=budget)
     cache.decode = decode
     cache.light_min_tokens = cache.checkpoint_min_gain = 16
     if _checkpointable(model.make_cache()):  # as the engine decides
         cache.checkpoint_every, cache.system_ends = STEP, frozenset({END})
+        if turns:  # requests that end with a turn header, as a chat template's do
+            cache.turn_starts = frozenset({TURN})
     return cache
 
 
@@ -191,6 +198,46 @@ def test_the_next_turn_rebuilt_to_its_prompt_end_beats_a_checkpoint_which_is_not
     same_as_read_cold(model, third, got, logprobs)
 
 
+def test_a_compaction_resumes_from_where_the_history_ends_not_the_system_prompt(caplog):
+    # Claude Code compacts by sending the prompt it last answered with a user turn asking for a summary, where that
+    # answer's header was. The hybrid layers' state was kept only a token before the prompt's end, past where the two
+    # part, so the request went back to the system prompt: 73,537 tokens read again, 20 minutes, on Aris 3.8-27B.
+    model = kv8_hybrid_model()
+    cache = cache_for(model, turns=True)
+    serve(cache, model, HISTORY + ASK, system_tokens=len(system()))
+    compact = HISTORY + [TURN, 6, NEWLINE] + text(9, 40) + [END, NEWLINE] + ASK
+    with caplog.at_level(logging.INFO):
+        cached, got, logprobs = serve(cache, model, compact, system_tokens=len(system()))
+    assert cached == len(HISTORY)
+    assert f"turn the request parts from at token {len(HISTORY) + 1}" in caplog.text
+    same_as_read_cold(model, compact, got, logprobs)
+
+
+def test_a_request_keeps_one_state_where_its_history_ends_and_its_next_turn_rebuilds_from_there():
+    model = kv8_hybrid_model()
+    cache = cache_for(model, turns=True)
+    first = HISTORY + ASK
+    _, answer, _ = serve(cache, model, first, system_tokens=len(system()))
+    # Where its history ends, in place of mlx-lm's snapshot a token before its prompt's end: memory as before.
+    assert not cache._prompt_state and [n for n, _ in cache._turn_state.values()] == [len(HISTORY)]
+    # Its answer comes back re-rendered: the turn is rebuilt from the end of its history, a header earlier than its
+    # prompt's end used to be, and answers as a cold read does.
+    second = first + [(answer[0] + 1) % 64, END, NEWLINE] + TOOL_RESULT + [END, NEWLINE] + ASK
+    cached, got, logprobs = serve(cache, model, second)
+    assert cached == len(HISTORY)
+    same_as_read_cold(model, second, got, logprobs)
+
+
+def test_a_later_turn_cut_nowhere_keeps_the_state_at_its_own_prompts_end():
+    model = kv8_hybrid_model()
+    cache = cache_for(model, turns=True)
+    first = HISTORY + ASK
+    _, answer, _ = serve(cache, model, first, system_tokens=len(system()))
+    second = first + answer + TOOL_RESULT  # no turn header near its end: nowhere to cut
+    serve(cache, model, second)
+    assert [n for n, _ in cache._turn_state.values()] == [len(second) - 1]
+
+
 def test_checkpoints_cover_the_system_prompt_and_not_the_conversation_after_it():
     # Past the system prompt a checkpoint holds the state of one version of it: a client that rewrites a line of
     # its system prompt would make a new one at every rewrite, pushing out the ones that cover the system prompt.
@@ -305,6 +352,30 @@ def test_segments_are_cut_where_checkpoints_go():
     _split_segments(segments, types, [4, 8, 12, 16, 4])           # 8 is already a boundary: no empty segment
     assert segments == [prompt[:4], prompt[4:8], prompt[8:12], prompt[12:16], prompt[16:19], prompt[19:]]
     assert types == ["checkpoint", "system", "checkpoint", "checkpoint", "assistant", "assistant"]
+    segments, types = [prompt[:8], prompt[8:]], ["system", "assistant"]
+    _split_segments(segments, types, [4, 16], history=16)         # where the history ends: a state, not a checkpoint
+    assert segments == [prompt[:4], prompt[4:8], prompt[8:16], prompt[16:]]
+    assert types == ["checkpoint", "system", "history", "assistant"]
+
+
+def test_the_turn_a_request_asks_for_starts_with_its_chat_templates_generation_prompt():
+    class Template:
+        def __init__(self, asks, fails=False):
+            self.asks, self.fails = asks, fails
+
+        def apply_chat_template(self, messages, add_generation_prompt=False, tokenize=True):
+            if self.fails:
+                raise ValueError("this template needs a system message")
+            return [1, 2, 3] + (self.asks if add_generation_prompt else [])
+
+    class Transformers5(Template):  # a bare transformers 5 tokenizer: a dict of the tokens
+        def apply_chat_template(self, *a, **k):
+            return {"input_ids": super().apply_chat_template(*a, **k), "attention_mask": []}
+
+    assert turn_start_tokens(Template([8, 7, 10])) == {8}           # Qwen: <|im_start|>assistant\n
+    assert turn_start_tokens(Transformers5([8, 7, 10])) == {8}
+    assert turn_start_tokens(Template([])) == frozenset()           # no generation prompt to tell it by
+    assert turn_start_tokens(Template([8], fails=True)) == frozenset()
 
 
 def greedy(logprobs):

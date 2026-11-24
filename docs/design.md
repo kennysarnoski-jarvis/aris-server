@@ -201,8 +201,14 @@ its generation loop with no handler, and MLX raises RuntimeError, not OSError. A
 and held again at the next save. A model sometimes
 generates a non-canonical tokenization, so its finished turn no longer matches the history the
 client sends back; instead of a multi-gigabyte snapshot of each prompt, the recurrent layers' state
-at the prompt's end (fixed-size, megabytes) is kept, and such a turn is rebuilt to its prompt's end
-in memory: its attention caches trimmed and that state put back. A conversation keeps only its
+(fixed-size, megabytes) is kept where the prompt's history ends, and such a turn is rebuilt from there
+in memory: its attention caches trimmed and that state put back. The history ends at the start of the
+turn the prompt asks for: a template that adds a generation prompt (Qwen's `<|im_start|>assistant`)
+ends a prompt a few tokens past it, Inkling's ends there. That point also serves a request that
+replaces the turn rather than continuing it. Claude Code compacts by sending the conversation with a
+user turn asking for a summary where the answer's header was; with the state kept a token before the
+prompt's end, a few tokens past where the two part, Arete-27B read that conversation again from its
+system prompt: 73,537 tokens, 20 minutes, at 79k of context. A conversation keeps only its
 longest earlier snapshot. A request that leaves every cached entry part-way through (a client that rewrites a line of
 its system prompt on each request, say) reuses what it still shares with them. Attention caches cut back to any token,
 but a hybrid model's recurrent layers hold only their state at the end of what they read, and a sliding window's ring
