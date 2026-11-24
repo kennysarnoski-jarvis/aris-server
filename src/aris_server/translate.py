@@ -34,6 +34,7 @@ class Plan:
     context_capped: bool = False  # max_tokens was cut to fit the context window
     stuck_repeats: int = 0  # the request ends with this many identical tool steps, and got a reminder about it
     session: str | None = None  # the client session it belongs to, when the client names it (claude_code_session)
+    appended: int = 0  # messages the server added after the client's (a stuck-call reminder, a tool_choice note)
 
 
 def claude_code_session(headers, body: dict) -> str | None:
@@ -246,6 +247,7 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000, guards: bool = T
     tools, hidden, late = convert_tools(body.get("tools"), body["messages"])
     messages = convert_messages(body.get("system"), body["messages"], {f["function"]["name"]: f for f in late},
                                 inkling=inkling)
+    converted = len(messages)
     tools, messages = _apply_tool_choice(body.get("tool_choice"), tools, messages, late)
     # A model stuck repeating one tool call gets told so before it answers (guards.py). The reminder goes last, so
     # the prompt cache still covers everything before it.
@@ -271,6 +273,7 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000, guards: bool = T
         loaded_tools=late,
         context=spec.context,
         stuck_repeats=stuck,
+        appended=len(messages) - converted,
     )
 
 

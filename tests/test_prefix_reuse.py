@@ -678,3 +678,77 @@ def test_a_conversation_keeps_its_turns_in_memory_once_eight_sessions_fill_the_c
     assert live_turns_on_disk() == []                                           # its turn waits in memory
     cached, _, _ = serve(cache, model, live + USER + out + TOOL_RESULT)
     assert cached > len(live + USER) and live_turns_on_disk() == []             # and the next turn takes it from there
+
+
+def test_a_note_the_server_added_to_a_request_is_left_without_reading_the_conversation_again(caplog):
+    # The server adds messages of its own to a request (a stuck-call reminder, a tool_choice note) that the client
+    # never sees, so the client's next request parts from that turn where they began. A hybrid model's state there
+    # was kept nowhere, and the next request went back to its system prompt: 33,765 tokens and 131 s on Inkling 2
+    # Mini after a reminder. The engine says where the server's messages start (cache.hold), and a checkpoint goes there.
+    model = kv8_hybrid_model()
+    cache = cache_for(model, turns=True)
+    first = HISTORY + ASK
+    _, answer, _ = serve(cache, model, first, system_tokens=len(system()))
+    history = first + answer + [END, NEWLINE] + TOOL_RESULT + [END, NEWLINE]
+    note = [TURN, 6, NEWLINE] + text(5, 30) + [END, NEWLINE]  # the server's note, a user turn of its own
+    cache.hold = len(history)  # what the engine's tokenize hook sets for a request carrying one
+    _, answer2, _ = serve(cache, model, history + note + ASK)
+    assert cache.hold is None  # used by that request only
+    after = history + [TURN, 7, NEWLINE] + answer2 + [END, NEWLINE] + TOOL_RESULT + [END, NEWLINE] + ASK
+    with caplog.at_level(logging.INFO):
+        cached, got, logprobs = serve(cache, model, after)
+    assert cached == len(history)
+    same_as_read_cold(model, after, got, logprobs)
+
+
+class _Request:
+    def __init__(self, messages, appended=0):
+        self.messages, self.aris_appended = messages, appended
+
+
+def _render(asks):
+    """A stand-in for mlx-lm's tokenize: each message becomes [TURN, role, NEWLINE, *content, END, NEWLINE], and a
+    template with a generation prompt (`asks`) ends with ASK."""
+    roles = {"user": 6, "assistant": 7, "tool": 5}
+
+    def tokenize(tokenizer, request, args):
+        out = []
+        for m in request.messages:
+            out += [TURN, roles[m["role"]], NEWLINE, *m["content"], END, NEWLINE]
+        return (out + (ASK if asks else []), [out], ["assistant"], "normal", None)
+    return tokenize
+
+
+@pytest.mark.parametrize("asks", [True, False])
+def test_where_the_messages_the_server_added_start_in_a_prompt(asks):
+    from aris_server.engine import appended_start
+
+    tokenize = _render(asks)
+    history = [{"role": "user", "content": USER}, {"role": "tool", "content": TOOL_RESULT}]
+    note = {"role": "user", "content": text(5, 30)}
+    request = _Request(history + [note], appended=1)
+    raw = tokenize(None, request, None)[0]
+    start = len(tokenize(None, _Request(history), None)[0]) - (len(ASK) if asks else 0)
+    # With a generation prompt the two prompts share its header token, so the cut is one token in: still before
+    # anything the next request, which has the model's turn there, doesn't share.
+    want = start + (1 if asks else 0)
+    assert appended_start(tokenize, (None, request, None), {}, raw, raw) == want
+    # A history read in a cached entry's own tokens (here 3 fewer) moves it with them.
+    assert appended_start(tokenize, (None, request, None), {}, raw, raw[3:]) == want - 3
+    assert appended_start(tokenize, (None, _Request(history + [note]), None), {}, raw, raw) is None  # none added
+    assert request.messages[-1] is note  # the request itself is left as it was
+
+
+def test_the_plan_counts_the_messages_the_server_adds_after_the_clients():
+    from aris_server.config import ModelSpec
+    from aris_server.translate import plan
+
+    spec = ModelSpec(name="m", path="m")
+    call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "Bash", "input": {"command": "true"}}]}
+    result = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}
+    asked = {"role": "user", "content": "go"}
+    tools = [{"name": "Bash", "input_schema": {"type": "object"}}]
+    assert plan({"messages": [asked, call, result], "tools": tools}, spec).appended == 0
+    stuck = [asked, call, result, call, result, call, result]
+    assert plan({"messages": stuck, "tools": tools}, spec).appended == 1
+    assert plan({"messages": stuck, "tools": tools, "tool_choice": {"type": "any"}}, spec).appended == 2

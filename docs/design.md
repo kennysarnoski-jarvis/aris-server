@@ -92,7 +92,9 @@ tasks.
 - **A stuck tool call.** When a request ends with the same tool step three times in a row (the same calls with the
   same input, answered with the same results), a system reminder goes after the last result: running the call again
   won't tell the model anything new. It goes last, so the prompt cache still covers everything before it. The next
-  request doesn't carry it, so that turn's saved cache is re-read from the reminder on.
+  request doesn't carry it, so it resumes from where the reminder began, and a hybrid model keeps a checkpoint of its
+  state there (any message the server adds after the client's gets one): without it, the request after a reminder went
+  back to the system prompt, 33,765 tokens and 131 s on Inkling 2 Mini.
 - **Looping output.** A logits processor watches each response. Once its last 400 tokens are one chunk of up to 50
   tokens repeated, it blocks the token that would continue the chunk, so the model writes something else. After
   three such breaks, the next loop ends the response as `max_tokens` would, rather than generating on to the cap.

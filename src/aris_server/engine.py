@@ -625,6 +625,7 @@ class MovingPromptCache(LRUPromptCache):
     # Empty for a template that adds no generation prompt, whose prompts end where their history does.
     turn_starts: frozenset = frozenset()
     tokenized = None  # set by the engine as it tokenizes a request: its segments, which fetching it cuts at checkpoints
+    hold = None  # and where the messages the server added to it start, if it added any (appended_start)
     _leaving = ((), 0)  # the cached entry the request being fetched runs along furthest, and how far
     _resuming = None  # a checkpoint's cache for the request being fetched, until something covers more
 
@@ -1092,8 +1093,11 @@ class MovingPromptCache(LRUPromptCache):
         where they would hold a conversation's state as of one version of its system prompt, made again each time
         that changes), and at the start of the line where it left the cached entries, if that was well past what it
         reuses: a client that rewrites a line once tends to rewrite it again. Never at its last token: that one is read
-        as generation starts. Also where its history ends, for the state a rebuild resumes from (see _history_end)."""
+        as generation starts. Also where its history ends, for the state a rebuild resumes from (see _history_end), and
+        where messages the server added to it start (`hold`): the client never sees them, so its next request parts
+        there, and without a state to resume from it went back to the system prompt (33,765 tokens on Inkling 2 Mini)."""
         tokenized, self.tokenized = self.tokenized, None
+        hold, self.hold = self.hold, None
         if self.checkpoint_every is None or tokenized is None or tokenized[0] is not tokens:
             return
         every, end = self.checkpoint_every, len(tokens) - 1
@@ -1101,6 +1105,8 @@ class MovingPromptCache(LRUPromptCache):
         if self.system_ends:
             first = min(first, next((i for i, t in enumerate(tokens[:first]) if t in self.system_ends), first))
         at = set(range((have // every + 1) * every, first + 1, every))
+        if hold is not None:
+            at.add(hold)
         leaving, leaves = self._leaving
         if leaves - have >= self.checkpoint_min_gain:
             line = self._line_start(tokens, leaves, have)
@@ -1342,6 +1348,27 @@ def align_tokens(key, prompt, start: int, of: Callable[[int], bytes]):
         places.append((si, sj))
 
 
+def appended_start(tokenize, a, k, raw_prompt, prompt) -> int | None:
+    """Where the messages the server added to the end of a request (Plan.appended: a stuck-call reminder, a
+    tool_choice note) start in its prompt as read, or None when it added none. The client never sees them, so its
+    next request parts from this turn there. Found by tokenizing the request without them: where the two prompts
+    part (a chat template's generation prompt can share a header token with the first added message), counted from
+    the end, so it moves with a history read in a cached entry's own tokens (MovingPromptCache.own_tokens)."""
+    request = a[1] if len(a) > 1 else k.get("request")
+    n = getattr(request, "aris_appended", 0)
+    if not n or len(request.messages) <= n:
+        return None
+    shorter = copy.copy(request)
+    shorter.messages = copy.deepcopy(request.messages[:-n])  # mlx-lm's tokenize may rewrite a message's content
+    if len(a) > 1:
+        prefix = tokenize(a[0], shorter, *a[2:], **k)[0]
+    else:
+        prefix = tokenize(*a, **{**k, "request": shorter})[0]
+    shared = next((i for i, (x, y) in enumerate(zip(raw_prompt, prefix)) if x != y), min(len(raw_prompt), len(prefix)))
+    added = len(raw_prompt) - shared
+    return len(prompt) - added if 0 < added < len(prompt) else None
+
+
 def merge_prompt_tail(tokenized):
     """mlx-lm splits a chat prompt into system / conversation / thinking-tail segments and saves a copy of the cache
     at the end of each but the last. The conversation snapshot is a second full copy of a long context, held through
@@ -1408,11 +1435,13 @@ class Engine:
 
         def tokenize_and_track(*a, **k):
             # Runs on the generation thread before the prompt is read, so a mid-request snapshot can't beat it.
-            tokenized = cache.own_tokens(self.provider.model_key, merge_prompt_tail(tokenize(*a, **k)))
+            raw = tokenize(*a, **k)
+            tokenized = cache.own_tokens(self.provider.model_key, merge_prompt_tail(raw))
             request = a[1] if len(a) > 1 else k.get("request")
             cache.note_session(self.provider.model_key, tokenized, getattr(request, "aris_session", None))
             cache.reading = cache.reading[-15:] + [tokenized[0]]
             cache.tokenized = tokenized  # fetching its cache next cuts its segments where checkpoints go
+            cache.hold = appended_start(tokenize, a, k, raw[0], tokenized[0])
             return tokenized
 
         self.generator._tokenize = tokenize_and_track
@@ -1582,6 +1611,7 @@ class Engine:
         request = mls.CompletionRequest(request_type="chat", prompt="", messages=plan.messages, tools=plan.tools,
                                         role_mapping=None)
         request.aris_session = getattr(plan, "session", None)  # read back by the tokenize hook (note_session)
+        request.aris_appended = getattr(plan, "appended", 0)  # and this (appended_start)
         ctx, responses = self.generator.generate(request, args, progress_callback=on_progress)
 
         classify = _classify_inkling if self.inkling else _classify
