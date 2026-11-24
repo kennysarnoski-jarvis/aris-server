@@ -6,6 +6,10 @@ are written as they enter the in-memory cache; a conversation's older snapshot i
 Each setup (weights, adapter, KV precision) has a folder of its own, and one cap covers them all. A server reads only
 its own folder, so the caches of setups no running server holds go first, then its own oldest. A running server holds
 a shared lock on its folder; another server sharing the directory clears only folders nobody holds.
+
+A cache no request has resumed from in a few days goes too, whatever the cap leaves room for: an old conversation's
+turns and an older system prompt's snapshot are rarely wanted again, and with the cap alone 19 GB of them sat on a Mac
+two weeks after they were last used.
 """
 
 import fcntl
@@ -20,8 +24,11 @@ from pathlib import Path
 import mlx.core as mx
 from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
 
+from .config import DISK_CACHE_DAYS
+
 MIN_TOKENS = 1024  # shorter prompts are quick to re-read
 LOCK = "lock"      # shared by each server using the folder, exclusive for one clearing it
+AGE_CHECK_SECONDS = 3600.0  # how often a serving server looks for caches past their age, besides at start and each save
 
 
 def model_id(model_path: str, adapter: str | None = None, kv_bits: int | None = None, mtp: str | None = None,
@@ -89,10 +96,13 @@ def _remove(data: Path):
 
 class DiskCache:
     def __init__(self, root: Path, model_path: str, max_bytes: int, adapter: str | None = None,
-                 kv_bits: int | None = None, mtp: str | None = None, mtp_bits: int = 0):
+                 kv_bits: int | None = None, mtp: str | None = None, mtp_bits: int = 0,
+                 max_age_days: float = DISK_CACHE_DAYS):
         self.root = root
         self.dir = root / model_id(model_path, adapter, kv_bits, mtp, mtp_bits)
         self.max_bytes = max_bytes
+        self.max_age = max_age_days * 86400
+        self._checked = 0.0  # when _trim last ran
         self._lock = self._hold()
         self.index: dict[Path, tuple[tuple[int, ...], str]] = {}
         for data in self.dir.glob("*.safetensors"):
@@ -165,15 +175,35 @@ class DiskCache:
         self.index.pop(data, None)
         _remove(data)
 
+    def used(self, data: Path):
+        """A request resumed from this cache: it counts as recent until max_age from now. Loading it into memory at
+        start doesn't: a server restarted every day would otherwise keep its newest caches forever."""
+        try:
+            os.utime(data)
+        except OSError:  # gone, or a folder that can't be changed: it ages as it was
+            pass
+
     def _trim(self):
-        """Keep this setup's caches, with those of setups no running server holds, under the cap: the others' go first,
-        oldest first, since this server can't read them; then this setup's oldest."""
+        """Delete the caches no request has resumed from in max_age, this setup's and those of setups no running
+        server holds. Then keep what is left under the cap: the others' go first, oldest first, since this server
+        can't read them; then this setup's oldest."""
+        self._checked = time.time()
         claimed = [(folder, lock) for folder in self.root.iterdir()
                    if folder != self.dir and folder.is_dir() and re.fullmatch(r"[0-9a-f]{16}", folder.name)
                    and (lock := _claim(folder)) is not None]
         try:
             spare = sorted((p for folder, _ in claimed for p in folder.glob("*.safetensors")), key=_stat)
             own = sorted(self.index, key=_stat)
+            if self.max_age > 0:
+                old = {p for p in spare + own if _stat(p)[0] < self._checked - self.max_age}
+                if old:
+                    size = sum(_stat(p)[1] for p in old)
+                    for data in old:
+                        self._delete(data)
+                    logging.info("disk cache: deleted %d caches (%.1f GB) no request used in %g days", len(old),
+                                 size / (1 << 30), self.max_age / 86400)
+                    spare = [p for p in spare if p not in old]
+                    own = [p for p in own if p not in old]
             total = sum(_stat(p)[1] for p in spare + own)
             freed = removed = 0
             for data in spare:
@@ -209,6 +239,8 @@ class DiskCache:
         """The saved cache covering the longest proper prefix of `tokens`, if it covers more than `longer_than`. One
         whose file is gone from disk (deleted by hand, say) is forgotten here, before the caller lets go of what memory
         holds for the turn."""
+        if self.max_age > 0 and time.time() - self._checked >= AGE_CHECK_SECONDS:
+            self._trim()  # a server that saves nothing for days still lets its old caches go
         key = tuple(tokens)
         while True:
             best = None

@@ -1,11 +1,13 @@
+import logging
 import os
 import shutil
 import threading
+import time
 
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, KVCache
 
-from aris_server.disk_cache import DiskCache, _claim, model_id
+from aris_server.disk_cache import AGE_CHECK_SECONDS, DiskCache, _claim, model_id
 from aris_server.engine import MovingPromptCache
 
 
@@ -250,12 +252,53 @@ def test_only_the_latest_turns_prompt_end_state_is_kept():
 
 
 def saved(disk, start, seed, age):
-    """A 2000-token conversation saved by `disk`, its file dated `age` seconds after the epoch."""
+    """A 2000-token conversation saved by `disk`, its file dated `age` seconds into the last day (within the days a
+    cache is kept, so only the cap decides what goes)."""
     tokens = tuple(range(start, start + 2000))
     disk.save(list(tokens), layers(2000, seed), "assistant")
     (data,) = [p for p, (t, _) in disk.index.items() if t == tokens]
-    os.utime(data, (age, age))
+    stamp = time.time() - 86400 + age
+    os.utime(data, (stamp, stamp))
     return data
+
+
+def dated(path, days_ago: float):
+    stamp = time.time() - days_ago * 86400
+    os.utime(path, (stamp, stamp))
+
+
+def test_a_cache_no_request_resumed_from_in_its_days_goes_at_start_whatever_the_cap(tmp_path, caplog):
+    # Under the cap alone, 19 GB of caches sat on a Mac two weeks after they were last used.
+    before = DiskCache(tmp_path, "model-b", max_bytes=1 << 30)              # a setup no server runs now
+    theirs = saved(before, 0, 1, age=1000)
+    del before
+    disk = DiskCache(tmp_path, "model-a", max_bytes=1 << 30)
+    stale, fresh = saved(disk, 10000, 2, age=1000), saved(disk, 20000, 3, age=2000)
+    dated(theirs, 7)
+    dated(stale, 3.5)
+    del disk
+    DiskCache(tmp_path, "model-a", max_bytes=1 << 30, max_age_days=0)        # 0: kept until the cap needs room
+    assert theirs.exists() and stale.exists() and fresh.exists()
+    with caplog.at_level(logging.INFO):
+        restarted = DiskCache(tmp_path, "model-a", max_bytes=1 << 30)
+    assert not theirs.parent.exists() and not stale.exists() and not stale.with_suffix(".json").exists()
+    assert list(restarted.index) == [fresh] and fresh.exists()
+    assert "deleted 2 caches" in caplog.text
+
+
+def test_a_serving_server_lets_old_caches_go_and_keeps_the_ones_requests_resume_from(tmp_path):
+    cache = cache_with_disk(tmp_path)
+    cache.insert_cache("m", TURN1, layers(2200, 2), cache_type="assistant")
+    cache.trim_to(n_bytes=0)                                                # evicted: on disk
+    (resumed,) = cache.disk.index
+    idle = saved(cache.disk, 30000, 4, age=0)                               # another conversation's
+    dated(resumed, 3.5)
+    dated(idle, 3.5)
+    got, rest = cache.fetch_nearest_cache("m", TURN1 + [1])                 # resumed from disk: used just now
+    assert got[0].offset == 2200 and rest == [1]
+    cache.disk._checked -= AGE_CHECK_SECONDS                                # an hour on, the next request looks
+    cache.fetch_nearest_cache("m", SYSTEM + [1])
+    assert resumed.exists() and not idle.exists() and list(cache.disk.index) == [resumed]
 
 
 def test_one_cap_covers_every_setup_and_other_setups_caches_go_first(tmp_path):

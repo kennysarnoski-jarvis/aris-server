@@ -36,7 +36,7 @@ from . import heads as draft_heads
 from . import inkling
 from . import models as _models
 from .budget import BudgetTokens, ThinkBudget
-from .config import ModelSpec, home
+from .config import DISK_CACHE_DAYS, ModelSpec, home
 from .disk_cache import DiskCache
 from .guards import LoopGuard, loop_exempt_ids
 from .kv_quant import BatchQuantizedKVCache, kv_bytes_per_token, quantize_kv
@@ -1200,6 +1200,7 @@ class MovingPromptCache(LRUPromptCache):
             # Dropped from disk, so it can't come up again: look again. Memory still has the system prompt, say;
             # giving up here sent the turn back to its first token, minutes for a long conversation.
             return self._fetch_nearest(model, tokens)
+        self.disk.used(data)
         gb = 1 << 30
         logging.info("loaded a %d-token cache from disk in place of %d cached tokens (%.1fs, active %.1f -> %.1f GB)",
                      n, len(tokens) - len(rest), time.time() - t0, before / gb, mx.get_active_memory() / gb)
@@ -1450,7 +1451,7 @@ class Run:
 class Engine:
     def __init__(self, spec: ModelSpec, decode_concurrency: int = 4, prompt_concurrency: int = 2,
                  prompt_cache_size: int = 8, prompt_cache_bytes: int | None = None, reserve_gb: float = 6.0,
-                 disk_cache_gb: float = 20.0, guards: bool = True):
+                 disk_cache_gb: float = 20.0, disk_cache_days: float = DISK_CACHE_DAYS, guards: bool = True):
         self.spec = spec
         self.guards = guards
         ns = argparse.Namespace(
@@ -1523,7 +1524,7 @@ class Engine:
         self._fit_memory(cache, ns, prompt_cache_bytes, reserve_gb)
         if disk_cache_gb > 0:
             disk = DiskCache(home() / "cache", spec.path, int(disk_cache_gb * (1 << 30)), spec.adapter, spec.kv_bits,
-                             spec.mtp, spec.mtp_bits)
+                             spec.mtp, spec.mtp_bits, max_age_days=disk_cache_days)
             key = self.provider.model_key
             restored = disk.restore(lambda t, c, kind: LRUPromptCache.insert_cache(cache, key, t, c, cache_type=kind),
                                     cache.max_bytes)

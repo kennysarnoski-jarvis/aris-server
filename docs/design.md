@@ -203,7 +203,10 @@ shared system prompt at once. Writing every turn put 445 GB on an SSD in one day
 precision) has its own folder, and one cap, 20 GB by default, covers them all: a server reads only its own folder, so
 at startup and whenever a save goes over the cap, the caches of setups no running server holds go first, oldest first,
 then its own oldest. A cap per folder let a day of trying seven setups on one Mac fill 116 GB, 96 of them for setups
-no longer served. A running server holds a shared lock on its folder, and another server sharing the directory leaves
+no longer served. A cache no request has resumed from in three days goes too (`--disk-cache-days`), looked for at
+startup, at each save and hourly while serving: under the cap alone, 19 GB of caches sat on a Mac two weeks after
+they were last used. Resuming from one counts as using it; loading the newest into memory at startup doesn't, or a
+server restarted every day would keep them forever. A running server holds a shared lock on its folder, and another server sharing the directory leaves
 it alone. A cache that can't be written (a full disk, say) costs a warning, not the server: mlx-lm calls the cache from
 its generation loop with no handler, and MLX raises RuntimeError, not OSError. A folder deleted while serving is made
 and held again at the next save. A model sometimes

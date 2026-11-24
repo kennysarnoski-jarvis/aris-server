@@ -11,6 +11,7 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 KV_BITS_CHOICES = (4, 8)
 MAX_MTP_DEPTH = 7  # drafts a round: an Inkling 2 draft block holds 7; past 3, Qwen's chained MTP drafts rarely hold
 DEFAULT_THINK_BUDGET = {"low": 1024, "medium": 4096, "high": 8192, "xhigh": 16384, "max": 0}
+DISK_CACHE_DAYS = 3.0  # a saved prompt cache no request has resumed from in this long is deleted (see disk_cache)
 
 
 def home() -> Path:

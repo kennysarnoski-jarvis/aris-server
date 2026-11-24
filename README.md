@@ -210,7 +210,8 @@ the weights this Mac would load, their size and context, and whether they and th
 
 The service starts at login and restarts the server within seconds of any exit (it exits on purpose
 if the GPU runs out of memory). Saved prompt caches mean the conversation picks up where it left off;
-they take up to 20 GB of disk, all models together (`--disk-cache-gb`). Logs go to
+they take up to 20 GB of disk, all models together (`--disk-cache-gb`), and one no request has
+resumed from in 3 days is deleted (`--disk-cache-days`). Logs go to
 `~/.aris-server/server.log`.
 
 ## Status

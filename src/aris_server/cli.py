@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from . import __version__, heads
-from .config import builtin_models, home, load_models, resolve
+from .config import DISK_CACHE_DAYS, builtin_models, home, load_models, resolve
 
 
 def _wired_limit():
@@ -47,6 +47,9 @@ def main(argv=None):
     s.add_argument("--prompt-cache-gb", type=float, help="memory for saved prompt caches (default: fit to the GPU)")
     s.add_argument("--disk-cache-gb", type=float, default=20.0,
                    help="disk for saved prompt caches, all models together (0 turns it off)")
+    s.add_argument("--disk-cache-days", type=float, default=DISK_CACHE_DAYS,
+                   help="days a saved prompt cache stays on disk after a request last resumed from it (0: until the "
+                        "space is needed)")
     s.add_argument("--reserve-gb", type=float, default=6.0, help="GPU memory kept free for active sequences")
     s.add_argument("--log-level", default="INFO")
     s.add_argument("--no-guards", dest="guards", action="store_false",
@@ -170,7 +173,7 @@ def main(argv=None):
         if (sized := weights_and_config(spec.path, spec.adapter)) is not None:
             check_memory(name, limit, sized[0] + heads.extra_bytes(spec, sized[1]))
         engine = Engine(spec, decode_concurrency=a.concurrency, reserve_gb=a.reserve_gb,
-                        disk_cache_gb=a.disk_cache_gb, guards=a.guards,
+                        disk_cache_gb=a.disk_cache_gb, disk_cache_days=a.disk_cache_days, guards=a.guards,
                         prompt_cache_bytes=int(a.prompt_cache_gb * (1 << 30)) if a.prompt_cache_gb else None)
     except NotEnoughMemory as e:
         logging.error("%s", e)
