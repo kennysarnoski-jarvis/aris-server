@@ -32,6 +32,26 @@ class Plan:
     context: int | None = None
     context_capped: bool = False  # max_tokens was cut to fit the context window
     stuck_repeats: int = 0  # the request ends with this many identical tool steps, and got a reminder about it
+    session: str | None = None  # the client session it belongs to, when the client names it (claude_code_session)
+
+
+def claude_code_session(headers, body: dict) -> str | None:
+    """The Claude Code session a request comes from: its X-Claude-Code-Session-Id header, or the session_id in its
+    metadata.user_id (a JSON object in Claude Code 2, `user_..._session_<id>` before). None for any other client: a
+    plain user id spans that user's sessions, and the prompt cache treats a session as one conversation at a time."""
+    named = headers.get("x-claude-code-session-id") if headers is not None else None
+    if named:
+        return str(named).strip() or None
+    user = (body.get("metadata") or {}).get("user_id") if isinstance(body.get("metadata"), dict) else None
+    if not isinstance(user, str):
+        return None
+    try:
+        parsed = json.loads(user)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return str(parsed["session_id"]) if parsed.get("session_id") else None
+    return user.rsplit("_session_", 1)[1] or None if "_session_" in user else None
 
 
 def parse_tools(p: "Plan") -> list[dict] | None:

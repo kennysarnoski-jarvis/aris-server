@@ -649,6 +649,10 @@ class MovingPromptCache(LRUPromptCache):
         # Recent requests cut where their history ends -> their prompt's length: that state stands in for their end's.
         self._history_ends: dict[tuple, int] = {}
         self._own_seen: dict[tuple, int] = {}  # see _note_own_tokens
+        # Requests in flight -> (session, system prompt length), and the entries their turns left, for note_session.
+        self._asking: list[tuple[list, str | None, int | None]] = []
+        self._sessions: dict[tuple, tuple[str, int]] = {}
+        self._ended: set[tuple] = set()  # entries a session started its conversation over from: dropped, not saved
 
     def _save(self, tokens, prompt_cache, cache_type):
         if self.disk is None or self.disk.has(tokens):
@@ -707,6 +711,7 @@ class MovingPromptCache(LRUPromptCache):
                     self._prompt_state.pop(next(iter(self._prompt_state)))
         elif cache_type != "system":
             key = tuple(tokens)
+            self._tag_session(tokens)
             at = max((k for k in self._prompt_state if len(k) < len(key) and key[:len(k)] == k), key=len, default=None)
             for older in [k for k in self._turn_state if len(k) < len(key) and key[:len(k)] == k]:
                 self._turn_state.pop(older)  # this conversation's earlier turns: superseded
@@ -809,6 +814,69 @@ class MovingPromptCache(LRUPromptCache):
         self._note_own_tokens(key, prompt, shared, places, where)
         return aligned, [aligned[a:b] for a, b in zip(cut, cut[1:])], types, initial_state, vision
 
+    message_starts: frozenset = frozenset()  # the tokens that open a message (Qwen's <|im_start|>), for note_session
+
+    def note_session(self, model, tokenized, session):
+        """Which client session a request comes from, and the cached conversation it starts over, if any. A Claude
+        Code session that compacts, or is cleared, sends its system prompt again and then a first message other than
+        its conversation's: nothing continues that conversation's cached turn after that, yet on its way out of memory
+        it was saved to disk, 3.4 GB for an 87k-token turn of Aris 3.8-27B, written for nothing at every compaction.
+        Such a turn is dropped instead, once this request has taken what it shares. Only within one named session
+        (Claude Code's X-Claude-Code-Session-Id): two sessions can share a system prompt, and one's new conversation
+        must leave the other's cache alone. A subagent's system prompt is its own, and a fork of the conversation (a
+        compaction's own request, say) shares it past its first message, so neither ends it."""
+        prompt, segments, types = tokenized[0], tokenized[1], tokenized[2]
+        system = len(segments[0]) if len(segments) > 1 and types and types[0] == "system" else None
+        self._asking = self._asking[-15:] + [(list(prompt), session, system)]
+        if session is None or system is None or not self.message_starts:
+            return
+        for kind, lru in self._lru._lrus.items():
+            if kind == "system":
+                continue
+            for m, key in list(lru):
+                if m != model or self._sessions.get(tuple(key)) != (session, system) or len(key) <= system:
+                    continue
+                if key[:system] != list(prompt[:system]):
+                    continue
+                first = next((i for i in range(system, len(key)) if key[i] in self.message_starts), len(key))
+                if system + _first_difference(key, list(prompt), system, system) < first:
+                    self._ended.add(tuple(key))
+
+    def _tag_session(self, tokens):
+        """The session of the request whose turn (or a snapshot of whose prompt) these tokens are."""
+        key = list(tokens)
+        for prompt, session, system in reversed(self._asking):
+            if session is not None and system is not None and key[:len(prompt)] == prompt:
+                self._sessions[tuple(tokens)] = (session, system)
+                break
+        if len(self._sessions) > 64:  # forget entries no longer cached
+            live = {tuple(k) for lru in self._lru._lrus.values() for _, k in lru}
+            self._sessions = {k: v for k, v in self._sessions.items() if k in live or k == tuple(tokens)}
+
+    def _drop_ended(self, model):
+        """Drops what note_session found ended, without saving it. A request that started over from one may have
+        resumed from its attention caches as views (see _from_checkpoint); it holds what it took."""
+        if not self._ended:
+            return
+        gb = 1 << 30
+        for kind, lru in self._lru._lrus.items():
+            for m, entry_key in list(lru):
+                if m != model or tuple(entry_key) not in self._ended:
+                    continue
+                self._trie.taking = True  # dropped, not evicted: never written
+                try:
+                    entry = self._trie.pop(m, entry_key)
+                finally:
+                    self._trie.taking = False
+                self._lru.remove(m, entry_key)
+                self._n_bytes -= entry.nbytes
+                self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
+                self._turn_state.pop(tuple(entry_key), None)
+                logging.info("memory cache: dropped a %d-token %s (%.1f GB) that its session started over from (a "
+                             "compaction or a clear): nothing continues it, so it isn't saved", len(entry_key),
+                             entry.cache_type, entry.nbytes / gb)
+        self._ended.clear()
+
     def _note_own_tokens(self, key, prompt, shared, places, where):
         """Logged once for each new place a conversation's history spells its reply in other tokens: each of its later
         requests lines up at the same places again."""
@@ -877,6 +945,7 @@ class MovingPromptCache(LRUPromptCache):
         self._fetches += 1
         self._touch(tokens)
         cache, rest = self._fetch_nearest(model, tokens)
+        self._drop_ended(model)
         resuming, self._resuming = self._resuming, None
         if resuming is not None and resuming[0] is cache:  # a checkpoint was the best there was
             logging.info("memory cache: resumed at token %d from a checkpoint and a %d-token %s, which the request "
@@ -1337,6 +1406,8 @@ class Engine:
         def tokenize_and_track(*a, **k):
             # Runs on the generation thread before the prompt is read, so a mid-request snapshot can't beat it.
             tokenized = cache.own_tokens(self.provider.model_key, merge_prompt_tail(tokenize(*a, **k)))
+            request = a[1] if len(a) > 1 else k.get("request")
+            cache.note_session(self.provider.model_key, tokenized, getattr(request, "aris_session", None))
             cache.reading = cache.reading[-15:] + [tokenized[0]]
             cache.tokenized = tokenized  # fetching its cache next cuts its segments where checkpoints go
             return tokenized
@@ -1366,6 +1437,8 @@ class Engine:
                 else frozenset(self.tokenizer.eos_token_ids or ())
             cache.turn_starts = turn_start_tokens(self.tokenizer)
         _OWN_TOOL_CALLS.active = self.inkling
+        cache.message_starts = inkling.conversation_starts(self.tokenizer) if self.inkling \
+            else turn_start_tokens(self.tokenizer)
         cache.decode = self.tokenizer.decode
         cache.token_bytes = token_bytes(self.tokenizer)
         if cache.token_bytes is None:
@@ -1505,6 +1578,7 @@ class Engine:
         )
         request = mls.CompletionRequest(request_type="chat", prompt="", messages=plan.messages, tools=plan.tools,
                                         role_mapping=None)
+        request.aris_session = getattr(plan, "session", None)  # read back by the tokenize hook (note_session)
         ctx, responses = self.generator.generate(request, args, progress_callback=on_progress)
 
         classify = _classify_inkling if self.inkling else _classify

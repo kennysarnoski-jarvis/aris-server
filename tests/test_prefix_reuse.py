@@ -9,6 +9,8 @@ drives it (ResponseGenerator._generate, batched path), so the checkpoints are ta
 them."""
 
 import logging
+
+import pytest
 from typing import Callable
 
 import mlx.core as mx
@@ -79,10 +81,11 @@ def cache_for(model, budget=1 << 30, turns=False):
         cache.checkpoint_every, cache.system_ends = STEP, frozenset({END})
         if turns:  # requests that end with a turn header, as a chat template's do
             cache.turn_starts = frozenset({TURN})
+    cache.message_starts = frozenset({TURN})
     return cache
 
 
-def serve(cache, model, prompt, system_tokens=None, max_tokens=4, sampler=None):
+def serve(cache, model, prompt, system_tokens=None, max_tokens=4, sampler=None, session=None):
     """One request, the way mlx-lm's server serves it: its prompt split into segments (the system prompt, then the
     rest; a request ending in tool results is one segment), the nearest cache fetched, the prompt read with a copy of
     the cache saved at each segment's end, then the finished sequence's cache saved. Returns (cached tokens, generated
@@ -95,6 +98,7 @@ def serve(cache, model, prompt, system_tokens=None, max_tokens=4, sampler=None):
         segments, types = [prompt], ["assistant"]
     # What the engine's tokenize hook does.
     tokenized = cache.own_tokens("m", merge_prompt_tail((prompt, segments, types, "normal", None)))
+    cache.note_session("m", tokenized, session)
     # The same lists, as mlx-lm's are: fetching the cache cuts them in place where checkpoints go.
     prompt, segments, types = tokenized[0], tokenized[1], tokenized[2]
     cache.reading = cache.reading[-15:] + [prompt]
@@ -284,6 +288,51 @@ def test_a_reply_its_next_request_tokenizes_differently_is_continued_whole(caplo
     cached, got, logprobs = serve(cache, model, third)
     assert serve.prompt == second_turn + third[len(history) + len(got):] and cached == len(second_turn)
     same_as_read_cold(model, serve.prompt, got, logprobs)
+
+
+class RecordingDisk:
+    """The disk tier as the cache asks of it, recording what it saves and finding nothing."""
+
+    def __init__(self):
+        self.index, self.saved = {}, []
+
+    def has(self, tokens):
+        return False
+
+    def save(self, tokens, prompt_cache, cache_type):
+        self.saved.append(len(tokens))
+
+    def nearest(self, tokens, longer_than=0):
+        return None
+
+
+@pytest.mark.parametrize("system_cached", [True, False])
+def test_the_conversation_a_compaction_leaves_is_dropped_and_the_new_one_answers_as_read_cold(caplog, system_cached):
+    # After a compaction Claude Code sends its system prompt with a summary as the first message. Nothing continues
+    # the old conversation, and saving it on its way out of memory wrote 3.4 GB at each compaction on Aris 3.8-27B.
+    # Without the system prompt in memory the new request resumes from a checkpoint with the old conversation's
+    # attention caches as views; the old one is dropped only after that, and the answer is a cold read's.
+    model = kv8_hybrid_model()
+    cache = cache_for(model, turns=True)
+    cache.disk = disk = RecordingDisk()
+    _, answer, _ = serve(cache, model, HISTORY + ASK, system_tokens=len(system()), session="s1")
+    turn = HISTORY + ASK + answer
+    if not system_cached:
+        cache._trie.taking = True
+        entry = cache._trie.pop("m", system())
+        cache._trie.taking = False
+        cache._lru.remove("m", system())
+        cache._n_bytes -= entry.nbytes
+        cache._n_bytes_by_type["system"] -= entry.nbytes
+    compacted = system() + text(9, 40) + [END, NEWLINE] + ASK
+    with caplog.at_level(logging.INFO):
+        cached, got, logprobs = serve(cache, model, compacted, system_tokens=len(system()), session="s1")
+    assert cached == (len(system()) if system_cached else len(system()) // STEP * STEP)
+    assert turn not in [list(k) for lru in cache._lru._lrus.values() for _, k in lru]
+    assert f"dropped a {len(turn)}-token assistant" in caplog.text
+    same_as_read_cold(model, compacted, got, logprobs)
+    cache.trim_to(n_bytes=0)
+    assert len(turn) not in disk.saved
 
 
 def test_checkpoints_cover_the_system_prompt_and_not_the_conversation_after_it():

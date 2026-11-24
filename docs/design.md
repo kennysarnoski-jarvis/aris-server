@@ -213,7 +213,13 @@ is kept where the prompt's history ends, and a turn the request parts from after
 memory: its attention caches trimmed and that state put back. mlx-lm's prompt trie found the shortest entry past
 where a prompt leaves it in time quadratic in that entry's length (it copied the path at every step down): the
 request after a compaction, which leaves an 88k-token conversation after its system prompt, waited 12 to 19 s on an
-M4 Pro for two searches. The server searches the trie itself, in linear time, with the same results. The history ends at the start of the
+M4 Pro for two searches. The server searches the trie itself, in linear time, with the same results. And the
+conversation a compaction leaves behind is dropped, not saved: Claude Code names its session on every request
+(`X-Claude-Code-Session-Id`), and a request from the same session with the same system prompt whose first message is
+another one (a summary, after a compaction; anything, after a clear) has started that conversation over, so nothing
+continues the cached turn it leaves. Saving it on its way out of memory wrote 3.4 GB at each compaction on Arete-27B.
+Only a named session's own requests do this: two sessions can share a system prompt, a subagent's system prompt is its
+own, and a fork of the conversation (the compaction's own request) shares it past its first message. The history ends at the start of the
 turn the prompt asks for: a template that adds a generation prompt (Qwen's `<|im_start|>assistant`)
 ends a prompt a few tokens past it, Inkling's ends there. That point also serves a request that
 replaces the turn rather than continuing it. Claude Code compacts by sending the conversation with a

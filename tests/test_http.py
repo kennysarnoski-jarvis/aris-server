@@ -234,3 +234,22 @@ def test_inklings_messages_reach_the_client_as_they_were_generated(serve, exact,
     conn.request("POST", "/v1/messages", json.dumps(BODY), {"content-type": "application/json"})
     blocks = json.loads(conn.getresponse().read())["content"]
     assert (blocks[0]["thinking"], blocks[1]["text"]) == want
+
+
+def test_a_request_carries_its_claude_code_session_to_the_engine(serve):
+    seen = []
+
+    class Recording(FakeEngine):
+        endless = False
+
+        def run(self, plan, on_progress=None):
+            seen.append(plan.session)
+            return super().run(plan, on_progress)
+
+    port = serve(Recording([("normal", "ok")]))
+    for headers in ({"X-Claude-Code-Session-Id": "s-123"}, {}):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("POST", "/v1/messages", json.dumps(BODY), {"content-type": "application/json", **headers})
+        assert conn.getresponse().status == 200
+        conn.close()
+    assert seen == ["s-123", None]

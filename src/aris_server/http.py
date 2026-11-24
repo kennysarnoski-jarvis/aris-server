@@ -17,7 +17,7 @@ from .config import BUILTIN_MODELS, ModelSpec, resolve
 from .engine import Engine
 from .mtp_serve import mtp_snapshot
 from .stream import MessageBuilder, new_id, progress_note, sse
-from .translate import RequestError, fit_context, parse_tools, plan
+from .translate import RequestError, claude_code_session, fit_context, parse_tools, plan
 
 
 # Claude Code drops a stream that sends nothing for a few minutes, and a tool call is only sent once it closes, so a
@@ -142,6 +142,7 @@ class Handler(BaseHTTPRequestHandler):
             p = plan(body, spec, guards=self.server.guards)
         except RequestError as e:
             return self._reject(e)
+        p.session = claude_code_session(self.headers, body)
         if self.route.endswith("count_tokens"):
             return self._json(200, {"input_tokens": engine.count_tokens(p)})
         p.context = _fit_window(p.context, getattr(engine, "max_context", None))
