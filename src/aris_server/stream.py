@@ -4,6 +4,7 @@ import json
 import re
 import uuid
 
+from .inkling import MESSAGE
 from .tool_stream import FUNCTION, XmlToolCall
 
 STOP_REASONS = {"stop": "end_turn", "length": "max_tokens"}
@@ -66,6 +67,11 @@ class MessageBuilder:
         return events
 
     def feed(self, state: str, text: str) -> list[dict]:
+        if state == MESSAGE:
+            # A message of the model's own starts (an Inkling reply is a run of them). A block never runs across two:
+            # a reply that thought twice in a row came back in the history as one thought, and missed its cache.
+            # Tool calls still gather until they end, as one run of calls.
+            return self._close() if self._open in ("thinking", "text") else []
         events = []
         if state != "tool" and (self._tool_text or self._xml):
             events += self._flush_tool()

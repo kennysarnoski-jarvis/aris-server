@@ -2,6 +2,7 @@ import json
 
 from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
 
+from aris_server.inkling import MESSAGE, parse_tool_calls
 from aris_server.stream import MessageBuilder
 
 TOOLS = [{"type": "function", "function": {"name": "Bash", "parameters": {
@@ -62,3 +63,19 @@ def test_two_tool_calls_in_one_turn():
     assert reason == "tool_use"
     assert [blk["input"]["command"] for blk in b.blocks] == ["ls", "pwd"]
     assert len({blk["id"] for blk in b.blocks}) == 2
+
+
+def test_a_new_message_closes_the_block_before_it_and_calls_in_a_row_stay_one_run():
+    b = MessageBuilder(parse_tool_calls, exact=True)
+    events = []
+    for state, text in [(MESSAGE, ""), ("reasoning", "a"), (MESSAGE, ""), ("reasoning", "b"), (MESSAGE, ""),
+                        ("normal", "c"), (MESSAGE, ""), ("normal", "d"), (MESSAGE, ""),
+                        ("tool", '{"name":"x","args":{}}'), ("tool", "\n"), (MESSAGE, ""),
+                        ("tool", '{"name":"y","args":{"n":1}}'), ("tool", "\n")]:
+        events += b.feed(state, text)
+    events += b.finish("stop")[0]
+    assert [(blk["type"], blk.get("thinking") or blk.get("text") or blk["name"]) for blk in b.blocks] == [
+        ("thinking", "a"), ("thinking", "b"), ("text", "c"), ("text", "d"), ("tool_use", "x"), ("tool_use", "y")]
+    kinds = [e["type"] for e in events]
+    assert kinds.count("content_block_start") == kinds.count("content_block_stop") == 6
+    assert sum(e["delta"]["type"] == "signature_delta" for e in events if e["type"] == "content_block_delta") == 2

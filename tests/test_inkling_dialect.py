@@ -1,17 +1,20 @@
 """Inkling 2's reply format through Aris Server: the reply stream, tool calls, the think budget, effort and sizing."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
+from tokenizers import Tokenizer, models
+from transformers import PreTrainedTokenizerFast
 
 from aris_server import config, inkling
 from aris_server.budget import ThinkBudget
 from aris_server.engine import _classify_inkling, full_attention_layers
 from aris_server.kv_quant import quantize_kv
-from aris_server.stream import MessageBuilder
+from aris_server.stream import MessageBuilder, progress_note
 from aris_server.translate import convert_messages, plan
 
 REPLY = ("<|message_model|><|content_thinking|>The user wants the weather.\nCall the tool.<|end_message|>"
@@ -104,6 +107,80 @@ def test_an_inkling_turn_comes_back_in_the_history_as_it_was_generated():
     echoed = [{"role": "user", "content": "List the files."}, {"role": "assistant", "content": builder.blocks}]
     turn = convert_messages(None, echoed)[-1]
     assert turn["reasoning_content"] == thinking and turn["content"] == text
+
+
+def test_each_message_starts_with_a_piece_that_keeps_it_apart():
+    stream = inkling.ReplyStream()
+    pieces = stream.feed("<|message_model|><|content_thinking|>a<|end_message|>"
+                         "<|message_model|><|content_thinking|>b<|end_message|><|content_model_end_sampling|>")
+    assert pieces == [(inkling.MESSAGE, ""), ("reasoning", "a"), (inkling.MESSAGE, ""), ("reasoning", "b")]
+
+
+def test_a_past_replys_messages_go_back_in_the_order_generated():
+    t, x = "thinking", "text"
+    assert inkling.history_fields([]) == {"content": ""}
+    assert inkling.history_fields([(t, "a")]) == {"content": "", "reasoning_content": "a"}
+    assert inkling.history_fields([(t, "a"), (x, "b")]) == {"content": "b", "reasoning_content": "a"}
+    assert inkling.history_fields([(t, "a"), (t, "b")]) == {
+        "content": "", "reasoning_content": "a<|end_message|><|message_model|><|content_thinking|>b"}
+    assert inkling.history_fields([(x, "a"), (t, "b"), (x, "c")]) == {
+        "content": "a<|end_message|><|message_model|><|content_thinking|>b<|end_message|><|message_model|>"
+                   "<|content_text|>c"}
+
+
+# Inkling 2 Mini's own chat template, byte for byte as its model ships it (thinkingmachines/Inkling-2-Mini, Apache
+# License 2.0; sha256 53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc), to write a past turn back
+# the way the server does.
+TEMPLATE = (Path(__file__).parent / "data" / "inkling2_chat_template.jinja").read_text()
+
+
+def render(messages) -> str:
+    tok = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+                                  unk_token="[UNK]")
+    tok.chat_template = TEMPLATE
+    return tok.apply_chat_template(messages, tokenize=False)
+
+
+CALL = '<|message_model|>Bash<|content_invoke_tool_json|>{"name":"Bash","args":{"command":"ls docs"}}<|end_message|>'
+REPLIES = {
+    # A think budget closed the first thought (on a newline) and the model opened another.
+    "two thoughts": ("<|message_model|><|content_thinking|>The spec is read.\n<|end_message|>"
+                     "<|message_model|><|content_thinking|>Check the docs, then write it.<|end_message|>" + CALL),
+    "thinking, text, thinking": ("<|message_model|><|content_thinking|>Plan.<|end_message|>"
+                                 "<|message_model|><|content_text|>Looking at the docs.<|end_message|>"
+                                 "<|message_model|><|content_thinking|>One more check.<|end_message|>" + CALL),
+    "two texts": "<|message_model|><|content_text|>First.<|end_message|><|message_model|><|content_text|>Second."
+                 "<|end_message|>",
+    "the usual": ("<|message_model|><|content_thinking|>\nPlan.\n<|end_message|>"
+                  "<|message_model|><|content_text|>Listing.\n<|end_message|>" + CALL + CALL),
+    "a call alone": CALL,
+}
+
+
+@pytest.mark.parametrize("reply", list(REPLIES.values()), ids=list(REPLIES))
+def test_a_turn_goes_back_through_inklings_template_as_it_was_generated(reply):
+    reply += "<|content_model_end_sampling|>"
+    builder = MessageBuilder(tool_parser=inkling.parse_tool_calls, exact=True)
+    builder.note(progress_note(512, 1024))  # the prompt took a while to read
+    stream = inkling.ReplyStream()
+    for i in range(0, len(reply), 4):  # as generation hands it over, a few characters at a time
+        for state, text in stream.feed(reply[i:i + 4]):
+            builder.feed(state, text)
+    for state, text in stream.flush():
+        builder.feed(state, text)
+    builder.finish("stop")
+    asked = {"role": "user", "content": "Write it."}
+    history = convert_messages(None, [asked, {"role": "assistant", "content": builder.blocks}], inkling=True)
+    assert render(history) == render(history[:1]) + reply
+
+
+def test_the_server_asks_for_inklings_history_only_for_inkling():
+    body = {"messages": [{"role": "user", "content": "Go."}, {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "a"}, {"type": "thinking", "thinking": "b"}]}]}
+    spec = config.ModelSpec(name="m", path="m")
+    assert plan(body, spec, inkling=True).messages[-1]["reasoning_content"] == (
+        "a<|end_message|><|message_model|><|content_thinking|>b")
+    assert plan(body, spec).messages[-1]["reasoning_content"] == "a\n\nb"
 
 
 def test_classify_ends_on_stop_and_shows_a_cut_reply():

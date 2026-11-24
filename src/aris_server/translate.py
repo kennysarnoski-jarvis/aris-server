@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from .config import EFFORTS, ModelSpec
 from .guards import STUCK_REPEATS, stuck_call_note, stuck_call_repeats
+from .inkling import history_fields as inkling_history
 from .stream import PROGRESS_NOTE
 
 
@@ -122,7 +123,9 @@ def _without_billing_line(text: str) -> str:
     return BILLING_LINE.sub("", text).strip("\n")
 
 
-def convert_messages(system, messages, defs: dict | None = None) -> list[dict]:
+def convert_messages(system, messages, defs: dict | None = None, inkling: bool = False) -> list[dict]:
+    """Anthropic messages as chat-template messages. `inkling`: the model writes its replies as Inkling's run of
+    messages, and a past reply's go back in the order generated (inkling.history_fields)."""
     out = []
     sys_text = _without_billing_line(_text(system))
     if sys_text:
@@ -165,21 +168,25 @@ def convert_messages(system, messages, defs: dict | None = None) -> list[dict]:
                 out.append({"role": "user", "content": "\n".join(pending)})
         else:
             msg = {"role": "assistant", "content": ""}
-            reasoning, texts, calls = [], [], []
+            parts, calls = [], []  # thinking and text in order, as ("thinking" | "text", body)
             for block in content:
                 kind = block.get("type")
                 if kind == "thinking":
                     thought = PROGRESS_NOTE.sub("", block.get("thinking", ""))
                     if thought.strip():
-                        reasoning.append(thought)
+                        parts.append(("thinking", thought))
                 elif kind == "text":
-                    texts.append(block.get("text", ""))
+                    if block.get("text"):
+                        parts.append(("text", block["text"]))
                 elif kind == "tool_use":
                     calls.append({"id": block.get("id"), "type": "function",
                                   "function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
-            msg["content"] = "\n\n".join(t for t in texts if t)
-            if reasoning:
-                msg["reasoning_content"] = "\n\n".join(reasoning)
+            if inkling:
+                msg.update(inkling_history(parts))
+            else:
+                msg["content"] = "\n\n".join(t for kind, t in parts if kind == "text")
+                if thoughts := [t for kind, t in parts if kind == "thinking"]:
+                    msg["reasoning_content"] = "\n\n".join(thoughts)
             if calls:
                 msg["tool_calls"] = calls
             out.append(msg)
@@ -210,7 +217,7 @@ def convert_tools(tools, messages) -> tuple[list[dict] | None, list[str], list[d
     return out or None, hidden, late
 
 
-def plan(body: dict, spec: ModelSpec, default_max: int = 32000, guards: bool = True) -> Plan:
+def plan(body: dict, spec: ModelSpec, default_max: int = 32000, guards: bool = True, inkling: bool = False) -> Plan:
     if not isinstance(body.get("messages"), list) or not body["messages"]:
         raise RequestError("messages must be a non-empty list")
     # As in Anthropic's API, a request thinks only when it asks to. Claude Code asks on every turn of its agent loop
@@ -237,7 +244,8 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000, guards: bool = T
 
     max_tokens = int(body.get("max_tokens") or default_max)
     tools, hidden, late = convert_tools(body.get("tools"), body["messages"])
-    messages = convert_messages(body.get("system"), body["messages"], {f["function"]["name"]: f for f in late})
+    messages = convert_messages(body.get("system"), body["messages"], {f["function"]["name"]: f for f in late},
+                                inkling=inkling)
     tools, messages = _apply_tool_choice(body.get("tool_choice"), tools, messages, late)
     # A model stuck repeating one tool call gets told so before it answers (guards.py). The reminder goes last, so
     # the prompt cache still covers everything before it.

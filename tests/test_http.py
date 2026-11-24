@@ -253,3 +253,25 @@ def test_a_request_carries_its_claude_code_session_to_the_engine(serve):
         assert conn.getresponse().status == 200
         conn.close()
     assert seen == ["s-123", None]
+
+
+@pytest.mark.parametrize("is_inkling,want", [(True, "a<|end_message|><|message_model|><|content_thinking|>b"),
+                                             (False, "a\n\nb")])
+def test_an_inkling_engine_gets_its_past_replies_as_they_were_generated(serve, is_inkling, want):
+    seen = []
+
+    class Recording(FakeEngine):
+        endless, inkling = False, is_inkling
+
+        def run(self, plan, on_progress=None):
+            seen.append(plan.messages[1])
+            return super().run(plan, on_progress)
+
+    port = serve(Recording([("normal", "ok")]))
+    body = {**BODY, "messages": [BODY["messages"][0], {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "a", "signature": "aris-local"},
+        {"type": "thinking", "thinking": "b", "signature": "aris-local"}]}, {"role": "user", "content": "go on"}]}
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("POST", "/v1/messages", json.dumps(body), {"content-type": "application/json"})
+    assert conn.getresponse().status == 200
+    assert seen[0]["reasoning_content"] == want

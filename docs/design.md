@@ -213,7 +213,12 @@ a character; a tokenizer that fails that check at startup is left alone) and con
 reads is the same, in the tokens the model generated. Each later request of the conversation tokenizes those replies
 the other way again and lines up with its cached turn the same way, in memory or on disk, so it never shares less
 with the conversation than it did. Where the history really differs (a compaction, an edit), the entry's tokens stop
-short of it. Instead of a multi-gigabyte snapshot of each prompt, the recurrent layers' state (fixed-size, megabytes)
+short of it. An Inkling reply is a run of messages (thinking, text, calls), and its template writes back one message
+of each kind, thinking first. A think budget that closes its thinking sometimes sees it open a second thinking
+message; streamed and written back as one thought, the turn no longer matched what it generated, and the next request
+read the reply again (4,109 tokens, once in a night of agent tasks). So each message streams as a content block of its
+own, and a past reply's messages go back in the order generated: those after the first of a kind inside its body,
+joined by the markers that separate them, which read as the same tokens. Instead of a multi-gigabyte snapshot of each prompt, the recurrent layers' state (fixed-size, megabytes)
 is kept where the prompt's history ends, and a turn the request parts from after that is rebuilt from there in
 memory: its attention caches trimmed and that state put back. mlx-lm's prompt trie found the shortest entry past
 where a prompt leaves it in time quadratic in that entry's length (it copied the path at every step down): the

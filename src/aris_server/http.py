@@ -139,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
                                f"model {name!r} is {where} but not loaded (loaded: {engine.spec.name!r})")
         spec = engine.spec if name not in self.server.models else resolve(name, self.server.models)
         try:
-            p = plan(body, spec, guards=self.server.guards)
+            p = plan(body, spec, guards=self.server.guards, inkling=getattr(engine, "inkling", False))
         except RequestError as e:
             return self._reject(e)
         p.session = claude_code_session(self.headers, body)

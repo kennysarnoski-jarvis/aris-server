@@ -1368,7 +1368,7 @@ def model_bytes(model) -> int:
 
 @dataclass
 class Piece:
-    state: str          # "reasoning" | "normal" | "tool"
+    state: str          # "reasoning" | "normal" | "tool", or inkling.MESSAGE (no text) where an Inkling message starts
     text: str
 
 

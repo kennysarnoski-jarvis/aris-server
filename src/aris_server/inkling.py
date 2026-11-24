@@ -17,15 +17,21 @@ HEADER = "<|message_model|>"
 END = "<|end_message|>"
 EOS = "<|content_model_end_sampling|>"
 THINKING = "<|content_thinking|>"
+TEXT = "<|content_text|>"
 TOOL_JSON = "<|content_invoke_tool_json|>"
 # Content markers, and the state of what follows each.
 CONTENT = {
     THINKING: "reasoning",
-    "<|content_text|>": "normal",
+    TEXT: "normal",
     "<|content_tool_error|>": "normal",
     "<|content_invoke_tool_text|>": "normal",
     TOOL_JSON: "tool",
 }
+# The state of a piece with no text that ReplyStream puts where each message's content starts, so that what reads
+# the pieces keeps messages apart: two thinking messages in a row stay two.
+MESSAGE = "message"
+# What opens a message of each kind, for writing a past reply's messages back as they were generated.
+OPENS = {"thinking": HEADER + THINKING, "text": HEADER + TEXT}
 # Markers that end a message or the reply: the loop guard never blocks them.
 ENDING_TEXTS = (END, EOS)
 
@@ -62,8 +68,8 @@ def _single_id(tokenizer, text: str) -> int | None:
 
 class ReplyStream:
     """Feed a reply's text in order; get (state, text) pieces with every marker removed. States are "reasoning",
-    "normal" and "tool". A message header's own text (the tool's name) is dropped: the call's JSON names it too.
-    A marker split between two feeds waits for the rest."""
+    "normal" and "tool", and MESSAGE (no text) where each message's content starts. A message header's own text (the
+    tool's name) is dropped: the call's JSON names it too. A marker split between two feeds waits for the rest."""
 
     def __init__(self):
         self.state = "normal"
@@ -104,6 +110,7 @@ class ReplyStream:
             self._header = True
         elif marker in CONTENT:
             self._header, self.state = False, CONTENT[marker]
+            out.append((MESSAGE, ""))
         elif marker == END:
             if self.state == "tool":
                 self._emit(out, "\n")  # calls in a row stay apart for the parser
@@ -120,6 +127,24 @@ class ReplyStream:
             out[-1] = (self.state, out[-1][1] + text)
         else:
             out.append((self.state, text))
+
+
+def history_fields(parts: list[tuple[str, str]]) -> dict:
+    """A past reply's thinking and text messages, as generated and in order ([("thinking" | "text", body)]), as the
+    fields Inkling's template writes back: the first run of thinking as reasoning_content, the rest as content. The
+    template writes one message of each, thinking first, so the messages after the first of either go inside its body,
+    joined by the markers that separate them, and the turn reads back as it was generated. A think budget that closes
+    thinking can see the model open a second thinking message; written back as one, the turn no longer matched its
+    own prompt cache, and the next request read the reply again (4,109 tokens in a night of agent tasks)."""
+    lead = next((i for i, (kind, _) in enumerate(parts) if kind != "thinking"), len(parts))
+
+    def body(run):
+        return run[0][1] + "".join(END + OPENS[kind] + text for kind, text in run[1:]) if run else ""
+
+    fields = {"content": body(parts[lead:])}
+    if lead:
+        fields["reasoning_content"] = body(parts[:lead])
+    return fields
 
 
 def parse_tool_calls(raw: str, tools=None) -> list[dict]:
