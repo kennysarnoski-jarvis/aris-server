@@ -198,6 +198,16 @@ def test_effort_reaches_inklings_template_and_off_means_none():
     assert "reasoning_effort" not in plan({**body, "thinking": {"type": "disabled"}}, aris).template_kwargs
 
 
+def test_claude_codes_efforts_up_to_its_default_run_inkling_at_low():
+    # At medium and above Inkling reasoned through a hard task's spec for most of an hour before writing; at low it
+    # scored the same on agent tasks in a fraction of the time. The think budget still follows the effort asked for.
+    spec = config.builtin_models()["inkling-2-mini"]
+    body = {"messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}}
+    for asked, runs in (("low", "low"), ("medium", "low"), ("high", "low"), ("xhigh", "xhigh"), ("max", "max")):
+        assert plan({**body, "output_config": {"effort": asked}}, spec).template_kwargs["reasoning_effort"] == runs
+    assert plan({**body, "output_config": {"effort": "high"}}, spec).think_budget == 8192
+
+
 def test_context_sizing_sees_the_caches_inside_cache_lists():
     from aris_server.engine import _flat_caches
     caches = [CacheList(RotatingKVCache(max_size=8), ArraysCache(4)), CacheList(KVCache(), ArraysCache(4)),

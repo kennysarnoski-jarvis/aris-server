@@ -85,11 +85,16 @@ BUILTIN_MODELS = {
     },
     # Inkling 2 Mini (Thinking Machines, Apache 2.0): 26B with 3.4B active and its middle layers looped three times,
     # so it fits 32 GB Macs. Effort goes to its own effort levels (none to max, which its template turns into a
-    # number); sampling is its generation_config's. Its KV cache stays at full precision (models/inkling2).
+    # number), Claude Code's low to high (its default) all to Inkling's low: at medium and above it reasoned through
+    # a hard task's spec for most of an hour before writing, where at low it scored the same on agent tasks in a
+    # fraction of the time (rs-bpe 71/71 in 7 min and rs-cbor 167/167 in 30, against 41 and 75 at medium with the
+    # 27B's budgets, and 60 with neither finished at medium with its own). The think budget still follows the effort
+    # asked for. xhigh and max reach its own. Sampling is its generation_config's. Its KV cache stays at full
+    # precision (models/inkling2).
     "inkling-2-mini": {
         "path": "mlx-community/Inkling-2-Mini-4bit",
         "effort_kwarg": "reasoning_effort",
-        "effort_map": {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"},
+        "effort_map": {"low": "low", "medium": "low", "high": "low", "xhigh": "xhigh", "max": "max"},
         "effort_off": "none",
         "temperature": 1.0,
         "top_p": 1.0,

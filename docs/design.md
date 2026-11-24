@@ -82,7 +82,10 @@ forced after the next newline, so the model closes its reasoning on a complete l
 thousands of tokens, and a model can loop on one line that never ends. It closes on one newline, not a
 paragraph break, because chat templates re-render past reasoning as `text\n</think>`: a turn closed
 as `text\n\n</think>` stops matching its own prompt cache, and the next turn re-reads from there.
-Budgets per effort are set per model, with defaults.
+Budgets per effort are set per model, with defaults. A model's effort map can also send several requested efforts
+to one level: Inkling 2 Mini runs at its own low for Claude Code's low to high, since at medium and above it spent
+most of an hour reasoning through a hard task's spec before writing, and at low scored the same in a fraction of
+the time. Its think budget still follows the effort asked for.
 
 **Loop guards** (`guards.py`) cover two ways a local model gets stuck in an agent loop, both seen in hard agent
 tasks.

@@ -86,9 +86,12 @@ aris-server serve --model inkling-2-mini
 
 On a 48 GB M4 Pro it writes about 32 tokens a second on its own and 33 to 44 with its draft head, which
 `pull` fetches from Thinking Machines' repo, and reads prompts at about 370, with room for about 280k tokens of
-context beside its head (320k without). Its thinking and tool calls stream as Anthropic events, like any other
-model's. Aris Server serves its text; images aren't supported yet. mlx-lm doesn't run Inkling yet, so Aris Server
-carries the model code from mlx-lm's open [pull request](https://github.com/ml-explore/mlx-lm/pull/2086) until a
+context beside its head (320k without). Claude Code's effort levels up to high, its default, run Inkling at its
+own low effort: at medium and above it reasoned through a hard task's spec for most of an hour before writing code,
+where at low it scored the same on our agent tasks in a fraction of the time (71/71 in 7 minutes instead of 41, and
+167/167 in 30 instead of 75). Claude Code's xhigh and max efforts reach Inkling's own. Its thinking and tool calls
+stream as Anthropic events, like any other model's. Aris Server serves its text; images aren't supported yet.
+mlx-lm doesn't run Inkling yet, so Aris Server carries the model code from mlx-lm's open [pull request](https://github.com/ml-explore/mlx-lm/pull/2086) until a
 release does.
 
 ## Built for coding agents
