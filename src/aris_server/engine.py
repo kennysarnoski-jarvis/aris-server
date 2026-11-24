@@ -408,6 +408,7 @@ CHECKPOINT_SHARE = 8       # checkpoints hold at most this fraction of the promp
 MAX_CHECKPOINTS = 64
 LINE_BACKOFF = 512         # how far back from where a request left the cache to look for the start of its line
 HISTORY_LOOKBACK = 64      # how far back from a prompt's end to look for the start of the turn it asks for
+RESYNC_BYTES = 1024        # how far two tokenizations of one text may run apart before they meet at a token boundary
 
 
 def _state_arrays(state):
@@ -647,6 +648,7 @@ class MovingPromptCache(LRUPromptCache):
         self._turn_state: dict[tuple, tuple[int, list]] = {}
         # Recent requests cut where their history ends -> their prompt's length: that state stands in for their end's.
         self._history_ends: dict[tuple, int] = {}
+        self._own_seen: dict[tuple, int] = {}  # see _note_own_tokens
 
     def _save(self, tokens, prompt_cache, cache_type):
         if self.disk is None or self.disk.has(tokens):
@@ -760,6 +762,74 @@ class MovingPromptCache(LRUPromptCache):
             if hasattr(self._lru, "_lrus") else []
 
     decode = None  # the tokenizer's decode, for logging where a turn and its re-rendered history part ways
+    token_bytes = None  # a token's bytes (see token_bytes), for own_tokens: None leaves requests' tokens as they are
+
+    def own_tokens(self, model, tokenized):
+        """The request's tokenized prompt with a cached entry's tokens in place where the two spell the same text
+        with other tokens. A reply comes back in the next request's history as text, and tokenizing it doesn't always
+        give the tokens the model generated (`[0, ` as `[`, `0`, `, `, in a long file write). The request then leaves
+        the finished turn there, inside the reply, and a hybrid model reads the rest of the reply again from the state
+        kept where that turn's prompt ended: 9 times in a day of agent tasks on Aris 3.8-27B, up to 15k tokens each.
+        With the entry's tokens there, the request continues the turn whole, the text exactly the same, the model
+        reading the tokens it generated. Each later request of the conversation tokenizes that reply the other way
+        again, and lines up with the conversation's cached turn the same way, wherever it is cached."""
+        prompt, segments, types, initial_state, vision = tokenized
+        if self.token_bytes is None or vision is not None or len(prompt) < self.light_min_tokens:
+            return tokenized
+        prompt = list(prompt)
+        found = self._trie.search(model, prompt)
+        if found.exact is not None:
+            return tokenized
+        candidates = [(found.common_prefix, list(found.longer), "cached")] if found.longer is not None else []
+        if self.disk is not None:
+            for t, _ in list(self.disk.index.values()):
+                if len(t) > found.common_prefix:
+                    key = list(t)
+                    candidates.append((_first_difference(key, prompt, 0, 0), key, "saved"))
+        if not candidates:
+            return tokenized
+        start, key, where = max(candidates, key=lambda c: (c[0], len(c[1])))
+        if not self.light_min_tokens <= start < min(len(key), len(prompt)):
+            return tokenized  # it covers all it shares already, or too little to be worth lining up
+        try:
+            aligned, shared, places = align_tokens(key, prompt, start, self.token_bytes)
+        except Exception as e:  # noqa: BLE001  a token the table can't spell: the request's own tokens, as before
+            logging.warning("prompt cache: could not line a request up with a cached entry: %s", e)
+            return tokenized
+        if not places or shared <= start:
+            return tokenized
+        resume = len(prompt) - (len(aligned) - shared)  # where the request's own tokens take over again
+        bounds, at = [], 0
+        for seg in segments[:-1]:
+            at += len(seg)
+            if start < at < resume:
+                return tokenized  # a segment would end inside what the entry's tokens now spell
+            bounds.append(at if at <= start else at - resume + shared)
+        cut = [0, *bounds, len(aligned)]
+        self._note_own_tokens(key, prompt, shared, places, where)
+        return aligned, [aligned[a:b] for a, b in zip(cut, cut[1:])], types, initial_state, vision
+
+    def _note_own_tokens(self, key, prompt, shared, places, where):
+        """Logged once for each new place a conversation's history spells its reply in other tokens: each of its later
+        requests lines up at the same places again."""
+        si, sj = places[-1]
+        seen_key = (places[0][0], tuple(key[max(0, places[0][0] - 8):places[0][0] + 8]))
+        seen = self._own_seen.pop(seen_key, 0)
+        self._own_seen[seen_key] = max(seen, len(places))
+        while len(self._own_seen) > 64:
+            self._own_seen.pop(next(iter(self._own_seen)))
+        log = logging.info if len(places) > seen else logging.debug
+        shown = ""
+        if self.decode is not None:
+            try:
+                shown = (f": generated {self.decode(key[max(0, si - 12):si + 8])!r}, history "
+                         f"{self.decode(prompt[max(0, sj - 12):sj + 8])!r}")
+            except Exception:  # noqa: BLE001  logging only
+                pass
+        whole = "all" if shared == len(key) else f"{shared}"
+        log("prompt cache: the request's history spells a %d-token %s entry's text in other tokens (%d place%s, the "
+            "latest at token %d), so it takes the entry's there and shares %s of them%s", len(key), where,
+            len(places), "" if len(places) == 1 else "s", si, whole, shown)
 
     def _show_divergence(self, generated, rendered, at: int, names=("generated", "history")) -> str:
         if self.decode is None:
@@ -1100,6 +1170,106 @@ def turn_start_tokens(tokenizer) -> frozenset:
     return frozenset()
 
 
+def _byte_alphabet() -> dict[str, int]:
+    """GPT-2's byte-level BPE alphabet: the character a vocabulary writes each byte as -> that byte."""
+    shown = [*range(ord("!"), ord("~") + 1), *range(ord("¡"), ord("¬") + 1), *range(ord("®"), ord("ÿ") + 1)]
+    chars, extra = list(shown), 0
+    for b in range(256):
+        if b not in shown:
+            shown.append(b)
+            chars.append(256 + extra)
+            extra += 1
+    return {chr(c): b for b, c in zip(shown, chars)}
+
+
+def token_bytes(tokenizer) -> Callable[[int], bytes] | None:
+    """A token's bytes, for telling whether two tokenizations spell one text byte for byte: decoding can't say, for a
+    token that holds part of a character. For byte-level BPE (GPT-2's alphabet, which Qwen's and Inkling's tokenizers
+    use); None for any other kind, or one whose decoding doesn't give back exactly these bytes."""
+    alphabet = _byte_alphabet()
+    try:
+        added = {int(i): t.content for i, t in tokenizer.added_tokens_decoder.items()}
+    except Exception:  # noqa: BLE001  no table of added tokens: not a tokenizer this knows
+        return None
+    known: dict[int, bytes] = {}
+
+    def of(token: int) -> bytes:
+        b = known.get(token)
+        if b is None:
+            content = added.get(token)
+            b = content.encode() if content is not None else bytes(
+                alphabet[c] for c in tokenizer.convert_ids_to_tokens(token))
+            known[token] = b
+        return b
+
+    try:
+        check = BYTES_CHECK + (tokenizer.eos_token or "")
+        ids = list(tokenizer.encode(check, add_special_tokens=False))
+        if not ids or b"".join(of(t) for t in ids) != tokenizer.decode(ids).encode():
+            return None
+    except Exception:  # noqa: BLE001  a character outside the alphabet, say: not byte-level BPE
+        return None
+    return of
+
+
+# Code, accents, CJK, an emoji split over tokens, and the spaces a decoder's clean-up would remove.
+BYTES_CHECK = "def f(x):\n\treturn {'a': x[0], \"b\": 1.5e-3}  # ünïcödé ✓ 中文 🙂 , . 's n't\n\n"
+
+
+def _first_difference(a: list, b: list, i: int, j: int, chunk: int = 4096) -> int:
+    """How many tokens a[i:] and b[j:] share before they first differ (or either ends), compared a chunk at a time."""
+    n = min(len(a) - i, len(b) - j)
+    k = 0
+    while k < n:
+        m = min(chunk, n - k)
+        if a[i + k:i + k + m] == b[j + k:j + k + m]:
+            k += m
+            continue
+        while a[i + k] == b[j + k]:
+            k += 1
+        return k
+    return n
+
+
+def align_tokens(key, prompt, start: int, of: Callable[[int], bytes]):
+    """The request's tokens with a cached entry's in their place wherever the two spell the same text in other tokens,
+    from `start`, where they first differ. Returns the tokens, which spell exactly what `prompt` does, how many of the
+    entry's they start with, and the places the entry's tokens stand in for the request's: (entry index, request
+    index) where each starts. Where the two spell different text, the entry's tokens stop."""
+    key, prompt = list(key), list(prompt)
+    i = j = start
+    places = []
+    while True:
+        d = _first_difference(key, prompt, i, j)
+        i, j = i + d, j + d
+        if i == len(key):
+            return key + prompt[j:], i, places
+        if j == len(prompt):
+            return key[:i], i, places
+        si, sj = i, j
+        a, b, checked = bytearray(), bytearray(), 0
+        while True:  # each side takes tokens until both have spelled the same bytes, ending a token on each side
+            if len(a) <= len(b):
+                if i == len(key):
+                    break
+                a += of(key[i])
+                i += 1
+            else:
+                if j == len(prompt):
+                    break
+                b += of(prompt[j])
+                j += 1
+            n = min(len(a), len(b))
+            if a[checked:n] != b[checked:n] or max(len(a), len(b)) > RESYNC_BYTES:
+                return key[:si] + prompt[sj:], si, places
+            checked = n
+            if len(a) == len(b):
+                break
+        if len(a) != len(b):  # one ran out inside the other's last token
+            return key[:si] + prompt[sj:], si, places
+        places.append((si, sj))
+
+
 def merge_prompt_tail(tokenized):
     """mlx-lm splits a chat prompt into system / conversation / thinking-tail segments and saves a copy of the cache
     at the end of each but the last. The conversation snapshot is a second full copy of a long context, held through
@@ -1166,7 +1336,7 @@ class Engine:
 
         def tokenize_and_track(*a, **k):
             # Runs on the generation thread before the prompt is read, so a mid-request snapshot can't beat it.
-            tokenized = merge_prompt_tail(tokenize(*a, **k))
+            tokenized = cache.own_tokens(self.provider.model_key, merge_prompt_tail(tokenize(*a, **k)))
             cache.reading = cache.reading[-15:] + [tokenized[0]]
             cache.tokenized = tokenized  # fetching its cache next cuts its segments where checkpoints go
             return tokenized
@@ -1197,6 +1367,10 @@ class Engine:
             cache.turn_starts = turn_start_tokens(self.tokenizer)
         _OWN_TOOL_CALLS.active = self.inkling
         cache.decode = self.tokenizer.decode
+        cache.token_bytes = token_bytes(self.tokenizer)
+        if cache.token_bytes is None:
+            logging.info("prompt cache: this tokenizer's tokens can't be compared byte for byte, so a reply its next "
+                         "request tokenizes differently is read again from where they part")
         self.budget_tokens = BudgetTokens(self.tokenizer)
         self.loop_exempt = loop_exempt_ids(self.tokenizer)
         self.cache = cache

@@ -199,10 +199,21 @@ no longer served. A running server holds a shared lock on its folder, and anothe
 it alone. A cache that can't be written (a full disk, say) costs a warning, not the server: mlx-lm calls the cache from
 its generation loop with no handler, and MLX raises RuntimeError, not OSError. A folder deleted while serving is made
 and held again at the next save. A model sometimes
-generates a non-canonical tokenization, so its finished turn no longer matches the history the
-client sends back; instead of a multi-gigabyte snapshot of each prompt, the recurrent layers' state
-(fixed-size, megabytes) is kept where the prompt's history ends, and such a turn is rebuilt from there
-in memory: its attention caches trimmed and that state put back. The history ends at the start of the
+generates a non-canonical tokenization (`[0, ` as `[`, `0`, `, ` in a long file write), so its finished turn no
+longer matches the history the client sends back: the request leaves the turn inside its reply, and a hybrid model
+read the rest of the reply again, up to 15k tokens at a time on Arete-27B, 9 times in a day of agent tasks. So a
+request whose history spells a cached entry's text in other tokens takes the entry's tokens there (compared byte for
+byte through the tokenizer's byte-level vocabulary, since decoding can't tell apart two tokens that each hold part of
+a character; a tokenizer that fails that check at startup is left alone) and continues the turn whole. The text it
+reads is the same, in the tokens the model generated. Each later request of the conversation tokenizes those replies
+the other way again and lines up with its cached turn the same way, in memory or on disk, so it never shares less
+with the conversation than it did. Where the history really differs (a compaction, an edit), the entry's tokens stop
+short of it. Instead of a multi-gigabyte snapshot of each prompt, the recurrent layers' state (fixed-size, megabytes)
+is kept where the prompt's history ends, and a turn the request parts from after that is rebuilt from there in
+memory: its attention caches trimmed and that state put back. mlx-lm's prompt trie found the shortest entry past
+where a prompt leaves it in time quadratic in that entry's length (it copied the path at every step down): the
+request after a compaction, which leaves an 88k-token conversation after its system prompt, waited 12 to 19 s on an
+M4 Pro for two searches. The server searches the trie itself, in linear time, with the same results. The history ends at the start of the
 turn the prompt asks for: a template that adds a generation prompt (Qwen's `<|im_start|>assistant`)
 ends a prompt a few tokens past it, Inkling's ends there. That point also serves a request that
 replaces the turn rather than continuing it. Claude Code compacts by sending the conversation with a

@@ -9,6 +9,7 @@ drives it (ResponseGenerator._generate, batched path), so the checkpoints are ta
 them."""
 
 import logging
+from typing import Callable
 
 import mlx.core as mx
 from mlx.utils import tree_flatten
@@ -85,16 +86,20 @@ def serve(cache, model, prompt, system_tokens=None, max_tokens=4, sampler=None):
     """One request, the way mlx-lm's server serves it: its prompt split into segments (the system prompt, then the
     rest; a request ending in tool results is one segment), the nearest cache fetched, the prompt read with a copy of
     the cache saved at each segment's end, then the finished sequence's cache saved. Returns (cached tokens, generated
-    tokens, their logprobs). The finished sequence's cache is left in serve.final."""
+    tokens, their logprobs). The finished sequence's cache is left in serve.final, and the prompt as read (with a
+    cached entry's own tokens where it spells them otherwise) in serve.prompt."""
     if system_tokens:
         segments = [prompt[:system_tokens], prompt[system_tokens:-2], prompt[-2:]]
         types = ["system", "user", "assistant"]
     else:
         segments, types = [prompt], ["assistant"]
-    tokenized = merge_prompt_tail((prompt, segments, types, "normal", None))
-    cache.reading = cache.reading[-15:] + [prompt]  # what the engine's tokenize hook does
-    cache.tokenized = tokenized
+    # What the engine's tokenize hook does.
+    tokenized = cache.own_tokens("m", merge_prompt_tail((prompt, segments, types, "normal", None)))
+    # The same lists, as mlx-lm's are: fetching the cache cuts them in place where checkpoints go.
     prompt, segments, types = tokenized[0], tokenized[1], tokenized[2]
+    cache.reading = cache.reading[-15:] + [prompt]
+    cache.tokenized = tokenized
+    serve.prompt = prompt
 
     reused, rest = cache.fetch_nearest_cache("m", prompt)
     n_cached = n = len(prompt) - len(rest)
@@ -236,6 +241,49 @@ def test_a_later_turn_cut_nowhere_keeps_the_state_at_its_own_prompts_end():
     second = first + answer + TOOL_RESULT  # no turn header near its end: nowhere to cut
     serve(cache, model, second)
     assert [n for n, _ in cache._turn_state.values()] == [len(second) - 1]
+
+
+def own_bytes(whole: int, parts: tuple) -> Callable[[int], bytes]:
+    """A byte table for the tiny vocabulary in which token `whole` spells what `parts` do, one after the other."""
+    def of(t: int) -> bytes:
+        return b"".join(of(p) for p in parts) if t == whole else f"<{t}>".encode()
+    return of
+
+
+def test_a_reply_its_next_request_tokenizes_differently_is_continued_whole(caplog):
+    # A reply's text comes back in its next request's history tokenized other than the model generated it. The
+    # request left the turn inside the reply, and a hybrid model read the rest of the reply again: up to 15k tokens a
+    # time on Aris 3.8-27B. It takes the generated tokens there, continues the turn whole, and answers as reading
+    # those tokens cold does.
+    model = kv8_hybrid_model()
+    first = HISTORY + ASK
+    cache = cache_for(model, turns=True)
+    _, answer, _ = serve(cache, model, first, system_tokens=len(system()), sampler=greedy)
+    turn = first + answer
+    assert [k for lru in cache._lru._lrus.values() for _, k in lru if len(k) > len(system())] == [turn]
+    at = next(i for i, t in enumerate(answer) if t not in (END, NEWLINE, TURN))
+    x, y = [t for t in range(60, 64) if t not in answer][:2]
+    after = [END, NEWLINE] + TOOL_RESULT + [END, NEWLINE] + ASK
+    history = first + answer[:at] + [x, y] + answer[at + 1:] + after   # the reply, with one token split in two
+
+    # Without its own tokens: rebuilt from where the turn's history ends, and the reply read again.
+    plain = cache_for(model, turns=True)
+    serve(plain, model, first, system_tokens=len(system()), sampler=greedy)
+    assert serve(plain, model, history)[0] == len(HISTORY)
+
+    cache.token_bytes = own_bytes(answer[at], (x, y))
+    with caplog.at_level(logging.INFO):
+        cached, got, logprobs = serve(cache, model, history)
+    assert serve.prompt == turn + after and cached == len(turn)
+    assert f"spells a {len(turn)}-token cached entry's text in other tokens (1 place" in caplog.text
+    same_as_read_cold(model, serve.prompt, got, logprobs)
+
+    # Its next request tokenizes that reply the other way again: it lines up there again and continues whole.
+    second_turn = serve.prompt + got
+    third = history + got + [END, NEWLINE] + text(11, 20) + [END, NEWLINE] + ASK
+    cached, got, logprobs = serve(cache, model, third)
+    assert serve.prompt == second_turn + third[len(history) + len(got):] and cached == len(second_turn)
+    same_as_read_cold(model, serve.prompt, got, logprobs)
 
 
 def test_checkpoints_cover_the_system_prompt_and_not_the_conversation_after_it():

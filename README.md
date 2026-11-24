@@ -109,8 +109,8 @@ Aris Server does one job: serve a local model to coding agents properly.
 - **Claude Code's tool search.** Deferred tools stay out of the prompt until the agent loads them.
 - **Fast on Apple Silicon.** Built on [MLX](https://github.com/ml-explore/mlx) and mlx-lm:
   continuous batching, a [draft head](#draft-heads) for each built-in model, and a prompt cache that keeps the system
-  prompt warm across conversations, with checkpoints so that a hybrid model doesn't read a whole conversation again
-  after an agent rewrites part of its system prompt.
+  prompt warm across conversations, so that a hybrid model doesn't read a conversation again when an agent rewrites
+  part of its system prompt, compacts the conversation, or sends a long reply back tokenized differently.
 
 ## Models
 
