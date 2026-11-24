@@ -161,14 +161,15 @@ Headers and `message_start` go out at once. Claude Code doesn't count pings as a
 reading the prompt takes more than 30 seconds its progress goes out as thinking (a
 `⟨reading prompt N/M⟩` line every 30 seconds, stripped when the conversation comes back, so the
 model never sees it); re-reading a long conversation on a small Mac can take longer than Claude
-Code waits. A `ping` also goes out whenever nothing else has been sent for five seconds (a tool call is only sent once it closes, so
-writing a long file would otherwise be minutes of silence, and Claude Code abandons a silent
-stream and retries). Thinking streams as `thinking_delta`,
-text as `text_delta`. Tool calls in the XML style most open models use
-(`<function=...><parameter=...>`) stream like the Anthropic API's: the `tool_use` block opens when
-the name is known and string arguments stream as `input_json_delta` while they are written (Claude
-Code abandons a response that produces no content for minutes, and pings don't count). Other tool
-formats are parsed whole when the call ends. `message_delta` carries `stop_reason` (`end_turn`, `tool_use`,
+Code waits. A `ping` also goes out whenever nothing else has been sent for five seconds, which keeps the
+connection alive but not the response. Thinking streams as `thinking_delta`, text as `text_delta`. Tool calls in the
+XML style most open models use (`<function=...><parameter=...>`) and Inkling's JSON calls
+(`{"name":...,"args":{...}}`, one to a message) stream like the Anthropic API's: the `tool_use` block opens when the
+name is known and the arguments stream as `input_json_delta` while they are written. Claude Code ends a response that
+sends no content for 10 minutes, pings or not, and asks for it again from the start: Inkling's calls, held back until
+they closed, were cut off writing a whole file at 10:00 twice in a night of agent tasks, and the files were lost. A call
+that doesn't open that way (Inkling's with another key first, say) and other tool formats are parsed whole when the
+call ends, and an Inkling call ends with its message, so one cut short can't take the next call's text. `message_delta` carries `stop_reason` (`end_turn`, `tool_use`,
 `max_tokens`, `stop_sequence`) and usage, including cached input tokens. A client that disconnects
 stops its generation, also when nothing is being written to it (non-streaming requests, or a tool
 call in progress): the socket is checked every two seconds. Abandoned generations otherwise keep

@@ -4,8 +4,8 @@ import json
 import re
 import uuid
 
-from .inkling import MESSAGE
-from .tool_stream import FUNCTION, XmlToolCall
+from .inkling import MESSAGE, parse_tool_calls
+from .tool_stream import FUNCTION, JsonToolCall, XmlToolCall
 
 STOP_REASONS = {"stop": "end_turn", "length": "max_tokens"}
 PROGRESS_NOTE = re.compile(r"⟨reading prompt \d+/\d+⟩\n?")
@@ -34,6 +34,8 @@ class MessageBuilder:
         self._ws = ""                        # whitespace held back until real text arrives
         self._tool_text = ""
         self._xml: XmlToolCall | None = None  # set while an XML-style call streams
+        self._json: JsonToolCall | None = None  # set while Inkling's JSON calls stream
+        self._json_calls = tool_parser is parse_tool_calls
         self._buffer_tool = False             # this call's format can't stream: parse it whole when it ends
         self.tool_calls = 0
 
@@ -70,10 +72,11 @@ class MessageBuilder:
         if state == MESSAGE:
             # A message of the model's own starts (an Inkling reply is a run of them). A block never runs across two:
             # a reply that thought twice in a row came back in the history as one thought, and missed its cache.
-            # Tool calls still gather until they end, as one run of calls.
-            return self._close() if self._open in ("thinking", "text") else []
+            # And a call ends with its message, so one cut short or malformed can't take the next one's text.
+            events = self._flush_tool() if (self._tool_text or self._json) else []
+            return events + (self._close() if self._open in ("thinking", "text") else [])
         events = []
-        if state != "tool" and (self._tool_text or self._xml):
+        if state != "tool" and (self._tool_text or self._xml or self._json):
             events += self._flush_tool()
         if not text:
             return events
@@ -114,6 +117,8 @@ class MessageBuilder:
     def _feed_tool(self, text: str) -> list[dict]:
         if self._xml is not None:
             return self._apply(self._xml.feed(text))
+        if self._json is not None:
+            return self._feed_json(text)
         self._tool_text += text
         if self._buffer_tool:
             return []
@@ -122,9 +127,19 @@ class MessageBuilder:
             self._xml = XmlToolCall(self.tools)
             raw, self._tool_text = self._tool_text, ""
             return self._apply(self._xml.feed(raw))
+        if self._json_calls and head.startswith("{"):
+            self._json = JsonToolCall()
+            raw, self._tool_text = self._tool_text, ""
+            return self._feed_json(raw)
         if len(head) >= len(FUNCTION) or (head and not FUNCTION.startswith(head)):
             self._buffer_tool = True
         return []
+
+    def _feed_json(self, text: str) -> list[dict]:
+        events = self._apply(self._json.feed(text))
+        if self._json.failed:  # not a call that streams: what it held is parsed whole when the calls end
+            self._tool_text, self._buffer_tool, self._json = self._json.buf, True, None
+        return events
 
     def _apply(self, ops) -> list[dict]:
         events = []
@@ -144,6 +159,13 @@ class MessageBuilder:
         if self._xml is not None:
             events = self._apply(self._xml.finish())
             self._xml = None
+            return events
+        if self._json is not None:
+            call, self._json = self._json, None
+            events = self._apply(call.finish())
+            if call.failed and call.buf.strip():  # what never showed a call's head: parsed whole, as before
+                self._tool_text = call.buf
+                events += self._flush_tool()
             return events
         raw, self._tool_text, self._buffer_tool = self._tool_text, "", False
         calls = self._parse(raw)
@@ -180,7 +202,7 @@ class MessageBuilder:
         return out
 
     def finish(self, finish_reason: str | None, context_capped: bool = False) -> tuple[list[dict], str]:
-        events = self._flush_tool() if (self._tool_text or self._xml) else []
+        events = self._flush_tool() if (self._tool_text or self._xml or self._json) else []
         events += self._close()
         if self.tool_calls and finish_reason != "length":
             reason = "tool_use"
