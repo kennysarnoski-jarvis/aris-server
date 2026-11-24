@@ -45,7 +45,8 @@ Claude Code assumes a 200k-token window and compacts its conversation 33k tokens
 model's window is whatever fits beside its weights (the server logs it at startup, and `/v1/models` lists it as
 `context_window`), and told that window as it is, Claude Code would compact a small one about every turn. So
 `aris-server claude` tells it, in `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, a window at which it compacts at 80% of the
-server's (or 33k short of it, as usual, on a window above 165k). It also gives each request 50 minutes
+server's, and by 128k tokens at the most: past that a local model reads slower and holds more memory than going on is
+worth (Inkling 2 Mini at 240k on a 48 GB Mac ran within 2 GB of the GPU's limit). It also gives each request 50 minutes
 (`API_TIMEOUT_MS=3000000`) where Claude Code gives 10, and keeps its retries streaming
 (`CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`), so a slow local turn is never cut off: Claude Code ends a response
 that sends no content for 10 minutes and asks for it again from the start. To start Claude Code

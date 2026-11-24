@@ -11,13 +11,15 @@ import pytest
 from aris_server import claude_code, cli
 
 
-def test_claude_code_compacts_at_80_percent_of_a_small_window_and_33k_short_of_a_large_one():
-    for window, told in ((49_152, 72_321), (100_352, 113_281), (200_000, 200_000)):
+def test_claude_code_compacts_at_80_percent_of_the_window_and_by_128k():
+    for window, told in ((49_152, 72_321), (100_352, 113_281), (155_000, 157_000), (280_576, 161_000)):
         assert claude_code.claude_code_window(window) == told
     # Where Claude Code then compacts, 33k short of what it's told: 80% of the 4-bit 27B's window on a 32 GB Mac
-    # (not 16k, about every turn), and 33k short of a 200k one, as it always does.
+    # (not 16k, about every turn), and at 128k on Inkling 2 Mini's 280k window on a 48 GB Mac, not 33k short of it
+    # (247k), within 2 GB of the GPU's limit.
     assert claude_code.claude_code_window(49_152) - claude_code.COMPACT_RESERVE == int(49_152 * 0.8)
-    assert claude_code.claude_code_window(200_000) - claude_code.COMPACT_RESERVE == 167_000
+    assert claude_code.claude_code_window(155_000) - claude_code.COMPACT_RESERVE == 124_000
+    assert claude_code.claude_code_window(280_576) - claude_code.COMPACT_RESERVE == 128_000
 
 
 MODELS = dict.fromkeys(("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",

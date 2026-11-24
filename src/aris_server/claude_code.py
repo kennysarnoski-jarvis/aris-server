@@ -12,10 +12,15 @@ import urllib.request
 
 # Claude Code compacts its conversation a fixed 33,000 tokens short of the window it's told. Told a small window as
 # it is, it would compact about every turn (at 16k of a 49k window); told nothing, it takes the window as 200k and runs
-# into the server's limit, where the summary request is refused too. Told claude_code_window's, it compacts at 80% of a
-# small window, and where it always does on a large one. Aris Code's Aris Local tells it the same.
+# into the server's limit, where the summary request is refused too. Told claude_code_window's, it compacts at 80% of
+# the server's window, and by 128k tokens at the most: past that a conversation reads slower and holds more memory than
+# going on is worth. Inkling 2 Mini on a 48 GB Mac, compacting 33k short of its 280k window as Claude Code does on a
+# large one, went to 240k on a long agent task within 2 GB of the GPU's limit, its prompt cache cut to 3.8 GB to make
+# room, at 18 tok/s; compacting at 128k (twice) it scored the same in the same time at 21 tok/s, its memory near 30 GB.
+# Aris Code's Aris Local tells it the same.
 COMPACT_RESERVE = 33_000
 COMPACT_AT_SHARE = 0.8
+COMPACT_AT_MOST = 128_000
 # Waiting for a local model. Claude Code gives a request 10 minutes and then cuts it off mid-stream, and a local model
 # can take longer than that over one turn: Inkling 2 Mini writing a whole file in one tool call at 20-odd tokens a second
 # was cut at 10:00 twice in a night of agent tasks, the file lost and the turn asked for again from the start. And after
@@ -43,7 +48,7 @@ LEFT_OUT_TOOLS = ("WebSearch", "Workflow", "ScheduleWakeup", "ReportFindings", "
 
 def claude_code_window(window: int) -> int:
     """The window to tell Claude Code (CLAUDE_CODE_MAX_CONTEXT_TOKENS) for a server that holds `window` tokens."""
-    return max(int(window * COMPACT_AT_SHARE), window - COMPACT_RESERVE) + COMPACT_RESERVE
+    return min(int(window * COMPACT_AT_SHARE), COMPACT_AT_MOST) + COMPACT_RESERVE
 
 
 def arguments(args: list[str]) -> list[str]:
