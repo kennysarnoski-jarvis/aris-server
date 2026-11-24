@@ -725,11 +725,14 @@ class MovingPromptCache(LRUPromptCache):
             # mlx-lm copies the cache at the end of the system prompt, while the rest of that prompt is still being
             # read. Kept beside what the read needs, a long system prompt's copy ran a 48 GB Mac's GPU out of memory
             # just after it read a 100k-token one (3.7 GB of copy beside a 6.1 GB read, with a 4.8 GB budget).
-            # Without it, a conversation that starts from this system prompt reads it again.
+            # It still goes to disk, the copy already made: the conversation after a compaction starts from this system
+            # prompt, and with memory that tight it read it cold, 19k tokens in 166 s on Aris 3.8-27B, where loading
+            # it from disk takes a tenth of a second.
             gb = 1 << 30
+            self._save(tokens, prompt_cache, cache_type)
             logging.info("memory cache: not keeping the %d-token system prompt: its %.1f GB beside the %.1f GB reading "
-                         "its prompt needs is more than the %.1f GB budget", len(tokens), size / gb,
-                         self._read_peak / gb, room / gb)
+                         "its prompt needs is more than the %.1f GB budget%s", len(tokens), size / gb,
+                         self._read_peak / gb, room / gb, "; it's on disk" if self.disk is not None else "")
             return
         if not mid_request:
             before = {k for k in self._entry_keys()}

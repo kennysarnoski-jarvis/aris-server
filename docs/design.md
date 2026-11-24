@@ -188,7 +188,9 @@ budget is what the GPU holds beside the weights less a reserve for prefill scrat
 entries make room for the peak reading it reaches (1.8 times the cache it builds, as for the context limit), and the
 system-prompt snapshot, which mlx-lm copies while the rest of the prompt is still being read, is kept only where it
 fits beside that: a 100k-token system prompt's copy beside its read ran a 48 GB Mac's GPU out of memory. A system
-prompt too long to keep is read again by the next conversation that starts from it. And entries go to
+prompt that memory can't keep still goes to disk, its copy already made, for the next conversation that starts from
+it: with the budget lowered after a long conversation, the one after a compaction read its 19k-token prompt cold in
+166 s on Arete-27B, where loading the system prompt takes a tenth of a second. And entries go to
 `~/.aris-server/cache/<setup>/` when memory lets them go: a finished turn when the LRU evicts it or
 at a graceful stop (usually its next turn takes it from memory first and it is never written), the
 shared system prompt at once. Writing every turn put 445 GB on an SSD in one day. Each setup (weights, adapter, KV

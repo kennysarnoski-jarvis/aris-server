@@ -412,3 +412,17 @@ def test_another_setups_folder_that_cannot_be_cleared_is_left_at_startup(tmp_pat
     finally:
         data.parent.chmod(0o700)
     assert data.with_suffix(".json").exists()
+
+
+def test_a_system_prompt_memory_cannot_keep_still_reaches_disk_for_the_next_conversation(tmp_path):
+    # With memory tight (the budget lowered after a long conversation peaked near the GPU's limit), the system
+    # prompt's copy isn't kept beside the read its prompt needs. It wasn't written to disk either, so the conversation
+    # after a compaction read its system prompt cold: 19k tokens, 166 s, on Aris 3.8-27B.
+    cache = MovingPromptCache(max_size=10, max_bytes=1)
+    cache.disk = DiskCache(tmp_path, "model-a", max_bytes=1 << 30)
+    cache.insert_cache("m", SYSTEM, layers(1200, 1), cache_type="system")
+    assert len(cache) == 0                                              # not in memory
+    assert [len(t) for t, _ in cache.disk.index.values()] == [1200]     # on disk
+    new_conversation = SYSTEM + list(range(9000, 10500))
+    got, rest = cache.fetch_nearest_cache("m", new_conversation)
+    assert got[0].offset == 1200 and rest == new_conversation[1200:]
