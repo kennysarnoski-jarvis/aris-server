@@ -391,7 +391,8 @@ mls.ResponseGenerator._generate = _generate_then_stop_hook
 
 
 DISK_MIN_GAIN = 1024  # fewer extra tokens than this are as quick to read as the cache file
-MAX_KEPT_STATES = 2  # prompt-end recurrent states kept per kind (requests in flight; finished turns)
+MAX_KEPT_STATES = 2  # prompt-end recurrent states kept per kind (requests in flight; finished turns, each with up to
+                     # two points; points carried from a turn to the request continuing its conversation)
 
 # A hybrid model's linear-attention layers carry a running state that can't be cut back to an earlier token, and a
 # sliding window's ring holds only the last rows it read, so a request that leaves every cached entry part-way through
@@ -645,8 +646,15 @@ class MovingPromptCache(LRUPromptCache):
         # with other tokens than were generated, a compaction or a retry in its place) gets it rebuilt from these: its
         # attention caches trimmed (they hold the prompt's tokens first) and its recurrent layers' state put back. The
         # recurrent state is small and fixed-size, so this costs megabytes where a full snapshot costs gigabytes.
+        # A finished turn keeps its points latest first: where its own history ends, then where its conversation's
+        # previous turn's did, carried over by the request that continued that turn (_carried, until its turn is kept).
+        # Claude Code's compaction can drop the reminder it appended after the latest tool results, which parts from
+        # the turn a few tokens before its own history ends; with no state there it read the conversation again from
+        # the system prompt, 120k tokens in 7 minutes on Inkling 2 Mini, where the previous turn's point leaves about a
+        # thousand.
         self._prompt_state: dict[tuple, list] = {}
-        self._turn_state: dict[tuple, tuple[int, list]] = {}
+        self._turn_state: dict[tuple, list[tuple[int, list]]] = {}
+        self._carried: dict[tuple, tuple[int, list]] = {}  # a point's tokens -> (its length, its state)
         # Recent requests cut where their history ends -> their prompt's length: that state stands in for their end's.
         self._history_ends: dict[tuple, int] = {}
         self._own_seen: dict[tuple, int] = {}  # see _note_own_tokens
@@ -714,10 +722,16 @@ class MovingPromptCache(LRUPromptCache):
             key = tuple(tokens)
             self._tag_session(tokens)
             at = max((k for k in self._prompt_state if len(k) < len(key) and key[:len(k)] == k), key=len, default=None)
-            for older in [k for k in self._turn_state if len(k) < len(key) and key[:len(k)] == k]:
-                self._turn_state.pop(older)  # this conversation's earlier turns: superseded
+            # This conversation's earlier turns are superseded: the latest point each kept, still here or carried over
+            # by the request that continued it, can be this turn's second.
+            earlier = [self._turn_state.pop(k)[0] for k in [k for k in self._turn_state
+                                                             if len(k) < len(key) and key[:len(k)] == k]]
+            earlier += [self._carried.pop(k) for k in [k for k in self._carried
+                                                       if len(k) < len(key) and key[:len(k)] == k]]
             if at is not None:
-                self._turn_state[key] = (len(at), self._prompt_state.pop(at))
+                points = [(len(at), self._prompt_state.pop(at))]
+                points += sorted((p for p in earlier if p[0] < len(at)), key=lambda p: p[0], reverse=True)[:1]
+                self._turn_state[key] = points
                 while len(self._turn_state) > MAX_KEPT_STATES:
                     self._turn_state.pop(next(iter(self._turn_state)))
         cap, size = self.max_bytes, sum(c.nbytes for c in prompt_cache)
@@ -876,6 +890,8 @@ class MovingPromptCache(LRUPromptCache):
                 self._n_bytes -= entry.nbytes
                 self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
                 self._turn_state.pop(tuple(entry_key), None)
+                for k in [k for k in self._carried if tuple(entry_key[:len(k)]) == k]:
+                    self._carried.pop(k)
                 logging.info("memory cache: dropped a %d-token %s (%.1f GB) that its session started over from (a "
                              "compaction or a clear): nothing continues it, so it isn't saved", len(entry_key),
                              entry.cache_type, entry.nbytes / gb)
@@ -912,13 +928,27 @@ class MovingPromptCache(LRUPromptCache):
         except Exception:  # noqa: BLE001  logging only
             return ""
 
+    def _carry(self, tokens, point):
+        """Keep a finished turn's point for the request that continues its conversation: that request's own turn keeps
+        it as its second (see _turn_state)."""
+        n, states = point
+        self._carried[tuple(tokens[:n])] = (n, states)
+        while len(self._carried) > MAX_KEPT_STATES:
+            self._carried.pop(next(iter(self._carried)))
+
     def _rebuild_diverged(self, model, tokens, have: int):
-        """The finished turn of this conversation, rebuilt to where its state was kept (its history's end, or its
-        prompt's), when the request parts from it after that point and the rebuild covers more than `have` tokens."""
+        """The finished turn of this conversation, rebuilt to the latest point where its state was kept that the
+        request still shares (its history's end, or its prompt's; else where its previous turn's history ended), when
+        the request parts from it after that point and the rebuild covers more than `have` tokens."""
         key = list(tokens)
-        for entry_key, (n, states) in list(self._turn_state.items()):
-            if not (have < n < len(key)) or list(entry_key[:n]) != key[:n] or list(entry_key) == key[:len(entry_key)]:
+        for entry_key, points in list(self._turn_state.items()):
+            if list(entry_key) == key[:len(entry_key)]:
+                continue  # continued, not parted from
+            point = next(((n, states) for n, states in points
+                          if have < n < len(key) and list(entry_key[:n]) == key[:n]), None)
+            if point is None:
                 continue
+            n, states = point
             try:
                 entry = self._trie.get(model, list(entry_key))
             except Exception:  # noqa: BLE001  no longer cached: taken, evicted or dropped
@@ -936,6 +966,9 @@ class MovingPromptCache(LRUPromptCache):
             self._n_bytes -= entry.nbytes
             self._n_bytes_by_type[entry.cache_type] -= entry.nbytes
             self._turn_state.pop(entry_key, None)
+            earlier = next((p for p in points if p[0] < n), None)
+            if earlier is not None:  # still holds for the request's own turn: this point's state is put back, not kept
+                self._carry(entry_key, earlier)
             for layer, state in zip(entry.prompt_cache, states):
                 _put_back(layer, state, n)
             at = next((i for i, (a, b) in enumerate(zip(entry_key, key)) if a != b), n)
@@ -1216,7 +1249,9 @@ class MovingPromptCache(LRUPromptCache):
             self._trie.pop(result.model, key)
         finally:
             self._trie.taking = False
-        self._turn_state.pop(tuple(key), None)  # continued as-is: it won't need rebuilding
+        points = self._turn_state.pop(tuple(key), None)  # continued as-is: it won't need rebuilding, and its latest
+        if points:                                       # point is the second of the turn this request finishes as
+            self._carry(key, points[0])
         self._lru.remove(result.model, key)
         self._n_bytes -= entry.nbytes
         self._n_bytes_by_type[entry.cache_type] -= entry.nbytes

@@ -238,7 +238,14 @@ ends a prompt a few tokens past it, Inkling's ends there. That point also serves
 replaces the turn rather than continuing it. Claude Code compacts by sending the conversation with a
 user turn asking for a summary where the answer's header was; with the state kept a token before the
 prompt's end, a few tokens past where the two part, Arete-27B read that conversation again from its
-system prompt: 73,537 tokens, 20 minutes, at 79k of context. A conversation keeps only its
+system prompt: 73,537 tokens, 20 minutes, at 79k of context. Claude Code also compacts by sending its latest prompt
+with the reminder it appended after the newest tool results replaced by its request for a summary, which parts from
+the turn a few tokens before its history ends. Inkling 2 Mini read that conversation again from its system prompt,
+120k tokens in about 7 minutes, with the turn it left still in memory beside the read (34.5 of 37.4 GB at the peak).
+So a turn also keeps the point where its conversation's previous turn's history ended, carried over by the request
+that continued that turn, and a request that parts from it before its own history ends is rebuilt from there: the
+latest exchange is read again (about a thousand tokens), and the turn's caches are reused in place. A conversation
+keeps only its
 longest earlier snapshot. A request that leaves every cached entry part-way through (a client that rewrites a line of
 its system prompt on each request, say) reuses what it still shares with them. Attention caches cut back to any token,
 but a hybrid model's recurrent layers hold only their state at the end of what they read, and a sliding window's ring

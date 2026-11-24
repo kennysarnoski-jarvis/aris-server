@@ -228,7 +228,7 @@ def test_a_request_keeps_one_state_where_its_history_ends_and_its_next_turn_rebu
     first = HISTORY + ASK
     _, answer, _ = serve(cache, model, first, system_tokens=len(system()))
     # Where its history ends, in place of mlx-lm's snapshot a token before its prompt's end: memory as before.
-    assert not cache._prompt_state and [n for n, _ in cache._turn_state.values()] == [len(HISTORY)]
+    assert not cache._prompt_state and points(cache) == [[len(HISTORY)]]
     # Its answer comes back re-rendered: the turn is rebuilt from the end of its history, a header earlier than its
     # prompt's end used to be, and answers as a cold read does.
     second = first + [(answer[0] + 1) % 64, END, NEWLINE] + TOOL_RESULT + [END, NEWLINE] + ASK
@@ -244,7 +244,56 @@ def test_a_later_turn_cut_nowhere_keeps_the_state_at_its_own_prompts_end():
     _, answer, _ = serve(cache, model, first, system_tokens=len(system()))
     second = first + answer + TOOL_RESULT  # no turn header near its end: nowhere to cut
     serve(cache, model, second)
-    assert [n for n, _ in cache._turn_state.values()] == [len(second) - 1]
+    assert points(cache) == [[len(second) - 1, len(HISTORY)]]  # and the point its previous turn kept
+
+
+def points(cache) -> list[list[int]]:
+    """Where each kept turn's states are, latest first."""
+    return [[n for n, _ in kept] for kept in cache._turn_state.values()]
+
+
+REMINDER = [TURN, 6, NEWLINE] + text(12, 20) + [END, NEWLINE]  # a user message the client appends after tool results
+
+
+def test_a_compaction_that_drops_the_latest_reminder_resumes_where_the_previous_turn_asked(caplog):
+    # Claude Code also compacts by sending its latest prompt with the reminder it appended after the newest tool
+    # results replaced by its request for a summary. That parts from the latest turn a few tokens before its history
+    # ends, where no state was kept, and Inkling 2 Mini read its conversation again from the system prompt: 120k
+    # tokens, 7 minutes. The point its previous turn kept, carried over, leaves only the latest exchange to read again.
+    model = kv8_hybrid_model()
+    cache = cache_for(model, turns=True)
+    first = HISTORY + ASK
+    _, answer, _ = serve(cache, model, first, system_tokens=len(system()))
+    second = first + answer + [END, NEWLINE] + TOOL_RESULT + [END, NEWLINE] + REMINDER + ASK
+    cached, _, _ = serve(cache, model, second)
+    assert cached == len(first + answer)  # continued as it was
+    assert points(cache) == [[len(second) - len(ASK), len(HISTORY)]] and not cache._carried
+    at = len(second) - len(ASK) - len(REMINDER) + 3  # the reminder's text, after its header
+    ask = [11 if second[at] != 11 else 12] + text(9, 39) + [END, NEWLINE] + ASK
+    compact = second[:at] + ask
+    with caplog.at_level(logging.INFO):
+        cached, got, logprobs = serve(cache, model, compact)
+    assert cached == len(HISTORY)  # not the system prompt
+    assert f"turn the request parts from at token {at}" in caplog.text
+    same_as_read_cold(model, compact, got, logprobs)
+
+
+def test_a_turn_rebuilt_from_its_latest_point_hands_the_one_before_it_to_the_next_turn():
+    # The point a rebuild resumes from is put back into the cache it reads on, so it can't be kept; the turn's earlier
+    # point still holds for the request's own turn, which keeps it as its second.
+    model = kv8_hybrid_model()
+    cache = cache_for(model, turns=True)
+    first = HISTORY + ASK
+    _, answer, _ = serve(cache, model, first, system_tokens=len(system()))
+    second = first + answer + [END, NEWLINE] + TOOL_RESULT + [END, NEWLINE] + ASK
+    _, answer2, _ = serve(cache, model, second)
+    assert points(cache) == [[len(second) - len(ASK), len(HISTORY)]]
+    # Its answer comes back re-rendered: rebuilt where the second turn asked for it.
+    third = second + [(answer2[0] + 1) % 64, END, NEWLINE] + TOOL_RESULT + [END, NEWLINE] + ASK
+    cached, got, logprobs = serve(cache, model, third)
+    assert cached == len(second) - len(ASK)
+    same_as_read_cold(model, third, got, logprobs)
+    assert points(cache) == [[len(third) - len(ASK), len(HISTORY)]] and not cache._carried
 
 
 def own_bytes(whole: int, parts: tuple) -> Callable[[int], bytes]:
