@@ -1,6 +1,6 @@
 [project]
 name = "aris-server"
-version = "0.3.0"
+version = "0.3.1"
 description = "Run open-weight models locally behind the Anthropic Messages API, for Claude Code and friends."
 readme = "README.md"
 license = "Apache-2.0"
