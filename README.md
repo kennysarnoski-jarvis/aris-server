@@ -17,18 +17,19 @@ Inkling 2 Mini 1.1 to 1.4 times on code, edits and long contexts (and about the 
 **In [Aris Code](https://youraris.com):** Aris Local sets up Aris Server and the model for you.
 
 **With Aris Server on its own:** it installs with [uv](https://docs.astral.sh/uv/), and `aris-server claude` runs
-Claude Code. On a Mac that has neither, install them first:
+Claude Code. On a Mac that has neither, install them first, uv and then Claude Code:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh       # uv
-curl -fsSL https://claude.ai/install.sh | bash        # Claude Code
+curl -LsSf https://astral.sh/uv/install.sh | sh
+curl -fsSL https://claude.ai/install.sh | bash
 ```
 
-Then, in a new terminal:
+Then, in a new terminal, install Aris Server and serve a model. `pull` downloads the build this Mac can hold and its
+draft head; for Inkling 2 Mini, use `inkling-2-mini` in both commands:
 
 ```bash
 uv tool install aris-server
-aris-server pull aris-3.8-27b      # the build this Mac can hold, and its draft head; or inkling-2-mini
+aris-server pull aris-3.8-27b
 aris-server serve --model aris-3.8-27b
 ```
 
