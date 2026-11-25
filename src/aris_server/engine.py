@@ -1543,11 +1543,14 @@ class Engine:
         try:
             layers = sum(isinstance(c, (KVCache, QuantizedKVCache))
                          for c in _flat_caches(self.provider.model.make_cache()))
-            path = Path(self.spec.path)
-            if not (path / "config.json").is_file():
+            # The loaded weights' config: a local folder's, or for a Hugging Face repo id (the built-in models, as
+            # `pull` and Aris Code load them) the repo's, from the Hub or the cache. Read from the repo id as a path,
+            # it was never found, so those models got no context limit and Claude Code no window to compact by.
+            sized = weights_and_config(self.spec.path) if layers else None
+            if sized is None:
                 return None
-            _, heads, head_dim = _kv_shape(json.loads((path / "config.json").read_text()))
-            return kv_bytes_per_token(layers, heads, head_dim, self.spec.kv_bits) if layers else None
+            _, heads, head_dim = _kv_shape(sized[1])
+            return kv_bytes_per_token(layers, heads, head_dim, self.spec.kv_bits)
         except Exception:  # noqa: BLE001  an unusual model: no memory-derived context limit
             return None
 
