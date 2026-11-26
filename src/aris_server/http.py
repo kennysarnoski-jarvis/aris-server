@@ -277,7 +277,9 @@ def _message(name, blocks, reason, run, n):
 def _log(name, p, run, n, builder, reason, t0, engine=None):
     dt = time.time() - t0
     budget = run.budget[0] if run.budget else None
-    think = f" think={budget.n}/{p.think_budget}{' FORCED' if budget.forced else ''}" if budget else ""
+    # Thinking the request didn't ask for (a model that thinks anyway, see translate.plan) shows only when it happened.
+    think = (f" think={budget.n}/{p.think_budget}{' FORCED' if budget.forced else ''}{'' if p.thinking else ' unasked'}"
+             if budget and (p.thinking or budget.n) else "")
     guard = run.guard[0] if getattr(run, "guard", None) else None
     guarded = (f" stuck-call-reminder={p.stuck_repeats}" if p.stuck_repeats else "") + (
         f" loop-breaks={guard.breaks}{' LOOP-STOPPED' if guard.gave_up else ''}"

@@ -99,8 +99,12 @@ class BudgetTokens:
                 self.fence_counts[i] = text.count("```")
         self.paragraph_ids = frozenset(self.paragraph_ids)
 
-    def make(self, budget: int) -> ThinkBudget | None:
+    def make(self, budget: int, requested: bool = True) -> ThinkBudget | None:
         if budget <= 0 or self.end_id is None or self.newline_id is None:
+            return None
+        # A cap on thinking the request didn't ask for (translate.plan) needs thinking that opens with a token of its
+        # own: without one the count would start on the answer itself and force an end-of-thinking token into it.
+        if not requested and self.start_id is None:
             return None
         return ThinkBudget(budget, self.end_id, self.newline_id, self.paragraph_ids, self.fence_counts,
                            start_id=self.start_id)

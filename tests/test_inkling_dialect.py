@@ -11,7 +11,8 @@ from tokenizers import Tokenizer, models
 from transformers import PreTrainedTokenizerFast
 
 from aris_server import config, inkling
-from aris_server.budget import ThinkBudget
+from aris_server.budget import BudgetTokens, ThinkBudget
+from aris_server.http import _log
 from aris_server.engine import _classify_inkling, full_attention_layers
 from aris_server.kv_quant import quantize_kv
 from aris_server.stream import MessageBuilder, progress_note
@@ -283,6 +284,70 @@ def test_claude_codes_efforts_up_to_its_default_run_inkling_at_low():
     for asked, runs in (("low", "low"), ("medium", "low"), ("high", "low"), ("xhigh", "xhigh"), ("max", "max")):
         assert plan({**body, "output_config": {"effort": asked}}, spec).template_kwargs["reasoning_effort"] == runs
     assert plan({**body, "output_config": {"effort": "high"}}, spec).think_budget == 8192
+
+
+def test_inkling_told_not_to_think_still_gets_a_think_cap():
+    # Aris Code's Thinking Off sends effort "low" with thinking disabled, and Inkling thinks anyway at
+    # reasoning_effort "none": on 2026-11-26 one such turn thought 32,000 tokens for 21 minutes and ended at
+    # max_tokens with no tool call. Thinking nobody asked for gets the low cap, halved on tool-loop turns.
+    spec = config.builtin_models()["inkling-2-mini"]
+    off = {"messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"},
+           "output_config": {"effort": "low"}}
+    p = plan(off, spec)
+    assert p.template_kwargs["reasoning_effort"] == "none" and not p.thinking
+    assert p.think_budget == spec.budget_for("low") == 1024
+    side = {"messages": [{"role": "user", "content": "What is the title?"}], "output_config": {"effort": "high"}}
+    assert plan(side, spec).think_budget == 1024  # a side request carries no thinking field at all
+    loop = {**off, "messages": [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "a.py"}]}]}
+    assert plan(loop, spec).think_budget == 512
+    # The 27B's template really does switch thinking off, and its thinking has no opening token, so a cap there
+    # would count its answer and force an end-of-thinking token into the text: none.
+    assert plan(off, config.builtin_models()["aris-3.8-27b"]).think_budget == 0
+
+
+def test_a_cap_on_unasked_thinking_needs_thinking_that_opens_with_its_own_token():
+    tokens = BudgetTokens.__new__(BudgetTokens)
+    tokens.end_id, tokens.newline_id, tokens.paragraph_ids, tokens.fence_counts = END, NL, frozenset(), {}
+    tokens.start_id = START  # Inkling: the cap counts only inside a thinking message, so an answer stays untouched
+    assert tokens.make(1024, requested=False) is not None
+    tokens.start_id = None  # thinking with no opening token: the count would start on the answer itself
+    assert tokens.make(1024, requested=False) is None
+    assert tokens.make(1024, requested=True) is not None  # asked-for thinking keeps its budget, as before
+    assert tokens.make(0, requested=True) is None
+
+
+def test_the_engine_tells_the_budget_whether_thinking_was_asked_for():
+    from aris_server.engine import Engine
+    tokens = BudgetTokens.__new__(BudgetTokens)
+    tokens.end_id, tokens.newline_id, tokens.paragraph_ids, tokens.fence_counts = END, NL, frozenset(), {}
+    tokens.start_id = None  # a model whose thinking has no opening token, with a template that can't switch it off
+    engine = Engine.__new__(Engine)
+    engine.budget_tokens = tokens
+    spec = config.ModelSpec(name="m", path="m", effort_kwarg="reasoning_effort", effort_off="none")
+    off = plan({"messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}}, spec)
+    assert off.think_budget == 1024 and engine._budget_for(off) is None  # its answer is never counted
+    on = plan({"messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}}, spec)
+    assert engine._budget_for(on) is not None
+
+
+def test_the_log_marks_thinking_nobody_asked_for(caplog):
+    spec = config.builtin_models()["inkling-2-mini"]
+    p = plan({"messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"},
+              "output_config": {"effort": "low"}}, spec)
+    budget = ThinkBudget(p.think_budget, END, NL, frozenset(), {}, start_id=START)
+    budget.n, budget.forced = 1030, True
+    run = SimpleNamespace(budget=[budget], guard=[], prompt_tokens=10, cached_tokens=0)
+    with caplog.at_level("INFO"):
+        _log("inkling-2-mini", p, run, 1100, SimpleNamespace(tool_calls=1), "tool_use", 0.0)
+    assert " think=1030/1024 FORCED unasked " in caplog.text
+    caplog.clear()
+    budget.n, budget.forced = 0, False  # no thinking happened: nothing to report
+    with caplog.at_level("INFO"):
+        _log("inkling-2-mini", p, run, 40, SimpleNamespace(tool_calls=1), "tool_use", 0.0)
+    assert " think=" not in caplog.text
 
 
 def test_context_sizing_sees_the_caches_inside_cache_lists():

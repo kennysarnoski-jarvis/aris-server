@@ -119,7 +119,8 @@ Aris Server does one job: serve a local model to coding agents properly.
 - **Effort.** Claude Code's effort setting reaches models that have trained effort levels.
 - **A think budget.** Reasoning models that overthink get their thinking closed at the end of
   the current line once they pass the budget for the requested effort, so they answer instead of
-  burning every token deliberating.
+  burning every token deliberating. A model that thinks even when a request turns thinking off
+  (Inkling) gets the low budget for it.
 - **Loop guards.** A model that makes the same tool call three times in a row, and gets the same
   result each time, gets a reminder to use what it already has. A response that degenerates into one
   chunk repeated over and over is steered off it, and ended early if it keeps falling back in, instead

@@ -71,7 +71,7 @@ Claude Code ──/v1/messages──▶ Anthropic layer ──▶ mlx-lm engine 
 | Request | Model sees |
 | --- | --- |
 | `thinking.type: "enabled"` or `"adaptive"` | Thinking on. Claude Code asks for `"adaptive"` on every turn of its agent loop. |
-| `thinking.type: "disabled"`, or no `thinking` | Thinking off (the template's `enable_thinking=False`). As in Anthropic's API, a request thinks only when it asks to: Claude Code leaves `thinking` out of its side requests, such as summarizing a page WebFetch read. |
+| `thinking.type: "disabled"`, or no `thinking` | Thinking off (the template's `enable_thinking=False`). As in Anthropic's API, a request thinks only when it asks to: Claude Code leaves `thinking` out of its side requests, such as summarizing a page WebFetch read. A template with no thinking switch can only ask the model not to think (Inkling: `reasoning_effort` `none`), and the model may think anyway, so that thinking gets the model's low think budget, logged as `unasked`. |
 | `output_config.effort` low / medium / high / xhigh / max | The model's own effort control if it has one (for example Arete's `reasoning_effort`), else nothing, plus that effort's think budget. |
 | `thinking.budget_tokens` | Overrides the think budget. |
 
@@ -85,7 +85,10 @@ as `text\n\n</think>` stops matching its own prompt cache, and the next turn re-
 Budgets per effort are set per model, with defaults. A model's effort map can also send several requested efforts
 to one level: Inkling 2 Mini runs at its own low for Claude Code's low to high, since at medium and above it spent
 most of an hour reasoning through a hard task's spec before writing, and at low scored the same in a fraction of
-the time. Its think budget still follows the effort asked for.
+the time. Its think budget still follows the effort asked for. Thinking a request turned off, which Inkling can do
+anyway (once 32,000 tokens and 21 minutes with no answer, from Aris Code's Thinking Off), gets the low budget,
+1,024 tokens and 512 on tool-loop turns. That cap applies only where thinking opens with a token of its own, so a
+model whose thinking has none never has its answer counted.
 
 **Loop guards** (`guards.py`) cover two ways a local model gets stuck in an agent loop, both seen in hard agent
 tasks.

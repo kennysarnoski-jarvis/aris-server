@@ -1620,6 +1620,11 @@ class Engine:
         return len(self.tokenizer.apply_chat_template(plan.messages, tools=plan.tools, add_generation_prompt=True,
                                                       tokenize=True, **plan.template_kwargs))
 
+    def _budget_for(self, plan: Plan) -> ThinkBudget | None:
+        """The think budget a run gets: the effort's, or for thinking the request didn't ask for, the low cap where the
+        model's thinking opens with a token of its own (see translate.plan)."""
+        return self.budget_tokens.make(plan.think_budget, requested=plan.thinking)
+
     def run(self, plan: Plan, on_progress: Callable[[int, int], None] | None = None) -> Run:
         budget: list[ThinkBudget] = []
         guard: list[LoopGuard] = []
@@ -1630,7 +1635,7 @@ class Engine:
                 # Ahead of the budget: a token the budget forces replaces the logits whole, so it stays possible.
                 guard.append(LoopGuard(self.loop_exempt))
                 procs.append(guard[-1])
-            b = self.budget_tokens.make(plan.think_budget)
+            b = self._budget_for(plan)
             if b is not None:
                 budget.append(b)
                 procs.append(b)

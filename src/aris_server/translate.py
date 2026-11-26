@@ -237,7 +237,17 @@ def plan(body: dict, spec: ModelSpec, default_max: int = 32000, guards: bool = T
     elif spec.effort_kwarg and spec.effort_off:
         kwargs[spec.effort_kwarg] = spec.effort_off
 
-    budget = spec.budget_for(effort) if thinking else 0
+    if thinking:
+        budget = spec.budget_for(effort)
+    elif spec.effort_off:
+        # A template with no enable_thinking switch can only ask the model not to think (Inkling: reasoning_effort
+        # "none"), and the model may think anyway: on 2026-11-26 one such Inkling turn, from Aris Code's Thinking Off,
+        # thought 32,000 tokens for 21 minutes and ended at max_tokens with no tool call. Thinking nobody asked for
+        # gets the low cap. The engine applies it only where thinking opens with a token of its own
+        # (BudgetTokens.make), so it never counts an answer.
+        budget = spec.budget_for("low")
+    else:
+        budget = 0
     if thinking and thinking_cfg.get("budget_tokens"):
         budget = int(thinking_cfg["budget_tokens"])
     elif budget and _continues_tool_loop(body["messages"]):
