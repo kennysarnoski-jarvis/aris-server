@@ -6,11 +6,17 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .config import home
 
 LABEL = "dev.aris.server"
+# `launchctl bootout` returns before a server with a model loaded has exited, and until it has, launchd refuses to load
+# the label again: "Bootstrap failed: 5: Input/output error". launchd kills a job 20 s after asking it to stop.
+UNLOAD_WAIT_S = 30.0
+BOOTSTRAP_ATTEMPTS = 10
+STILL_UNLOADING = "Bootstrap failed: 5"
 
 
 def plist_path() -> Path:
@@ -43,6 +49,16 @@ def _domain() -> str:
     return f"gui/{os.getuid()}"
 
 
+def _loaded() -> bool:
+    return subprocess.run(["launchctl", "print", f"{_domain()}/{LABEL}"], capture_output=True).returncode == 0
+
+
+def _wait_until_unloaded() -> None:
+    deadline = time.monotonic() + UNLOAD_WAIT_S
+    while _loaded() and time.monotonic() < deadline:
+        time.sleep(0.25)
+
+
 def install(serve_args: list[str]) -> int:
     log = home() / "server.log"
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -50,11 +66,16 @@ def install(serve_args: list[str]) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         subprocess.run(["launchctl", "bootout", f"{_domain()}/{LABEL}"], capture_output=True)
+        _wait_until_unloaded()
     path.write_bytes(plistlib.dumps(build_plist(_executable(), serve_args, log)))
-    done = subprocess.run(["launchctl", "bootstrap", _domain(), str(path)], capture_output=True, text=True)
-    if done.returncode != 0:
-        print(f"launchctl bootstrap failed: {done.stderr.strip()}", file=sys.stderr)
-        return 1
+    for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
+        done = subprocess.run(["launchctl", "bootstrap", _domain(), str(path)], capture_output=True, text=True)
+        if done.returncode == 0:
+            break
+        if STILL_UNLOADING not in done.stderr or attempt == BOOTSTRAP_ATTEMPTS:
+            print(f"launchctl bootstrap failed: {done.stderr.strip()}", file=sys.stderr)
+            return 1
+        time.sleep(1)
     print(f"Aris Server runs as a service now ({LABEL}); log: {log}")
     return 0
 
